@@ -34,6 +34,15 @@ model_reasoning_effort = "xhigh"
 model_reasoning_summary = "detailed"
 model_verbosity = "high"
 
+[profiles.spark]
+model = "gpt-5.3-codex-spark"
+model_reasoning_effort = "high"
+model_reasoning_summary = "detailed"
+model_verbosity = "high"
+model_context_window = 128000
+model_auto_compact_token_limit = 80000
+tool_output_token_limit = 2000
+
 # Optional MCP retrieval template (disabled until uncommented/configured).
 # [mcp_servers.repo_rag]
 # command = "my-mcp-rag-server"

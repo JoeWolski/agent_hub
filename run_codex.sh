@@ -20,6 +20,7 @@ export BASE_DOCKER_PATH="${BASE_DOCKER_PATH:-}"
 export BASE_DOCKER_CONTEXT="${BASE_DOCKER_CONTEXT:-}"
 export BASE_DOCKERFILE="${BASE_DOCKERFILE:-}"
 export BASE_IMAGE_TAG="${BASE_IMAGE_TAG:-}"
+RESUME_SESSION="${RESUME_SESSION:-0}"
 
 RO_MOUNTS=()
 RW_MOUNTS=()
@@ -88,6 +89,10 @@ while [[ $# -gt 0 ]]; do
       parsed_mount="$(parse_mount_spec "$mount_spec" "--rw-mount")"
       RW_MOUNTS+=("$parsed_mount")
       shift 2
+      ;;
+    --resume)
+      RESUME_SESSION=1
+      shift
       ;;
     --)
       shift
@@ -261,8 +266,15 @@ done
 for ro_mount in "${RO_MOUNTS[@]}"; do
   cmd+=(--volume "$ro_mount")
 done
-cmd+=(codex)
-if [[ "${#CONTAINER_ARGS[@]}" -gt 0 ]]; then
+
+if [[ "${#CONTAINER_ARGS[@]}" -eq 0 ]]; then
+  if [[ "$RESUME_SESSION" == "1" ]]; then
+    cmd+=(codex bash -lc 'if codex resume --last; then :; else exec codex; fi')
+  else
+    cmd+=(codex)
+  fi
+else
+  cmd+=(codex)
   cmd+=("${CONTAINER_ARGS[@]}")
 fi
 exec "${cmd[@]}"

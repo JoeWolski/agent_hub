@@ -13,6 +13,8 @@ This setup runs OpenAI Codex inside an Ubuntu 22.04 container and mounts your pr
 - Persistent Codex home mounted at `/home/<your-user>` (default host path: `~/.codex-docker-home/<your-user>`)
 - Runtime identity mirrors the launcher user (`name`, `uid`, `gid`, supplementary groups, and `umask`)
 - Working directory starts in the mounted project path (not the parent `projects` folder)
+- Re-run on the same project starts a new conversation by default
+- Use `--resume` to continue the last Codex session for that project
 - `sudo` is available for the mapped user inside the container
 - No package/tool installs on your host machine
 
@@ -30,6 +32,9 @@ chmod +x run_codex.sh
 ```
 
 By default, `PROJECT_PATH` is your current directory (`$PWD`).
+If you rerun `run_codex.sh` from the same `PROJECT_PATH` and a previous session exists,
+it resumes that project session automatically.
+
 To run against any project directory:
 
 ```bash
@@ -39,6 +44,12 @@ PROJECT_PATH="$HOME/projects/any-repo" ./run_codex.sh
 If `PROJECT_PATH="$HOME/projects/any-repo"`, container cwd will be:
 
 `$HOME/projects/any-repo`
+
+You can resume the previous session in the same project with:
+
+```bash
+PROJECT_PATH="/path/to/project" ./run_codex.sh --resume
+```
 
 Optional: choose where Codex home/auth state lives on your host:
 
