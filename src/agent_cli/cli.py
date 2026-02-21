@@ -12,9 +12,10 @@ import click
 
 
 DEFAULT_BASE_IMAGE = "nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04"
-DEFAULT_IMAGE = "codex-ubuntu2204:latest"
+DEFAULT_RUNTIME_IMAGE = "agent-ubuntu2204:latest"
 DEFAULT_DOCKERFILE = "docker/Dockerfile"
-RESUME_COMMAND = "if codex resume --last; then :; else exec codex; fi"
+DEFAULT_AGENT_COMMAND = "codex"
+RESUME_COMMAND = f"if {DEFAULT_AGENT_COMMAND} resume --last; then :; else exec {DEFAULT_AGENT_COMMAND}; fi"
 
 
 def _repo_root() -> Path:
@@ -25,11 +26,11 @@ def _repo_root() -> Path:
 
 
 def _default_config_file() -> Path:
-    config_file = _repo_root() / "config" / "codex.config.toml"
+    config_file = _repo_root() / "config" / "agent.config.toml"
     if config_file.exists():
         return config_file
 
-    fallback = Path.cwd() / "config" / "codex.config.toml"
+    fallback = Path.cwd() / "config" / "agent.config.toml"
     if fallback.exists():
         return fallback
 
@@ -215,22 +216,22 @@ def _resolve_base_image(
         resolved_context = resolved_dockerfile.parent
 
     tag = (
-        f"codex-base-{_sanitize_tag_component(project_dir.name)}-"
+        f"agent-base-{_sanitize_tag_component(project_dir.name)}-"
         f"{_sanitize_tag_component(resolved_context.name)}-"
         f"{_short_hash(str(resolved_dockerfile))}"
     )
     return tag, resolved_context, resolved_dockerfile
 
 
-@click.command(help="Launch the Codex containerized environment")
+@click.command(help="Launch the containerized agent environment")
 @click.option("--project", default=".", show_default=True)
 @click.option("--container-home", default=None, help="Container home path for mapped user")
-@click.option("--codex-home-path", default=None, help="Host path for persistent Codex state")
+@click.option("--agent-home-path", default=None, help="Host path for persistent agent state")
 @click.option(
     "--config-file",
     default=str(_default_config_file()),
     show_default=True,
-    help="Host codex config file mounted into container",
+    help="Host agent config file mounted into container",
 )
 @click.option("--openai-api-key", default=None, show_default=False, help="API key to pass into container")
 @click.option(
@@ -273,14 +274,14 @@ def _resolve_base_image(
     "--prepare-snapshot-only",
     is_flag=True,
     default=False,
-    help="Build/reuse snapshot image and exit without starting Codex.",
+    help="Build/reuse snapshot image and exit without starting the agent.",
 )
-@click.option("--resume", is_flag=True, default=False, help="Resume last Codex session")
+@click.option("--resume", is_flag=True, default=False, help="Resume last session")
 @click.argument("container_args", nargs=-1)
 def main(
     project: str,
     container_home: str | None,
-    codex_home_path: str | None,
+    agent_home_path: str | None,
     config_file: str,
     openai_api_key: str | None,
     credentials_file: str,
@@ -319,9 +320,9 @@ def main(
         if fallback.is_file():
             config_path = fallback
         else:
-            raise click.ClickException(f"Codex config file does not exist: {config_path}")
+            raise click.ClickException(f"Agent config file does not exist: {config_path}")
     if not config_path.is_file():
-        raise click.ClickException(f"Codex config file does not exist: {config_path}")
+        raise click.ClickException(f"Agent config file does not exist: {config_path}")
 
     user = local_user or _default_user()
     group = local_group or _default_group_name()
@@ -343,9 +344,9 @@ def main(
     container_project_name = project_path.name
     container_project_path = f"{container_home_path}/projects/{container_project_name}"
 
-    host_codex_home = Path(codex_home_path or (Path.home() / ".codex-docker-home" / user)).resolve()
-    (host_codex_home / ".codex").mkdir(parents=True, exist_ok=True)
-    (host_codex_home / "projects").mkdir(parents=True, exist_ok=True)
+    host_agent_home = Path(agent_home_path or (Path.home() / ".agent-home" / user)).resolve()
+    (host_agent_home / ".codex").mkdir(parents=True, exist_ok=True)
+    (host_agent_home / "projects").mkdir(parents=True, exist_ok=True)
 
     api_key = openai_api_key
     if not api_key:
@@ -374,7 +375,7 @@ def main(
                 raise click.ClickException("Unable to resolve a valid base docker source")
 
             tag = base_image_tag or (
-                f"codex-base-{_sanitize_tag_component(project_path.name)}-"
+                f"agent-base-{_sanitize_tag_component(project_path.name)}-"
                 f"{_sanitize_tag_component(resolved_context.name)}-"
                 f"{_short_hash(str(resolved_dockerfile))}"
             )
@@ -383,7 +384,7 @@ def main(
             _run(["docker", "build", "-f", str(resolved_dockerfile), "-t", tag, str(resolved_context)])
             selected_base_image = tag
 
-        click.echo(f"Building Codex image '{DEFAULT_IMAGE}' from {DEFAULT_DOCKERFILE}")
+        click.echo(f"Building runtime image '{DEFAULT_RUNTIME_IMAGE}' from {DEFAULT_DOCKERFILE}")
         _run(
             [
                 "docker",
@@ -393,7 +394,7 @@ def main(
                 "--build-arg",
                 f"BASE_IMAGE={selected_base_image}",
                 "-t",
-                DEFAULT_IMAGE,
+                DEFAULT_RUNTIME_IMAGE,
                 str(_repo_root()),
             ],
             cwd=_repo_root(),
@@ -415,11 +416,11 @@ def main(
         parsed_env_vars.append(_parse_env_var(entry, "--env-var"))
 
     if container_args:
-        command = ["codex", *container_args]
+        command = [DEFAULT_AGENT_COMMAND, *container_args]
     elif resume:
-        command = ["codex", "bash", "-lc", RESUME_COMMAND]
+        command = [DEFAULT_AGENT_COMMAND, "bash", "-lc", RESUME_COMMAND]
     else:
-        command = ["codex"]
+        command = [DEFAULT_AGENT_COMMAND]
 
     run_args = [
         "--init",
@@ -428,7 +429,7 @@ def main(
         "--workdir",
         container_project_path,
         "--volume",
-        f"{host_codex_home}:{container_home_path}",
+        f"{host_agent_home}:{container_home_path}",
         "--volume",
         f"{project_path}:{container_project_path}",
         "--volume",
@@ -472,14 +473,14 @@ def main(
     for mount in ro_mount_flags + rw_mount_flags:
         run_args.extend(["--volume", mount])
 
-    runtime_image = DEFAULT_IMAGE
+    runtime_image = DEFAULT_RUNTIME_IMAGE
     if snapshot_tag:
         should_build_snapshot = not cached_snapshot_exists
         if should_build_snapshot:
             script = (setup_script or "").strip() or ":"
             click.echo(f"Building setup snapshot image '{snapshot_tag}'")
             container_name = (
-                f"codex-setup-{_sanitize_tag_component(project_path.name)}-"
+                f"agent-setup-{_sanitize_tag_component(project_path.name)}-"
                 f"{_short_hash(snapshot_tag + script)}"
             )
             setup_cmd = [
@@ -490,7 +491,7 @@ def main(
                 "--entrypoint",
                 "bash",
                 *run_args,
-                DEFAULT_IMAGE,
+                DEFAULT_RUNTIME_IMAGE,
                 "-lc",
                 (
                     "set -e\n"
@@ -510,7 +511,7 @@ def main(
                         "--change",
                         'ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]',
                         "--change",
-                        'CMD ["codex"]',
+                        f'CMD ["{DEFAULT_AGENT_COMMAND}"]',
                         container_name,
                         snapshot_tag,
                     ]

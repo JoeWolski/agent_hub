@@ -1,0 +1,28 @@
+# AGENTS.md
+
+## Design practices
+
+- Prefer responsive, optimistic UI behavior.
+- Show immediate feedback on user actions; do not wait for long async operations before updating UI state.
+- Keep layout geometry stable during state transitions to avoid cursor-jump behavior.
+- Keep action controls spatially consistent; toggled states should not move controls unexpectedly.
+- Place loading indicators at the locus of work (where users are looking for progress).
+- Avoid replacing entire components when in-place state transitions can preserve continuity.
+- Support concurrent operations where backend semantics allow it.
+- Use progressive disclosure for dense configuration and details.
+- Hide irrelevant controls and empty sections; show actions only when they are meaningful for current state.
+- Keep interaction patterns keyboard-accessible and predictable.
+- Make status/state explicit with clear, user-facing labels.
+
+## Data and behavior principles
+
+- Treat server-side state as authoritative for shared/app-critical data.
+- Persist user/app state on the backend so sessions are consistent across devices.
+- Reconcile optimistic client state with server state without causing abrupt UI jumps.
+- Ensure shutdown/cleanup paths are deterministic and do not require repeated user intervention.
+
+## Implementation quality
+
+- Favor state-driven rendering over ad hoc DOM behavior.
+- Keep async flows cancellation-safe and shutdown-safe.
+- Validate changes with appropriate build/test checks before handoff.

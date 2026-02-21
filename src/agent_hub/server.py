@@ -32,7 +32,7 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 TERMINAL_LOG_TAIL_BYTES = 200_000
 TERMINAL_QUEUE_MAX = 256
-DEFAULT_CODEX_IMAGE = "codex-ubuntu2204:latest"
+DEFAULT_AGENT_IMAGE = "agent-ubuntu2204:latest"
 DEFAULT_PTY_COLS = 160
 DEFAULT_PTY_ROWS = 48
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
@@ -53,15 +53,15 @@ def _repo_root() -> Path:
 
 
 def _default_data_dir() -> Path:
-    return Path.home() / ".local" / "share" / "codex-hub"
+    return Path.home() / ".local" / "share" / "agent-hub"
 
 
 def _default_config_file() -> Path:
-    config_file = _repo_root() / "config" / "codex.config.toml"
+    config_file = _repo_root() / "config" / "agent.config.toml"
     if config_file.exists():
         return config_file
 
-    fallback = Path.cwd() / "config" / "codex.config.toml"
+    fallback = Path.cwd() / "config" / "agent.config.toml"
     if fallback.exists():
         return fallback
 
@@ -157,14 +157,14 @@ def _frontend_not_built_page() -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Codex Hub Frontend Missing</title>
+  <title>Agent Hub Frontend Missing</title>
   <style>
     body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 2rem; color: #111827; }
     pre { padding: 0.75rem; border: 1px solid #d1d5db; border-radius: 8px; background: #f9fafb; }
   </style>
 </head>
 <body>
-  <h1>Codex Hub frontend is not built</h1>
+  <h1>Agent Hub frontend is not built</h1>
   <p>Build the React frontend using Yarn, then restart the backend.</p>
   <pre>cd web
 yarn install
@@ -386,7 +386,7 @@ def _docker_fix_path_ownership(path: Path, uid: int, gid: int) -> None:
         return
     if shutil.which("docker") is None:
         return
-    if not _docker_image_exists(DEFAULT_CODEX_IMAGE):
+    if not _docker_image_exists(DEFAULT_AGENT_IMAGE):
         return
     subprocess.run(
         [
@@ -397,7 +397,7 @@ def _docker_fix_path_ownership(path: Path, uid: int, gid: int) -> None:
             "bash",
             "--volume",
             f"{path}:/target",
-            DEFAULT_CODEX_IMAGE,
+            DEFAULT_AGENT_IMAGE,
             "-lc",
             f"chown -R {uid}:{gid} /target || true; chmod -R u+rwX /target || true",
         ],
@@ -455,17 +455,87 @@ def _is_process_running(pid: int | None) -> bool:
 def _stop_process(pid: int) -> None:
     if not _is_process_running(pid):
         return
+
     try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, OSError):
+        pgid = None
+
+    try:
+        if pgid:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+
     deadline = time.monotonic() + 4
     while time.monotonic() < deadline:
         if not _is_process_running(pid):
             return
         time.sleep(0.1)
+
     if _is_process_running(pid):
-        os.kill(pid, signal.SIGKILL)
+        try:
+            if pgid:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                return
+
+
+def _stop_processes(pids: list[int], timeout_seconds: float = 4.0) -> int:
+    active = [pid for pid in sorted({int(pid) for pid in pids}) if _is_process_running(pid)]
+    if not active:
+        return 0
+
+    groups: dict[int, int] = {}
+    for pid in active:
+        try:
+            pgid = os.getpgid(pid)
+        except (ProcessLookupError, OSError):
+            pgid = 0
+        groups[pid] = pgid
+        try:
+            if pgid:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                continue
+
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+    alive = active
+    while time.monotonic() < deadline:
+        alive = [pid for pid in alive if _is_process_running(pid)]
+        if not alive:
+            return len(active)
+        time.sleep(0.1)
+
+    for pid in alive:
+        pgid = groups.get(pid, 0)
+        try:
+            if pgid:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                continue
+
+    return len(active)
 
 
 class HubState:
@@ -491,9 +561,31 @@ class HubState:
             if not self.state_file.exists():
                 return _new_state()
             try:
-                return json.loads(self.state_file.read_text())
+                loaded = json.loads(self.state_file.read_text())
             except json.JSONDecodeError:
                 return _new_state()
+        if not isinstance(loaded, dict):
+            return _new_state()
+        projects = loaded.get("projects")
+        chats = loaded.get("chats")
+        if not isinstance(projects, dict):
+            projects = {}
+        if not isinstance(chats, dict):
+            chats = {}
+        state = {"version": loaded.get("version", 1), "projects": projects, "chats": chats}
+        for chat in state["chats"].values():
+            if not isinstance(chat, dict):
+                continue
+            legacy_args = chat.get("codex_args")
+            current_args = chat.get("agent_args")
+            if isinstance(current_args, list):
+                chat["agent_args"] = [str(arg) for arg in current_args]
+                continue
+            if isinstance(legacy_args, list):
+                chat["agent_args"] = [str(arg) for arg in legacy_args]
+            else:
+                chat["agent_args"] = []
+        return state
 
     def save(self, state: dict[str, Any]) -> None:
         with self._lock:
@@ -734,7 +826,7 @@ class HubState:
         ro_mounts: list[str],
         rw_mounts: list[str],
         env_vars: list[str],
-        codex_args: list[str] | None = None,
+        agent_args: list[str] | None = None,
     ) -> dict[str, Any]:
         state = self.load()
         project = state["projects"].get(project_id)
@@ -752,7 +844,7 @@ class HubState:
             "ro_mounts": ro_mounts,
             "rw_mounts": rw_mounts,
             "env_vars": env_vars,
-            "codex_args": codex_args or [],
+            "agent_args": agent_args or [],
             "status": "stopped",
             "pid": None,
             "workspace": str(workspace_path),
@@ -777,7 +869,7 @@ class HubState:
             ro_mounts=list(project.get("default_ro_mounts") or []),
             rw_mounts=list(project.get("default_rw_mounts") or []),
             env_vars=list(project.get("default_env_vars") or []),
-            codex_args=[],
+            agent_args=[],
         )
         return self.start_chat(chat["id"])
 
@@ -787,7 +879,7 @@ class HubState:
         if chat is None:
             raise HTTPException(status_code=404, detail="Chat not found.")
 
-        for field in ["name", "profile", "ro_mounts", "rw_mounts", "env_vars", "codex_args"]:
+        for field in ["name", "profile", "ro_mounts", "rw_mounts", "env_vars", "agent_args"]:
             if field in patch:
                 chat[field] = patch[field]
 
@@ -1063,7 +1155,7 @@ class HubState:
             path.mkdir(parents=True, exist_ok=True)
 
         self.save(state)
-        _docker_remove_images(("codex-hub-setup-", "codex-base-"), image_tags)
+        _docker_remove_images(("agent-hub-setup-", "agent-base-"), image_tags)
 
         return {
             "stopped_chats": stopped_chats,
@@ -1071,6 +1163,28 @@ class HubState:
             "projects_reset": projects_reset,
             "docker_images_requested": len(image_tags),
         }
+
+    def shutdown(self) -> dict[str, int]:
+        with self._runtime_lock:
+            runtime_ids = list(self._chat_runtimes.keys())
+        for chat_id in runtime_ids:
+            self._close_runtime(chat_id)
+
+        state = self.load()
+        running_chat_ids: list[str] = []
+        running_pids: list[int] = []
+        for chat_id, chat in state["chats"].items():
+            pid = chat.get("pid")
+            if isinstance(pid, int) and _is_process_running(pid):
+                running_chat_ids.append(chat_id)
+                running_pids.append(pid)
+
+        stopped = _stop_processes(running_pids, timeout_seconds=4.0)
+        if running_chat_ids:
+            for chat_id in running_chat_ids:
+                state["chats"].pop(chat_id, None)
+            self.save(state)
+        return {"stopped_chats": stopped, "closed_chats": len(running_chat_ids)}
 
     def _ensure_chat_clone(self, chat: dict[str, Any], project: dict[str, Any]) -> Path:
         workspace = Path(str(chat.get("workspace") or self.chat_dir / chat["id"]))
@@ -1174,7 +1288,7 @@ class HubState:
             sort_keys=True,
         )
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-        return f"codex-hub-setup-{project_id}-{digest}"
+        return f"agent-hub-setup-{project_id}-{digest}"
 
     def _ensure_project_setup_snapshot(
         self,
@@ -1195,7 +1309,7 @@ class HubState:
             "run",
             "--project",
             str(_repo_root()),
-            "codex_image",
+            "agent_cli",
             "--project",
             str(workspace),
             "--config-file",
@@ -1322,7 +1436,7 @@ class HubState:
             "run",
             "--project",
             str(_repo_root()),
-            "codex_image",
+            "agent_cli",
             "--project",
             str(workspace),
             "--config-file",
@@ -1364,7 +1478,7 @@ def _html_page() -> str:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="light dark" />
-  <title>Codex Hub</title>
+  <title>Agent Hub</title>
   <style>
     :root {
       --bg: #f4f6f8;
@@ -1534,7 +1648,7 @@ def _html_page() -> str:
 </head>
 <body>
   <header>
-    <h1>Codex Hub</h1>
+    <h1>Agent Hub</h1>
     <div class="subhead">Project-level workspaces, one cloned directory per chat</div>
   </header>
   <div id="ui-error" class="error-banner"></div>
@@ -1807,7 +1921,7 @@ def _html_page() -> str:
         const baseValue = escapeHtml(baseValueRaw);
         const baseSummary = baseValueRaw
           ? `${baseModeLabel(baseMode)}: ${escapeHtml(baseValueRaw)}`
-          : 'Default codex_image base image';
+          : 'Default agent_cli base image';
         const defaultVolumeCount = (project.default_ro_mounts || []).length + (project.default_rw_mounts || []).length;
         const defaultEnvCount = (project.default_env_vars || []).length;
 
@@ -2045,9 +2159,9 @@ def _html_page() -> str:
     """
 
 
-@click.command(help="Run the local Codex hub.")
+@click.command(help="Run the local agent hub.")
 @click.option("--data-dir", default=str(_default_data_dir()), show_default=True, type=click.Path(file_okay=False, path_type=Path), help="Directory for hub state and chat workspaces.")
-@click.option("--config-file", default=str(_default_config_file()), show_default=True, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Codex config file to pass into every chat.")
+@click.option("--config-file", default=str(_default_config_file()), show_default=True, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Agent config file to pass into every chat.")
 @click.option("--host", default=DEFAULT_HOST, show_default=True)
 @click.option("--port", default=DEFAULT_PORT, show_default=True, type=int)
 @click.option("--frontend-build/--no-frontend-build", default=True, show_default=True, help="Automatically build the React frontend before starting the server.")
@@ -2190,11 +2304,13 @@ def main(
         ro_mounts = _parse_mounts(_empty_list(payload.get("ro_mounts")), "read-only mount")
         rw_mounts = _parse_mounts(_empty_list(payload.get("rw_mounts")), "read-write mount")
         env_vars = _parse_env_vars(_empty_list(payload.get("env_vars")))
-        codex_args = payload.get("codex_args")
-        if codex_args is None:
-            codex_args = []
-        if not isinstance(codex_args, list):
-            raise HTTPException(status_code=400, detail="codex_args must be an array.")
+        agent_args = payload.get("agent_args")
+        if agent_args is None and "codex_args" in payload:
+            agent_args = payload.get("codex_args")
+        if agent_args is None:
+            agent_args = []
+        if not isinstance(agent_args, list):
+            raise HTTPException(status_code=400, detail="agent_args must be an array.")
         return {
             "chat": state.create_chat(
                 project_id,
@@ -2202,7 +2318,7 @@ def main(
                 ro_mounts,
                 rw_mounts,
                 env_vars,
-                codex_args=[str(arg) for arg in codex_args],
+                agent_args=[str(arg) for arg in agent_args],
             )
         }
 
@@ -2226,11 +2342,12 @@ def main(
             update["rw_mounts"] = _parse_mounts(_empty_list(payload.get("rw_mounts")), "read-write mount")
         if "env_vars" in payload:
             update["env_vars"] = _parse_env_vars(_empty_list(payload.get("env_vars")))
-        if "codex_args" in payload:
-            args = payload.get("codex_args")
+        args_key = "agent_args" if "agent_args" in payload else "codex_args" if "codex_args" in payload else ""
+        if args_key:
+            args = payload.get(args_key)
             if not isinstance(args, list):
-                raise HTTPException(status_code=400, detail="codex_args must be an array.")
-            update["codex_args"] = [str(arg) for arg in args]
+                raise HTTPException(status_code=400, detail="agent_args must be an array.")
+            update["agent_args"] = [str(arg) for arg in args]
         if not update:
             raise HTTPException(status_code=400, detail="No patch values provided.")
         return {"chat": state.update_chat(chat_id, update)}
@@ -2268,7 +2385,10 @@ def main(
 
         async def stream_output() -> None:
             while True:
-                chunk = await asyncio.to_thread(listener.get)
+                try:
+                    chunk = await asyncio.to_thread(listener.get, True, 0.25)
+                except queue.Empty:
+                    continue
                 if chunk is None:
                     break
                 await websocket.send_text(chunk)
@@ -2308,6 +2428,7 @@ def main(
         except WebSocketDisconnect:
             pass
         finally:
+            state._queue_put(listener, None)
             state.detach_terminal(chat_id, listener)
             if not sender.done():
                 sender.cancel()
@@ -2317,6 +2438,19 @@ def main(
     assets_dir = frontend_dist / "assets"
     if assets_dir.is_dir():
         app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="frontend-assets")
+
+    @app.on_event("shutdown")
+    async def app_shutdown() -> None:
+        try:
+            summary = state.shutdown()
+            if summary["closed_chats"] > 0:
+                click.echo(
+                    "Shutdown cleanup completed: "
+                    f"stopped_chats={summary['stopped_chats']} "
+                    f"closed_chats={summary['closed_chats']}"
+                )
+        except Exception as exc:  # pragma: no cover - defensive shutdown guard
+            click.echo(f"Shutdown cleanup failed: {exc}", err=True)
 
     @app.get("/{path:path}")
     def spa(path: str):

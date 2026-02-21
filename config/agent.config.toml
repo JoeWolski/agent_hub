@@ -12,8 +12,8 @@ project_doc_auto_load = true
 project_doc_fallback_filenames = ["AGENTS.md", "README.md"]
 project_doc_auto_load_extra_filenames = [
   "docs/repo-map.md",
-  "docs/codex-mcp.md",
-  "docs/codex-setup.md",
+  "docs/agent-mcp.md",
+  "docs/agent-setup.md",
 ]
 project_doc_max_bytes = 131072
 

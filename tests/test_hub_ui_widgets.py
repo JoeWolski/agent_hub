@@ -12,7 +12,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-import codex_hub.server as hub_server
+import agent_hub.server as hub_server
 
 
 class HubUiWidgetScriptTests(unittest.TestCase):

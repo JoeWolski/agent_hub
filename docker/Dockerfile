@@ -24,11 +24,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && npm cache clean --force \
  && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /home/codex/projects
+RUN mkdir -p /home/agent/projects
 
 COPY docker/docker-entrypoint.py /usr/local/bin/docker-entrypoint.py
 RUN chmod +x /usr/local/bin/docker-entrypoint.py
 
-WORKDIR /home/codex/projects
+WORKDIR /home/agent/projects
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]
 CMD ["codex"]

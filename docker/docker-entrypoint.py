@@ -25,7 +25,7 @@ def _group_name_for_gid(gid: str) -> str | None:
 
 
 def _ensure_user_and_groups() -> None:
-    local_user = os.environ.get("LOCAL_USER", "codex")
+    local_user = os.environ.get("LOCAL_USER", "agent")
     local_group = os.environ.get("LOCAL_GROUP", local_user)
     local_uid = int(os.environ.get("LOCAL_UID", "1000"))
     local_gid = int(os.environ.get("LOCAL_GID", "1000"))

@@ -1,18 +1,18 @@
-# Codex Docker (Ubuntu 22.04)
+# Agent Hub (Ubuntu 22.04)
 
-This repository now uses a Python `uv` tool (`codex_image`) to launch the existing Codex container image.
+This repository uses a Python `uv` tool (`agent_cli`) to launch a containerized agent runtime.
 
-It also includes `codex_hub`, a local web control panel for project chat orchestration.
+It also includes `agent_hub`, a local web control panel for project chat orchestration.
 
 ## What it does
 
-- Builds and runs the `docker/Dockerfile` for the Codex environment.
+- Builds and runs the `docker/Dockerfile` for the agent environment.
 - Supports an optional intermediate base image build from a provided Dockerfile/path.
 - Mounts your project under a stable container path:
   `/home/<local_user>/projects/<project-name>`
-- Mounts persistent Codex state on the host.
+- Mounts persistent agent state on the host.
 - Supports read-only and read-write mount overrides.
-- Supports `--resume` to continue the latest Codex session for the project.
+- Supports `--resume` to continue the latest session for the project.
 
 ## Requirements
 
@@ -22,7 +22,7 @@ It also includes `codex_hub`, a local web control panel for project chat orchest
 ## Quick start
 
 ```bash
-uv run codex_image --project /path/to/project
+uv run agent_cli --project /path/to/project
 ```
 
 Defaults for `--project` is `.`.
@@ -31,7 +31,7 @@ Defaults for `--project` is `.`.
 
 - `--project PATH`
 - `--resume`
-- `--config-file PATH` (default: repo `config/codex.config.toml`)
+- `--config-file PATH` (default: repo `config/agent.config.toml`)
 - `--credentials-file PATH` and/or `--openai-api-key`
 - `--base PATH` (Dockerfile path or directory with Dockerfile)
 - `--base-image TAG` (default: `nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04`)
@@ -42,26 +42,26 @@ Defaults for `--project` is `.`.
 - `--prepare-snapshot-only` (build/reuse snapshot and exit)
 - `--local-user`, `--local-group`, `--local-uid`, `--local-gid`
 - `--local-supplementary-gids`, `--local-supplementary-groups`, `--local-umask`
-- `--codex-home-path PATH`
+- `--agent-home-path PATH`
 
 ## Examples
 
 Use a different project and pass through a command:
 
 ```bash
-uv run codex_image --project /path/to/project -- bash -lc 'id && pwd'
+uv run agent_cli --project /path/to/project -- bash -lc 'id && pwd'
 ```
 
 Build/run against a custom base Dockerfile:
 
 ```bash
-uv run codex_image --project /path/to/project --base /path/to/base/Dockerfile
+uv run agent_cli --project /path/to/project --base /path/to/base/Dockerfile
 ```
 
 Add mounts:
 
 ```bash
-uv run codex_image \
+uv run agent_cli \
   --project /path/to/project \
   --ro-mount /mnt/datasets:/mnt/datasets \
   --rw-mount /var/ccache_cache:/var/ccache_cache \
@@ -71,15 +71,15 @@ uv run codex_image \
 Resume last session:
 
 ```bash
-uv run codex_image --project /path/to/project --resume
+uv run agent_cli --project /path/to/project --resume
 ```
 
 ## Usage model
 
-- Supported launcher: `uv run codex_image`.
+- Supported launcher: `uv run agent_cli`.
 - All behavior is controlled with CLI arguments.
 
-## Local web panel (`codex_hub`)
+## Local web panel (`agent_hub`)
 
 Build the React frontend first:
 
@@ -89,16 +89,16 @@ yarn install
 yarn build
 ```
 
-`uv run codex_hub` now auto-builds the frontend when needed, so the manual build step above is optional.
+`uv run agent_hub` now auto-builds the frontend when needed, so the manual build step above is optional.
 
 ```bash
-uv run codex_hub
+uv run agent_hub
 ```
 
 Optional:
 
 ```bash
-uv run codex_hub --data-dir /path/to/state --config-file /path/to/config.toml --host 127.0.0.1 --port 8765
+uv run agent_hub --data-dir /path/to/state --config-file /path/to/config.toml --host 127.0.0.1 --port 8765
 ```
 
 Then open:
@@ -110,7 +110,7 @@ http://127.0.0.1:8765
 To access from another machine on the same network:
 
 ```bash
-uv run codex_hub --host 0.0.0.0 --port 8765
+uv run agent_hub --host 0.0.0.0 --port 8765
 ```
 
 Then open:
@@ -119,7 +119,7 @@ Then open:
 http://<hub-host-ip>:8765
 ```
 
-Frontend development (React + Vite, with API proxy to `codex_hub`):
+Frontend development (React + Vite, with API proxy to `agent_hub`):
 
 ```bash
 cd web

@@ -144,6 +144,15 @@ function projectStatusInfo(buildStatus) {
   return { key: "pending", label: "Needs build" };
 }
 
+function SpinnerLabel({ text }) {
+  return (
+    <>
+      <span className="inline-spinner" aria-hidden="true" />
+      <span>{text}</span>
+    </>
+  );
+}
+
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -335,7 +344,7 @@ function ProjectBuildTerminal({ text }) {
     terminal.write(text || "Preparing project image...\r\n");
     terminal.scrollToBottom();
     fitRef.current?.fit();
-  }, [text, status]);
+  }, [text]);
 
   return (
     <div className="terminal-shell project-build-shell">
@@ -455,11 +464,112 @@ export default function App() {
   const [activeTerminalChatId, setActiveTerminalChatId] = useState("");
   const [activeTab, setActiveTab] = useState("projects");
   const [collapsedChats, setCollapsedChats] = useState({});
+  const [pendingSessions, setPendingSessions] = useState([]);
+  const [pendingProjectBuilds, setPendingProjectBuilds] = useState({});
+  const [pendingChatStarts, setPendingChatStarts] = useState({});
 
   const refreshState = useCallback(async () => {
     const payload = await fetchJson("/api/state");
     setHubState(payload);
+    const serverChatMap = new Map((payload.chats || []).map((chat) => [chat.id, chat]));
+    setPendingSessions((prev) =>
+      prev.flatMap((session) => {
+        if (!session.server_chat_id) {
+          return [session];
+        }
+        const onServer = serverChatMap.has(session.server_chat_id);
+        const seenOnServer = Boolean(session.seen_on_server || onServer);
+        if (seenOnServer && !onServer) {
+          return [];
+        }
+        if (seenOnServer === Boolean(session.seen_on_server)) {
+          return [session];
+        }
+        return [{ ...session, seen_on_server: seenOnServer }];
+      })
+    );
+    setPendingChatStarts((prev) => {
+      const next = {};
+      for (const [chatId, pending] of Object.entries(prev)) {
+        if (!pending) {
+          continue;
+        }
+        const serverChat = serverChatMap.get(chatId);
+        if (serverChat && !serverChat.is_running) {
+          next[chatId] = true;
+        }
+      }
+      return next;
+    });
+    setPendingProjectBuilds((prev) => {
+      const next = {};
+      for (const project of payload.projects || []) {
+        if (prev[project.id] && String(project.build_status || "") === "building") {
+          next[project.id] = true;
+        }
+      }
+      return next;
+    });
   }, []);
+
+  const visibleChats = useMemo(() => {
+    const serverChats = hubState.chats || [];
+    const serverChatById = new Map(serverChats.map((chat) => [chat.id, chat]));
+    const mappedServerIds = new Set();
+    const merged = [];
+
+    for (const session of pendingSessions) {
+      const serverId = String(session.server_chat_id || "");
+      if (serverId && serverChatById.has(serverId)) {
+        mappedServerIds.add(serverId);
+        const serverChat = serverChatById.get(serverId);
+        merged.push({ ...serverChat, id: session.ui_id, server_chat_id: serverId });
+        continue;
+      }
+      const knownServerIds = new Set(session.known_server_chat_ids || []);
+      const matchedServerChat = serverChats.find(
+        (chat) =>
+          !mappedServerIds.has(chat.id) &&
+          String(chat.project_id || "") === String(session.project_id || "") &&
+          !knownServerIds.has(chat.id)
+      );
+      if (matchedServerChat) {
+        mappedServerIds.add(matchedServerChat.id);
+        merged.push({
+          ...matchedServerChat,
+          id: session.ui_id,
+          server_chat_id: matchedServerChat.id,
+          is_pending_start: true
+        });
+        continue;
+      }
+      merged.push({
+        id: session.ui_id,
+        server_chat_id: serverId,
+        name: "new-chat",
+        display_name: "New chat",
+        display_subtitle: "Creating workspace and starting worker…",
+        status: "starting",
+        is_running: false,
+        is_pending_start: true,
+        project_id: session.project_id,
+        project_name: session.project_name || "Unknown",
+        workspace: "",
+        container_workspace: "",
+        ro_mounts: [],
+        rw_mounts: [],
+        env_vars: []
+      });
+    }
+
+    for (const chat of serverChats) {
+      if (!mappedServerIds.has(chat.id)) {
+        merged.push(chat);
+      }
+    }
+
+    return merged;
+  }, [hubState.chats, pendingSessions]);
 
   useEffect(() => {
     let mounted = true;
@@ -511,23 +621,31 @@ export default function App() {
       if (!current) {
         return current;
       }
-      const selected = hubState.chats.find((chat) => chat.id === current);
-      if (!selected || !selected.is_running) {
+      const selected = visibleChats.find((chat) => chat.id === current);
+      if (!selected) {
+        return "";
+      }
+      const resolvedChatId = String(selected.server_chat_id || selected.id);
+      const isRunning = Boolean(selected.is_running);
+      const isStarting = Boolean(
+        pendingChatStarts[resolvedChatId] || selected.is_pending_start || String(selected.status || "") === "starting"
+      );
+      if (!isRunning && !isStarting) {
         return "";
       }
       return current;
     });
-  }, [hubState.chats]);
+  }, [visibleChats, pendingChatStarts]);
 
   useEffect(() => {
     setCollapsedChats((prev) => {
       const next = {};
-      for (const chat of hubState.chats) {
+      for (const chat of visibleChats) {
         next[chat.id] = prev[chat.id] ?? true;
       }
       return next;
     });
-  }, [hubState.chats]);
+  }, [visibleChats]);
 
   useEffect(() => {
     let stopped = false;
@@ -592,6 +710,23 @@ export default function App() {
     }));
   }
 
+  function markProjectBuilding(projectId) {
+    setHubState((prev) => ({
+      ...prev,
+      projects: (prev.projects || []).map((project) =>
+        project.id === projectId
+          ? { ...project, build_status: "building", build_error: "" }
+          : project
+      )
+    }));
+    setPendingProjectBuilds((prev) => ({ ...prev, [projectId]: true }));
+    setOpenBuildLogs((prev) => ({ ...prev, [projectId]: false }));
+    setProjectBuildLogs((prev) => ({
+      ...prev,
+      [projectId]: prev[projectId] || "Preparing project image...\r\n"
+    }));
+  }
+
   async function handleCreateProject(event) {
     event.preventDefault();
     try {
@@ -642,13 +777,26 @@ export default function App() {
   }
 
   async function handleSaveProjectSettings(projectId) {
+    setEditingProjects((prev) => ({ ...prev, [projectId]: false }));
+    markProjectBuilding(projectId);
     try {
       await persistProjectSettings(projectId);
-      setEditingProjects((prev) => ({ ...prev, [projectId]: false }));
+      setPendingProjectBuilds((prev) => {
+        const next = { ...prev };
+        delete next[projectId];
+        return next;
+      });
       setError("");
-      await refreshState();
+      refreshState().catch(() => {});
     } catch (err) {
+      setEditingProjects((prev) => ({ ...prev, [projectId]: true }));
+      setPendingProjectBuilds((prev) => {
+        const next = { ...prev };
+        delete next[projectId];
+        return next;
+      });
       setError(err.message || String(err));
+      refreshState().catch(() => {});
     }
   }
 
@@ -669,19 +817,44 @@ export default function App() {
   }
 
   async function handleCreateChat(projectId) {
+    const uiId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const project = projectsById.get(projectId);
+    const knownServerChatIds = (hubState.chats || [])
+      .filter((chat) => String(chat.project_id || "") === String(projectId))
+      .map((chat) => chat.id);
+    setPendingSessions((prev) => [{
+      ui_id: uiId,
+      project_id: projectId,
+      project_name: project?.name || "Unknown",
+      server_chat_id: "",
+      known_server_chat_ids: knownServerChatIds,
+      seen_on_server: false
+    }, ...prev]);
+    setActiveTab("chats");
+    setCollapsedChats((prev) => ({ ...prev, [uiId]: false }));
+    setActiveTerminalChatId(uiId);
+
     try {
       const response = await fetchJson(`/api/projects/${projectId}/chats/start`, {
         method: "POST"
       });
       const chatId = response?.chat?.id;
       if (chatId) {
-        setActiveTab("chats");
-        setActiveTerminalChatId(chatId);
-        setCollapsedChats((prev) => ({ ...prev, [chatId]: false }));
+        setPendingSessions((prev) =>
+          prev.map((session) =>
+            session.ui_id === uiId ? { ...session, server_chat_id: chatId } : session
+          )
+        );
+        setPendingChatStarts((prev) => ({ ...prev, [chatId]: true }));
+      } else {
+        setPendingSessions((prev) => prev.filter((session) => session.ui_id !== uiId));
+        setActiveTerminalChatId((current) => (current === uiId ? "" : current));
       }
       setError("");
-      await refreshState();
+      refreshState().catch(() => {});
     } catch (err) {
+      setPendingSessions((prev) => prev.filter((session) => session.ui_id !== uiId));
+      setActiveTerminalChatId((current) => (current === uiId ? "" : current));
       setError(err.message || String(err));
     }
   }
@@ -692,46 +865,85 @@ export default function App() {
     if (!window.confirm(`Delete project '${label}' and all chats?`)) {
       return;
     }
+    setHubState((prev) => ({
+      ...prev,
+      projects: (prev.projects || []).filter((projectItem) => projectItem.id !== projectId),
+      chats: (prev.chats || []).filter((chat) => chat.project_id !== projectId)
+    }));
+    setPendingSessions((prev) => prev.filter((session) => session.project_id !== projectId));
     try {
       await fetchJson(`/api/projects/${projectId}`, { method: "DELETE" });
       setError("");
-      await refreshState();
+      refreshState().catch(() => {});
     } catch (err) {
       setError(err.message || String(err));
+      refreshState().catch(() => {});
     }
   }
 
   async function handleStartChat(chatId) {
+    setPendingChatStarts((prev) => ({ ...prev, [chatId]: true }));
+    setCollapsedChats((prev) => ({ ...prev, [chatId]: false }));
+    setActiveTerminalChatId(chatId);
     try {
       await fetchJson(`/api/chats/${chatId}/start`, { method: "POST" });
-      setActiveTerminalChatId(chatId);
-      setCollapsedChats((prev) => ({ ...prev, [chatId]: false }));
       setError("");
-      await refreshState();
+      refreshState().catch(() => {});
     } catch (err) {
+      setPendingChatStarts((prev) => {
+        const next = { ...prev };
+        delete next[chatId];
+        return next;
+      });
       setError(err.message || String(err));
+      refreshState().catch(() => {});
     }
   }
 
-  async function handleDeleteChat(chatId) {
+  async function handleDeleteChat(chatId, uiId = chatId) {
+    setHubState((prev) => ({
+      ...prev,
+      chats: (prev.chats || []).filter((chat) => chat.id !== chatId)
+    }));
+    setPendingSessions((prev) =>
+      prev.filter((session) => session.ui_id !== uiId && session.server_chat_id !== chatId)
+    );
+    setPendingChatStarts((prev) => {
+      const next = { ...prev };
+      delete next[chatId];
+      return next;
+    });
     try {
       await fetchJson(`/api/chats/${chatId}`, { method: "DELETE" });
-      setActiveTerminalChatId((current) => (current === chatId ? "" : current));
+      setActiveTerminalChatId((current) => (current === uiId || current === chatId ? "" : current));
       setError("");
-      await refreshState();
+      refreshState().catch(() => {});
     } catch (err) {
       setError(err.message || String(err));
+      refreshState().catch(() => {});
     }
   }
 
   async function handleBuildProject(projectId) {
+    markProjectBuilding(projectId);
     try {
       await persistProjectSettings(projectId);
       setEditingProjects((prev) => ({ ...prev, [projectId]: false }));
+      setPendingProjectBuilds((prev) => {
+        const next = { ...prev };
+        delete next[projectId];
+        return next;
+      });
       setError("");
-      await refreshState();
+      refreshState().catch(() => {});
     } catch (err) {
+      setPendingProjectBuilds((prev) => {
+        const next = { ...prev };
+        delete next[projectId];
+        return next;
+      });
       setError(err.message || String(err));
+      refreshState().catch(() => {});
     }
   }
 
@@ -759,7 +971,7 @@ export default function App() {
       byProject.set(project.id, []);
     }
     const orphanChats = [];
-    for (const chat of hubState.chats) {
+    for (const chat of visibleChats) {
       if (!byProject.has(chat.project_id)) {
         orphanChats.push(chat);
         continue;
@@ -767,14 +979,14 @@ export default function App() {
       byProject.get(chat.project_id).push(chat);
     }
     return { byProject, orphanChats };
-  }, [hubState.projects, hubState.chats]);
+  }, [hubState.projects, visibleChats]);
 
   return (
     <div className="app-root">
       <header className="app-header">
         <div className="header-row">
           <div>
-            <h1>Codex Hub</h1>
+            <h1>Agent Hub</h1>
             <p>Project-level workspaces, one cloned directory per chat.</p>
           </div>
           <div className="tab-row">
@@ -861,12 +1073,19 @@ export default function App() {
               {hubState.projects.length === 0 ? <div className="empty">No projects yet.</div> : null}
               {hubState.projects.map((project) => {
                 const draft = projectDrafts[project.id] || projectDraftFromProject(project);
+                const setupCommands = String(project.setup_script || "")
+                  .split("\n")
+                  .map((line) => line.trim())
+                  .filter(Boolean);
+                const defaultRoMounts = project.default_ro_mounts || [];
+                const defaultRwMounts = project.default_rw_mounts || [];
+                const defaultEnvVars = project.default_env_vars || [];
                 const defaultVolumeCount =
-                  (project.default_ro_mounts || []).length + (project.default_rw_mounts || []).length;
-                const defaultEnvCount = (project.default_env_vars || []).length;
+                  defaultRoMounts.length + defaultRwMounts.length;
+                const defaultEnvCount = defaultEnvVars.length;
                 const buildStatus = String(project.build_status || "pending");
                 const statusInfo = projectStatusInfo(buildStatus);
-                const isBuilding = buildStatus === "building";
+                const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
                 const canStartChat = buildStatus === "ready";
                 const canShowStoredLogButton = buildStatus === "ready" || buildStatus === "failed";
                 const isEditing = Boolean(editingProjects[project.id]);
@@ -894,30 +1113,57 @@ export default function App() {
                     <div className="meta">Branch: {project.default_branch || "master"}</div>
                     <div className="meta">Status: <span className={`project-build-state ${statusInfo.key}`}>{statusInfo.label}</span></div>
                     <div className="meta">
-                      Setup commands: {setupCommandCount(project.setup_script || "")}
-                    </div>
-                    <div className="meta">
                       Base image source:{" "}
                       {project.base_image_value
                         ? `${baseModeLabel(normalizeBaseMode(project.base_image_mode))}: ${project.base_image_value}`
-                        : "Default codex_image base image"}
+                        : "Default agent_cli base image"}
                     </div>
                     {project.setup_snapshot_image ? (
                       <div className="meta">Setup snapshot image: {project.setup_snapshot_image}</div>
                     ) : null}
                     {project.build_error ? <div className="meta build-error">{project.build_error}</div> : null}
-                    <div className="meta">
-                      Default volumes: {defaultVolumeCount} | Default env vars: {defaultEnvCount}
-                    </div>
+                    {setupCommands.length > 0 ? (
+                      <details className="details-block">
+                        <summary className="details-summary">Setup commands ({setupCommands.length})</summary>
+                        <pre className="log-box details-log">{setupCommands.join("\n")}</pre>
+                      </details>
+                    ) : null}
+                    {defaultVolumeCount > 0 ? (
+                      <details className="details-block">
+                        <summary className="details-summary">Default volumes ({defaultVolumeCount})</summary>
+                        <div className="details-list">
+                          {defaultRoMounts.map((mount, idx) => (
+                            <div className="meta" key={`ro-${project.id}-${idx}`}>read-only: {mount}</div>
+                          ))}
+                          {defaultRwMounts.map((mount, idx) => (
+                            <div className="meta" key={`rw-${project.id}-${idx}`}>read-write: {mount}</div>
+                          ))}
+                        </div>
+                      </details>
+                    ) : null}
+                    {defaultEnvCount > 0 ? (
+                      <details className="details-block">
+                        <summary className="details-summary">Default environment variables ({defaultEnvCount})</summary>
+                        <div className="details-list">
+                          {defaultEnvVars.map((entry, idx) => (
+                            <div className="meta" key={`env-${project.id}-${idx}`}>{entry}</div>
+                          ))}
+                        </div>
+                      </details>
+                    ) : null}
 
                     <div className="stack compact">
                       <button
                         type="button"
                         className="btn-primary"
-                        disabled={isBuilding}
+                        disabled={!canStartChat && isBuilding}
                         onClick={() => (canStartChat ? handleCreateChat(project.id) : handleBuildProject(project.id))}
                       >
-                        {canStartChat ? "New chat" : isBuilding ? "Building image..." : "Build"}
+                        {canStartChat
+                          ? "New chat"
+                          : isBuilding
+                            ? <SpinnerLabel text="Building image..." />
+                            : "Build"}
                       </button>
                       {isBuilding ? (
                         <ProjectBuildTerminal
@@ -928,7 +1174,7 @@ export default function App() {
                         <div className="actions">
                           <button
                             type="button"
-                            className="btn-secondary btn-small"
+                            className="btn-secondary btn-small build-log-toggle"
                             onClick={() => handleToggleStoredBuildLog(project.id)}
                           >
                             {isStoredLogOpen ? "Hide stored build log" : "Show stored build log"}
@@ -1025,7 +1271,7 @@ export default function App() {
                 const buildStatus = String(project.build_status || "pending");
                 const statusInfo = projectStatusInfo(buildStatus);
                 const canStartChat = buildStatus === "ready";
-                const isBuilding = buildStatus === "building";
+                const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
                 return (
                   <article className="card project-chat-group" key={`group-${project.id}`}>
                     <div className="project-head">
@@ -1036,33 +1282,62 @@ export default function App() {
                       <button
                         type="button"
                         className="btn-primary"
-                        disabled={isBuilding}
+                        disabled={!canStartChat && isBuilding}
                         onClick={() => (canStartChat ? handleCreateChat(project.id) : handleBuildProject(project.id))}
                       >
-                        {canStartChat ? "New chat" : isBuilding ? "Building image..." : "Build"}
+                        {canStartChat
+                          ? "New chat"
+                          : isBuilding
+                            ? <SpinnerLabel text="Building image..." />
+                            : "Build"}
                       </button>
                     </div>
 
                     <div className="stack compact">
                       {projectChats.length === 0 ? <div className="empty">No chats yet for this project.</div> : null}
                       {projectChats.map((chat) => {
+                        const resolvedChatId = String(chat.server_chat_id || chat.id || "");
+                        const hasServerChat = Boolean(chat.server_chat_id || !String(chat.id || "").startsWith("pending-"));
                         const isRunning = Boolean(chat.is_running);
+                        const isStarting = Boolean(
+                          pendingChatStarts[resolvedChatId] || chat.is_pending_start || String(chat.status || "") === "starting"
+                        );
                         const volumeCount = (chat.ro_mounts || []).length + (chat.rw_mounts || []).length;
                         const envCount = (chat.env_vars || []).length;
                         const isActiveTerminal = activeTerminalChatId === chat.id;
                         const collapsed = collapsedChats[chat.id] ?? true;
                         return (
                           <article className="card" key={chat.id}>
-                            <h3>{chat.display_name || chat.name}</h3>
-                            <div className="meta">
-                              <span className={`status ${isRunning ? "running" : "stopped"}`}>{chat.status}</span>{" "}
-                              {chat.project_name}
+                            <div
+                              className="chat-card-header"
+                              role="button"
+                              tabIndex={0}
+                              onClick={() => setCollapsedChats((prev) => ({ ...prev, [chat.id]: !collapsed }))}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter" || event.key === " ") {
+                                  event.preventDefault();
+                                  setCollapsedChats((prev) => ({ ...prev, [chat.id]: !collapsed }));
+                                }
+                              }}
+                            >
+                              <h3>{chat.display_name || chat.name}</h3>
+                              <div className="meta">
+                                <span className={`status ${isRunning ? "running" : isStarting ? "starting" : "stopped"}`}>
+                                  {isRunning ? chat.status : isStarting ? "starting" : chat.status}
+                                </span>{" "}
+                                {chat.project_name}
+                              </div>
+                              {collapsed ? (
+                                <div className="meta">
+                                  {isStarting
+                                    ? "Starting chat and preparing terminal..."
+                                    : chat.display_subtitle || "No recent assistant summary yet."}
+                                </div>
+                              ) : null}
                             </div>
-                            {collapsed ? (
-                              <div className="meta">{chat.display_subtitle || "No recent assistant summary yet."}</div>
-                            ) : (
+                            {!collapsed ? (
                               <>
-                                <div className="meta">Chat ID: {chat.id}</div>
+                                <div className="meta">Chat ID: {resolvedChatId || "starting..."}</div>
                                 <div className="meta">Workspace: {chat.workspace}</div>
                                 <div className="meta">Container folder: {chat.container_workspace || "not started yet"}</div>
                                 {chat.setup_snapshot_image ? (
@@ -1070,19 +1345,28 @@ export default function App() {
                                 ) : null}
                                 <div className="meta">Volumes: {volumeCount} | Env vars: {envCount}</div>
                               </>
-                            )}
+                            ) : null}
 
                             <div className="stack compact">
-                              <div className="actions">
-                                {!isRunning ? (
-                                  <button type="button" className="btn-primary" onClick={() => handleStartChat(chat.id)}>
+                              <div className="actions chat-actions">
+                                {!isRunning && !isStarting && hasServerChat ? (
+                                  <button
+                                    type="button"
+                                    className="btn-primary chat-primary-action"
+                                    onClick={() => handleStartChat(resolvedChatId)}
+                                  >
                                     Start
+                                  </button>
+                                ) : null}
+                                {isStarting ? (
+                                  <button type="button" className="btn-primary chat-primary-action" disabled>
+                                    Starting...
                                   </button>
                                 ) : null}
                                 {isRunning ? (
                                   <button
                                     type="button"
-                                    className="btn-primary"
+                                    className="btn-primary chat-primary-action"
                                     onClick={() => {
                                       setActiveTerminalChatId(chat.id);
                                       setCollapsedChats((prev) => ({ ...prev, [chat.id]: false }));
@@ -1091,19 +1375,33 @@ export default function App() {
                                     {isActiveTerminal ? "Connected" : "Connect"}
                                   </button>
                                 ) : null}
-                                <button type="button" className="btn-danger" onClick={() => handleDeleteChat(chat.id)}>
-                                  Delete
-                                </button>
                                 <button
                                   type="button"
-                                  className="btn-secondary"
-                                  onClick={() => setCollapsedChats((prev) => ({ ...prev, [chat.id]: !collapsed }))}
+                                  className="btn-danger"
+                                  onClick={() => {
+                                    if (!hasServerChat) {
+                                      setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chat.id));
+                                      setActiveTerminalChatId((current) => (current === chat.id ? "" : current));
+                                      return;
+                                    }
+                                    handleDeleteChat(resolvedChatId, chat.id);
+                                  }}
                                 >
-                                  {collapsed ? "Expand" : "Collapse"}
+                                  Delete
                                 </button>
                               </div>
 
-                              {!collapsed && isActiveTerminal ? <ChatTerminal chatId={chat.id} running={isRunning} /> : null}
+                              {!collapsed && isActiveTerminal ? (
+                                isStarting && !isRunning ? (
+                                  <div className="terminal-shell chat-terminal-shell chat-terminal-placeholder">
+                                    <div className="terminal-overlay">
+                                      <span className="inline-spinner" aria-hidden="true" />
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <ChatTerminal chatId={resolvedChatId} running={isRunning} />
+                                )
+                              ) : null}
                             </div>
                           </article>
                         );
@@ -1119,26 +1417,62 @@ export default function App() {
                   </div>
                   <div className="stack compact">
                     {chatsByProject.orphanChats.map((chat) => {
+                      const resolvedChatId = String(chat.server_chat_id || chat.id || "");
+                      const hasServerChat = Boolean(chat.server_chat_id || !String(chat.id || "").startsWith("pending-"));
                       const isRunning = Boolean(chat.is_running);
+                      const isStarting = Boolean(
+                        pendingChatStarts[resolvedChatId] || chat.is_pending_start || String(chat.status || "") === "starting"
+                      );
                       const isActiveTerminal = activeTerminalChatId === chat.id;
                       const collapsed = collapsedChats[chat.id] ?? true;
                       return (
                         <article className="card" key={chat.id}>
-                          <h3>{chat.display_name || chat.name}</h3>
-                          <div className="meta">
-                            <span className={`status ${isRunning ? "running" : "stopped"}`}>{chat.status}</span>
+                          <div
+                            className="chat-card-header"
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => setCollapsedChats((prev) => ({ ...prev, [chat.id]: !collapsed }))}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === " ") {
+                                event.preventDefault();
+                                setCollapsedChats((prev) => ({ ...prev, [chat.id]: !collapsed }));
+                              }
+                            }}
+                          >
+                            <h3>{chat.display_name || chat.name}</h3>
+                            <div className="meta">
+                              <span className={`status ${isRunning ? "running" : isStarting ? "starting" : "stopped"}`}>
+                                {isRunning ? chat.status : isStarting ? "starting" : chat.status}
+                              </span>
+                            </div>
+                            {collapsed ? (
+                              <div className="meta">
+                                {isStarting
+                                  ? "Starting chat and preparing terminal..."
+                                  : chat.display_subtitle || "No recent assistant summary yet."}
+                              </div>
+                            ) : null}
                           </div>
                           <div className="stack compact">
-                            <div className="actions">
-                              {!isRunning ? (
-                                <button type="button" className="btn-primary" onClick={() => handleStartChat(chat.id)}>
+                            <div className="actions chat-actions">
+                              {!isRunning && !isStarting && hasServerChat ? (
+                                <button
+                                  type="button"
+                                  className="btn-primary chat-primary-action"
+                                  onClick={() => handleStartChat(resolvedChatId)}
+                                >
                                   Start
+                                </button>
+                              ) : null}
+                              {isStarting ? (
+                                <button type="button" className="btn-primary chat-primary-action" disabled>
+                                  Starting...
                                 </button>
                               ) : null}
                               {isRunning ? (
                                 <button
                                   type="button"
-                                  className="btn-primary"
+                                  className="btn-primary chat-primary-action"
                                   onClick={() => {
                                     setActiveTerminalChatId(chat.id);
                                     setCollapsedChats((prev) => ({ ...prev, [chat.id]: false }));
@@ -1147,18 +1481,32 @@ export default function App() {
                                   {isActiveTerminal ? "Connected" : "Connect"}
                                 </button>
                               ) : null}
-                              <button type="button" className="btn-danger" onClick={() => handleDeleteChat(chat.id)}>
-                                Delete
-                              </button>
                               <button
                                 type="button"
-                                className="btn-secondary"
-                                onClick={() => setCollapsedChats((prev) => ({ ...prev, [chat.id]: !collapsed }))}
+                                className="btn-danger"
+                                onClick={() => {
+                                  if (!hasServerChat) {
+                                    setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chat.id));
+                                    setActiveTerminalChatId((current) => (current === chat.id ? "" : current));
+                                    return;
+                                  }
+                                  handleDeleteChat(resolvedChatId, chat.id);
+                                }}
                               >
-                                {collapsed ? "Expand" : "Collapse"}
+                                Delete
                               </button>
                             </div>
-                            {!collapsed && isActiveTerminal ? <ChatTerminal chatId={chat.id} running={isRunning} /> : null}
+                            {!collapsed && isActiveTerminal ? (
+                              isStarting && !isRunning ? (
+                                <div className="terminal-shell chat-terminal-shell chat-terminal-placeholder">
+                                  <div className="terminal-overlay">
+                                    <span className="inline-spinner" aria-hidden="true" />
+                                  </div>
+                                </div>
+                              ) : (
+                                <ChatTerminal chatId={resolvedChatId} running={isRunning} />
+                              )
+                            ) : null}
                           </div>
                         </article>
                       );

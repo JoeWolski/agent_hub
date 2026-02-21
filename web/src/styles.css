@@ -200,6 +200,10 @@ button {
   cursor: pointer;
   font-weight: 600;
   transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
 }
 
 .btn-primary {
@@ -306,6 +310,35 @@ button {
   overflow-wrap: anywhere;
 }
 
+.details-block {
+  margin-top: 0.38rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.34rem 0.5rem;
+  background: color-mix(in srgb, var(--panel) 96%, transparent);
+}
+
+.details-summary {
+  cursor: pointer;
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.details-block[open] .details-summary {
+  margin-bottom: 0.42rem;
+}
+
+.details-list {
+  display: grid;
+  gap: 0.24rem;
+}
+
+.details-log {
+  margin-top: 0;
+  max-height: 220px;
+}
+
 .build-error {
   color: var(--danger);
   white-space: pre-wrap;
@@ -326,6 +359,20 @@ button {
 
 .status.stopped {
   background: #7e8798;
+}
+
+.status.starting {
+  background: #1d4ed8;
+}
+
+.inline-spinner {
+  width: 0.82rem;
+  height: 0.82rem;
+  border: 2px solid rgba(255, 255, 255, 0.5);
+  border-top-color: #ffffff;
+  border-radius: 999px;
+  animation: spin 0.8s linear infinite;
+  flex: 0 0 auto;
 }
 
 .label {
@@ -368,6 +415,32 @@ button {
   width: auto;
 }
 
+.chat-actions .chat-primary-action {
+  min-width: 8.75rem;
+}
+
+.build-log-toggle {
+  min-width: 11.5rem;
+}
+
+.chat-card-header {
+  cursor: pointer;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 0.25rem 0.35rem;
+  margin: -0.25rem -0.35rem 0;
+}
+
+.chat-card-header:hover {
+  background: color-mix(in srgb, var(--panel) 94%, var(--line));
+}
+
+.chat-card-header:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(16, 163, 127, 0.18);
+}
+
 .log-box {
   margin: 0;
   border: 1px solid var(--line);
@@ -391,6 +464,24 @@ button {
   min-height: 220px;
   max-height: 82vh;
   resize: vertical;
+}
+
+.chat-terminal-placeholder {
+  position: relative;
+  resize: none;
+}
+
+.terminal-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(11, 16, 24, 0.62);
+}
+
+.terminal-overlay .inline-spinner {
+  width: 1.35rem;
+  height: 1.35rem;
 }
 
 .terminal-toolbar {
@@ -505,4 +596,13 @@ button {
 
 .project-chat-group > .stack.compact {
   margin-top: 0.65rem;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }

@@ -16,8 +16,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-import codex_hub.server as hub_server
-import codex_image.cli as image_cli
+import agent_hub.server as hub_server
+import agent_cli.cli as image_cli
 
 
 class HubStateTests(unittest.TestCase):
@@ -84,7 +84,7 @@ class HubStateTests(unittest.TestCase):
             ro_mounts=[f"{self.host_ro}:/ro_data"],
             rw_mounts=[f"{self.host_rw}:/rw_data"],
             env_vars=["FOO=bar", "EMPTY="],
-            codex_args=["--model", "gpt-5"],
+            agent_args=["--model", "gpt-5"],
         )
 
         captured: dict[str, list[str]] = {}
@@ -104,7 +104,7 @@ class HubStateTests(unittest.TestCase):
         with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
             hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
         ), patch(
-            "codex_hub.server._docker_image_exists",
+            "agent_hub.server._docker_image_exists",
             return_value=True,
         ), patch.object(
             hub_server.HubState,
@@ -140,7 +140,7 @@ class HubStateTests(unittest.TestCase):
             ro_mounts=[],
             rw_mounts=[],
             env_vars=[],
-            codex_args=[],
+            agent_args=[],
         )
 
         def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
@@ -185,11 +185,11 @@ class HubStateTests(unittest.TestCase):
             ro_mounts=[],
             rw_mounts=[],
             env_vars=[],
-            codex_args=[],
+            agent_args=[],
         )
 
         with patch(
-            "codex_hub.server._docker_image_exists",
+            "agent_hub.server._docker_image_exists",
             return_value=True,
         ):
             with self.assertRaises(HTTPException):
@@ -207,7 +207,7 @@ class HubStateTests(unittest.TestCase):
             ro_mounts=[],
             rw_mounts=[],
             env_vars=[],
-            codex_args=[],
+            agent_args=[],
         )
 
         chat_workspace = self.state.chat_workdir(chat["id"])
@@ -221,7 +221,7 @@ class HubStateTests(unittest.TestCase):
         state_before["chats"][chat["id"]]["setup_snapshot_image"] = "chat-snapshot"
         self.state.save(state_before)
 
-        with patch("codex_hub.server._docker_remove_images") as docker_rm:
+        with patch("agent_hub.server._docker_remove_images") as docker_rm:
             summary = self.state.clean_start()
 
         self.assertEqual(summary["cleared_chats"], 1)
@@ -242,7 +242,7 @@ class HubStateTests(unittest.TestCase):
 
         docker_rm.assert_called_once()
         prefixes, tags = docker_rm.call_args[0]
-        self.assertEqual(prefixes, ("codex-hub-setup-", "codex-base-"))
+        self.assertEqual(prefixes, ("agent-hub-setup-", "agent-base-"))
         self.assertIn("project-snapshot", tags)
         self.assertIn("chat-snapshot", tags)
 
@@ -271,8 +271,8 @@ class HubStateTests(unittest.TestCase):
                 stderr = ""
             return Dummy()
 
-        with patch("codex_hub.server._docker_image_exists", side_effect=[False, True]), patch(
-            "codex_hub.server._run", side_effect=fake_run
+        with patch("agent_hub.server._docker_image_exists", side_effect=[False, True]), patch(
+            "agent_hub.server._run", side_effect=fake_run
         ):
             first = self.state._ensure_project_setup_snapshot(workspace, project)
             second = self.state._ensure_project_setup_snapshot(workspace, project)
@@ -280,7 +280,7 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(executed), 1)
         cmd = executed[0]
-        self.assertIn("codex_image", cmd)
+        self.assertIn("agent_cli", cmd)
         self.assertIn("--prepare-snapshot-only", cmd)
         self.assertIn("--snapshot-image-tag", cmd)
         self.assertIn("--setup-script", cmd)
@@ -288,7 +288,7 @@ class HubStateTests(unittest.TestCase):
     def test_resize_terminal_sets_pty_size(self) -> None:
         runtime = hub_server.ChatRuntime(process=SimpleNamespace(pid=1), master_fd=42)
         with patch.object(hub_server.HubState, "_runtime_for_chat", return_value=runtime), patch(
-            "codex_hub.server.fcntl.ioctl"
+            "agent_hub.server.fcntl.ioctl"
         ) as ioctl_mock:
             self.state.resize_terminal("chat-1", 120, 40)
         self.assertEqual(ioctl_mock.call_count, 1)
@@ -305,7 +305,7 @@ class HubStateTests(unittest.TestCase):
             ro_mounts=[],
             rw_mounts=[],
             env_vars=[],
-            codex_args=[],
+            agent_args=[],
         )
         workspace = Path(chat["workspace"])
         self.assertEqual(workspace.name, f"Demo_Project_{chat['id']}")
@@ -322,7 +322,7 @@ class HubStateTests(unittest.TestCase):
             ro_mounts=[],
             rw_mounts=[],
             env_vars=[],
-            codex_args=[],
+            agent_args=[],
         )
         workspace = self.state.chat_workdir(chat["id"])
         workspace.mkdir(parents=True, exist_ok=True)
@@ -344,15 +344,15 @@ class HubStateTests(unittest.TestCase):
             ro_mounts=[],
             rw_mounts=[],
             env_vars=[],
-            codex_args=[],
+            agent_args=[],
         )
         state_data = self.state.load()
         state_data["chats"][chat["id"]]["status"] = "running"
         state_data["chats"][chat["id"]]["pid"] = 424242
         self.state.save(state_data)
 
-        with patch("codex_hub.server._is_process_running", return_value=False), patch(
-            "codex_hub.server._stop_process"
+        with patch("agent_hub.server._is_process_running", return_value=False), patch(
+            "agent_hub.server._stop_process"
         ):
             payload = self.state.state_payload()
 
@@ -370,9 +370,9 @@ class HubStateTests(unittest.TestCase):
             ro_mounts=[],
             rw_mounts=[],
             env_vars=[],
-            codex_args=[],
+            agent_args=[],
         )
-        with patch("codex_hub.server._is_process_running", return_value=False):
+        with patch("agent_hub.server._is_process_running", return_value=False):
             payload = self.state.state_payload()
         self.assertEqual(len(payload["chats"]), 1)
         self.assertEqual(payload["chats"][0]["id"], chat["id"])
@@ -390,7 +390,7 @@ class HubStateTests(unittest.TestCase):
             ro_mounts=[],
             rw_mounts=[],
             env_vars=[],
-            codex_args=[],
+            agent_args=[],
         )
         self.state.chat_log(chat["id"]).write_text(
             "Tip: example\n> how do i run tests?\nUse uv run python -m unittest discover -s tests -v\n",
@@ -401,12 +401,58 @@ class HubStateTests(unittest.TestCase):
         state_data["chats"][chat["id"]]["pid"] = 1111
         self.state.save(state_data)
 
-        with patch("codex_hub.server._is_process_running", return_value=True):
+        with patch("agent_hub.server._is_process_running", return_value=True):
             payload = self.state.state_payload()
 
         chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
         self.assertEqual(chat_payload["display_name"], "how do i run tests?")
         self.assertTrue(chat_payload["display_subtitle"].startswith("Use uv run python -m unittest"))
+
+    def test_shutdown_stops_running_chats_and_persists_state(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        running_chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        stopped_chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+
+        state_data = self.state.load()
+        state_data["chats"][running_chat["id"]]["status"] = "running"
+        state_data["chats"][running_chat["id"]]["pid"] = 5001
+        state_data["chats"][stopped_chat["id"]]["status"] = "stopped"
+        state_data["chats"][stopped_chat["id"]]["pid"] = None
+        self.state.save(state_data)
+
+        with patch.object(hub_server.HubState, "_close_runtime"), patch(
+            "agent_hub.server._is_process_running",
+            side_effect=lambda pid: pid == 5001,
+        ), patch(
+            "agent_hub.server._stop_processes",
+            return_value=1,
+        ) as stop_many:
+            summary = self.state.shutdown()
+
+        self.assertEqual(summary["stopped_chats"], 1)
+        self.assertEqual(summary["closed_chats"], 1)
+        stop_many.assert_called_once_with([5001], timeout_seconds=4.0)
+
+        post = self.state.load()
+        self.assertNotIn(running_chat["id"], post["chats"])
+        self.assertIn(stopped_chat["id"], post["chats"])
 
 
 class CliEnvVarTests(unittest.TestCase):
@@ -423,7 +469,7 @@ class CliEnvVarTests(unittest.TestCase):
             tmp_path = Path(tmp)
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
-            config = tmp_path / "codex.config.toml"
+            config = tmp_path / "agent.config.toml"
             config.write_text("model = 'test'\n", encoding="utf-8")
 
             commands: list[list[str]] = []
@@ -433,14 +479,14 @@ class CliEnvVarTests(unittest.TestCase):
                 commands.append(list(cmd))
 
             runner = CliRunner()
-            with patch("codex_image.cli.shutil.which", return_value="/usr/bin/docker"), patch(
-                "codex_image.cli._read_openai_api_key", return_value=None
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
-                "codex_image.cli._docker_image_exists", return_value=False
+                "agent_cli.cli._docker_image_exists", return_value=False
             ), patch(
-                "codex_image.cli._docker_rm_force", return_value=None
+                "agent_cli.cli._docker_rm_force", return_value=None
             ), patch(
-                "codex_image.cli._run", side_effect=fake_run
+                "agent_cli.cli._run", side_effect=fake_run
             ):
                 result = runner.invoke(
                     image_cli.main,
@@ -478,7 +524,7 @@ class CliEnvVarTests(unittest.TestCase):
             tmp_path = Path(tmp)
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
-            config = tmp_path / "codex.config.toml"
+            config = tmp_path / "agent.config.toml"
             config.write_text("model = 'test'\n", encoding="utf-8")
 
             commands: list[list[str]] = []
@@ -488,12 +534,12 @@ class CliEnvVarTests(unittest.TestCase):
                 commands.append(list(cmd))
 
             runner = CliRunner()
-            with patch("codex_image.cli.shutil.which", return_value="/usr/bin/docker"), patch(
-                "codex_image.cli._read_openai_api_key", return_value=None
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
-                "codex_image.cli._docker_image_exists", return_value=True
+                "agent_cli.cli._docker_image_exists", return_value=True
             ), patch(
-                "codex_image.cli._run", side_effect=fake_run
+                "agent_cli.cli._run", side_effect=fake_run
             ):
                 result = runner.invoke(
                     image_cli.main,
@@ -511,15 +557,15 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, msg=result.output)
             self.assertEqual(commands, [])
 
-    def test_codex_hub_main_clean_start_invokes_state_cleanup(self) -> None:
+    def test_agent_hub_main_clean_start_invokes_state_cleanup(self) -> None:
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             data_dir = tmp_path / "hub"
-            config = tmp_path / "codex.config.toml"
+            config = tmp_path / "agent.config.toml"
             config.write_text("model = 'test'\n", encoding="utf-8")
 
-            with patch("codex_hub.server.uvicorn.run", return_value=None), patch.object(
+            with patch("agent_hub.server.uvicorn.run", return_value=None), patch.object(
                 hub_server.HubState,
                 "clean_start",
                 return_value={
