@@ -1,0 +1,550 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+from types import SimpleNamespace
+
+from click.testing import CliRunner
+from fastapi import HTTPException
+
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+import codex_hub.server as hub_server
+import codex_image.cli as image_cli
+
+
+class HubStateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self.tmp.name)
+        self.config_file = self.tmp_path / "config.toml"
+        self.config_file.write_text("model = 'test'\n", encoding="utf-8")
+        self.snapshot_patcher = patch.object(
+            hub_server.HubState,
+            "_prepare_project_snapshot_for_project",
+            lambda state_obj, project, **_kwargs: state_obj._project_setup_snapshot_tag(project),
+        )
+        self.snapshot_patcher.start()
+        self.schedule_patcher = patch.object(
+            hub_server.HubState,
+            "_schedule_project_build",
+            lambda state_obj, project_id: state_obj._build_project_snapshot(project_id),
+        )
+        self.schedule_patcher.start()
+        self.state = hub_server.HubState(self.tmp_path / "hub", self.config_file)
+        self.host_ro = self.tmp_path / "host_ro"
+        self.host_rw = self.tmp_path / "host_rw"
+        self.host_ro.mkdir(parents=True, exist_ok=True)
+        self.host_rw.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        self.snapshot_patcher.stop()
+        self.schedule_patcher.stop()
+        self.tmp.cleanup()
+
+    def test_project_defaults_are_persisted(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            name="demo",
+            default_branch="main",
+            setup_script="echo hi",
+            base_image_mode="tag",
+            base_image_value="nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04",
+            default_ro_mounts=[f"{self.host_ro}:/data_ro"],
+            default_rw_mounts=[f"{self.host_rw}:/data_rw"],
+            default_env_vars=["FOO=bar"],
+        )
+        payload = self.state.state_payload()
+        loaded = next(item for item in payload["projects"] if item["id"] == project["id"])
+        self.assertEqual(loaded["default_ro_mounts"], [f"{self.host_ro}:/data_ro"])
+        self.assertEqual(loaded["default_rw_mounts"], [f"{self.host_rw}:/data_rw"])
+        self.assertEqual(loaded["default_env_vars"], ["FOO=bar"])
+        self.assertEqual(loaded["base_image_mode"], "tag")
+        self.assertEqual(loaded["setup_snapshot_image"], self.state._project_setup_snapshot_tag(project))
+        self.assertEqual(loaded["build_status"], "ready")
+
+    def test_start_chat_builds_cmd_with_mounts_env_and_repo_base_path(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            base_image_mode="repo_path",
+            base_image_value="docker/base",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="fast",
+            ro_mounts=[f"{self.host_ro}:/ro_data"],
+            rw_mounts=[f"{self.host_rw}:/rw_data"],
+            env_vars=["FOO=bar", "EMPTY="],
+            codex_args=["--model", "gpt-5"],
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            (workspace / "docker" / "base").mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        class DummyProc:
+            pid = 4242
+
+        def fake_spawn(_: hub_server.HubState, _chat_id: str, cmd: list[str]) -> DummyProc:
+            captured["cmd"] = list(cmd)
+            return DummyProc()
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "codex_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+            fake_spawn,
+        ):
+            self.state.start_chat(chat["id"])
+
+        cmd = captured["cmd"]
+        workspace = self.state.chat_workdir(chat["id"])
+        self.assertIn("--base", cmd)
+        self.assertIn(str(workspace / "docker" / "base"), cmd)
+        self.assertIn("--ro-mount", cmd)
+        self.assertIn(f"{self.host_ro}:/ro_data", cmd)
+        self.assertIn("--rw-mount", cmd)
+        self.assertIn(f"{self.host_rw}:/rw_data", cmd)
+        self.assertIn("--env-var", cmd)
+        self.assertIn("FOO=bar", cmd)
+        self.assertIn("EMPTY=", cmd)
+        self.assertIn("--snapshot-image-tag", cmd)
+        self.assertIn(self.state._project_setup_snapshot_tag(project), cmd)
+
+    def test_start_chat_rejects_base_path_outside_workspace(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            base_image_mode="repo_path",
+            base_image_value="../outside",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            codex_args=[],
+        )
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ):
+            with self.assertRaises(HTTPException):
+                self.state.start_chat(chat["id"])
+
+    def test_create_and_start_chat_rejects_when_project_build_is_not_ready(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        state_data = self.state.load()
+        state_data["projects"][project["id"]]["build_status"] = "building"
+        state_data["projects"][project["id"]]["setup_snapshot_image"] = ""
+        self.state.save(state_data)
+
+        with self.assertRaises(HTTPException):
+            self.state.create_and_start_chat(project["id"])
+
+    def test_start_chat_rejects_when_stored_snapshot_tag_is_stale(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+
+        state_data = self.state.load()
+        state_data["projects"][project["id"]]["setup_snapshot_image"] = "stale-snapshot-tag"
+        self.state.save(state_data)
+
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            codex_args=[],
+        )
+
+        with patch(
+            "codex_hub.server._docker_image_exists",
+            return_value=True,
+        ):
+            with self.assertRaises(HTTPException):
+                self.state.start_chat(chat["id"])
+
+    def test_clean_start_clears_chat_artifacts_and_preserves_projects(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            codex_args=[],
+        )
+
+        chat_workspace = self.state.chat_workdir(chat["id"])
+        project_workspace = self.state.project_workdir(project["id"])
+        chat_workspace.mkdir(parents=True, exist_ok=True)
+        project_workspace.mkdir(parents=True, exist_ok=True)
+        self.state.chat_log(chat["id"]).write_text("log", encoding="utf-8")
+
+        state_before = self.state.load()
+        state_before["projects"][project["id"]]["setup_snapshot_image"] = "project-snapshot"
+        state_before["chats"][chat["id"]]["setup_snapshot_image"] = "chat-snapshot"
+        self.state.save(state_before)
+
+        with patch("codex_hub.server._docker_remove_images") as docker_rm:
+            summary = self.state.clean_start()
+
+        self.assertEqual(summary["cleared_chats"], 1)
+        self.assertGreaterEqual(summary["projects_reset"], 1)
+        self.assertEqual(summary["docker_images_requested"], 2)
+
+        state_after = self.state.load()
+        self.assertIn(project["id"], state_after["projects"])
+        self.assertEqual(state_after["chats"], {})
+        self.assertEqual(state_after["projects"][project["id"]]["setup_snapshot_image"], "")
+        self.assertEqual(state_after["projects"][project["id"]]["build_status"], "pending")
+        self.assertTrue(self.state.chat_dir.exists())
+        self.assertTrue(self.state.project_dir.exists())
+        self.assertTrue(self.state.log_dir.exists())
+        self.assertEqual(list(self.state.chat_dir.iterdir()), [])
+        self.assertEqual(list(self.state.project_dir.iterdir()), [])
+        self.assertEqual(list(self.state.log_dir.iterdir()), [])
+
+        docker_rm.assert_called_once()
+        prefixes, tags = docker_rm.call_args[0]
+        self.assertEqual(prefixes, ("codex-hub-setup-", "codex-base-"))
+        self.assertIn("project-snapshot", tags)
+        self.assertIn("chat-snapshot", tags)
+
+    def test_ensure_project_setup_snapshot_builds_once(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+            base_image_mode="repo_path",
+            base_image_value="docker/base",
+            default_ro_mounts=[f"{self.host_ro}:/ro_data"],
+            default_rw_mounts=[f"{self.host_rw}:/rw_data"],
+            default_env_vars=["FOO=bar"],
+        )
+        workspace = self.tmp_path / "workspace"
+        (workspace / "docker" / "base").mkdir(parents=True, exist_ok=True)
+
+        executed: list[list[str]] = []
+
+        def fake_run(cmd: list[str], cwd: Path | None = None, capture: bool = False, check: bool = True):
+            del cwd, capture, check
+            executed.append(list(cmd))
+            class Dummy:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return Dummy()
+
+        with patch("codex_hub.server._docker_image_exists", side_effect=[False, True]), patch(
+            "codex_hub.server._run", side_effect=fake_run
+        ):
+            first = self.state._ensure_project_setup_snapshot(workspace, project)
+            second = self.state._ensure_project_setup_snapshot(workspace, project)
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(executed), 1)
+        cmd = executed[0]
+        self.assertIn("codex_image", cmd)
+        self.assertIn("--prepare-snapshot-only", cmd)
+        self.assertIn("--snapshot-image-tag", cmd)
+        self.assertIn("--setup-script", cmd)
+
+    def test_resize_terminal_sets_pty_size(self) -> None:
+        runtime = hub_server.ChatRuntime(process=SimpleNamespace(pid=1), master_fd=42)
+        with patch.object(hub_server.HubState, "_runtime_for_chat", return_value=runtime), patch(
+            "codex_hub.server.fcntl.ioctl"
+        ) as ioctl_mock:
+            self.state.resize_terminal("chat-1", 120, 40)
+        self.assertEqual(ioctl_mock.call_count, 1)
+
+    def test_chat_workspace_uses_project_name_plus_chat_id(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            name="Demo Project",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            codex_args=[],
+        )
+        workspace = Path(chat["workspace"])
+        self.assertEqual(workspace.name, f"Demo_Project_{chat['id']}")
+        self.assertEqual(self.state.chat_workdir(chat["id"]), workspace)
+
+    def test_close_chat_deletes_workspace_and_chat_record(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            codex_args=[],
+        )
+        workspace = self.state.chat_workdir(chat["id"])
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "sentinel.txt").write_text("data", encoding="utf-8")
+
+        result = self.state.close_chat(chat["id"])
+        self.assertEqual(result["status"], "deleted")
+        self.assertFalse(workspace.exists())
+        self.assertNotIn(chat["id"], self.state.load()["chats"])
+
+    def test_state_payload_prunes_finished_chats(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            codex_args=[],
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 424242
+        self.state.save(state_data)
+
+        with patch("codex_hub.server._is_process_running", return_value=False), patch(
+            "codex_hub.server._stop_process"
+        ):
+            payload = self.state.state_payload()
+
+        self.assertEqual(payload["chats"], [])
+        self.assertNotIn(chat["id"], self.state.load()["chats"])
+
+    def test_state_payload_keeps_new_stopped_chat(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            codex_args=[],
+        )
+        with patch("codex_hub.server._is_process_running", return_value=False):
+            payload = self.state.state_payload()
+        self.assertEqual(len(payload["chats"]), 1)
+        self.assertEqual(payload["chats"][0]["id"], chat["id"])
+        self.assertEqual(payload["chats"][0]["status"], "stopped")
+        self.assertIn(chat["id"], self.state.load()["chats"])
+
+    def test_state_payload_sets_chat_display_name_and_subtitle(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            codex_args=[],
+        )
+        self.state.chat_log(chat["id"]).write_text(
+            "Tip: example\n> how do i run tests?\nUse uv run python -m unittest discover -s tests -v\n",
+            encoding="utf-8",
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 1111
+        self.state.save(state_data)
+
+        with patch("codex_hub.server._is_process_running", return_value=True):
+            payload = self.state.state_payload()
+
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(chat_payload["display_name"], "how do i run tests?")
+        self.assertTrue(chat_payload["display_subtitle"].startswith("Use uv run python -m unittest"))
+
+
+class CliEnvVarTests(unittest.TestCase):
+    def test_parse_env_var_valid(self) -> None:
+        self.assertEqual(image_cli._parse_env_var("FOO=bar", "--env-var"), "FOO=bar")
+        self.assertEqual(image_cli._parse_env_var("EMPTY=", "--env-var"), "EMPTY=")
+
+    def test_parse_env_var_invalid(self) -> None:
+        with self.assertRaises(Exception):
+            image_cli._parse_env_var("NO_EQUALS", "--env-var")
+
+    def test_snapshot_commit_resets_entrypoint_and_cmd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "codex.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("codex_image.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "codex_image.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "codex_image.cli._docker_image_exists", return_value=False
+            ), patch(
+                "codex_image.cli._docker_rm_force", return_value=None
+            ), patch(
+                "codex_image.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--snapshot-image-tag",
+                        "snapshot:test",
+                        "--setup-script",
+                        "echo hello",
+                        "--prepare-snapshot-only",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            setup_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(setup_cmd)
+            assert setup_cmd is not None
+            self.assertIn("--entrypoint", setup_cmd)
+            self.assertIn("bash", setup_cmd)
+            setup_script = setup_cmd[-1]
+            self.assertIn("git config --system --add safe.directory '*'", setup_script)
+            self.assertIn('chown -R "${LOCAL_UID}:${LOCAL_GID}" "${CONTAINER_PROJECT_PATH}" || true', setup_script)
+            commit_cmd = next((cmd for cmd in commands if len(cmd) >= 3 and cmd[0:2] == ["docker", "commit"]), None)
+            self.assertIsNotNone(commit_cmd)
+            assert commit_cmd is not None
+            self.assertIn("--change", commit_cmd)
+            self.assertIn('ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]', commit_cmd)
+            self.assertIn('CMD ["codex"]', commit_cmd)
+
+    def test_cached_snapshot_skips_runtime_build(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "codex.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("codex_image.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "codex_image.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "codex_image.cli._docker_image_exists", return_value=True
+            ), patch(
+                "codex_image.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--snapshot-image-tag",
+                        "snapshot:test",
+                        "--prepare-snapshot-only",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            self.assertEqual(commands, [])
+
+    def test_codex_hub_main_clean_start_invokes_state_cleanup(self) -> None:
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = tmp_path / "hub"
+            config = tmp_path / "codex.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            with patch("codex_hub.server.uvicorn.run", return_value=None), patch.object(
+                hub_server.HubState,
+                "clean_start",
+                return_value={
+                    "stopped_chats": 0,
+                    "cleared_chats": 0,
+                    "projects_reset": 0,
+                    "docker_images_requested": 0,
+                },
+            ) as clean_patch:
+                result = runner.invoke(
+                    hub_server.main,
+                    [
+                        "--data-dir",
+                        str(data_dir),
+                        "--config-file",
+                        str(config),
+                        "--no-frontend-build",
+                        "--clean-start",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            self.assertEqual(clean_patch.call_count, 1)
+            self.assertIn("Clean start completed", result.output)
+
+
+if __name__ == "__main__":
+    unittest.main()

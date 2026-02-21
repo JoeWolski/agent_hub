@@ -12,6 +12,7 @@ RUN apt-get update \
     git \
     less \
     openssh-client \
+    python3 \
     passwd \
     sudo \
  && rm -rf /var/lib/apt/lists/*
@@ -25,9 +26,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 
 RUN mkdir -p /home/codex/projects
 
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY docker/docker-entrypoint.py /usr/local/bin/docker-entrypoint.py
+RUN chmod +x /usr/local/bin/docker-entrypoint.py
 
 WORKDIR /home/codex/projects
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]
 CMD ["codex"]

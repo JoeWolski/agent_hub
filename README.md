@@ -1,182 +1,141 @@
 # Codex Docker (Ubuntu 22.04)
 
-This setup runs OpenAI Codex inside an Ubuntu 22.04 container and mounts your project at:
+This repository now uses a Python `uv` tool (`codex_image`) to launch the existing Codex container image.
 
-`$HOME/projects/<project-name>`
+It also includes `codex_hub`, a local web control panel for project chat orchestration.
 
-## What this gives you
+## What it does
 
-- Ubuntu 22.04 container
-- Codex CLI preinstalled
-- Full GPU access enabled (`gpus: all`)
-- Your chosen project directory mounted at `$HOME/projects/<project-name>` in the container
-- Persistent Codex home mounted at `/home/<your-user>` (default host path: `~/.codex-docker-home/<your-user>`)
-- Runtime identity mirrors the launcher user (`name`, `uid`, `gid`, supplementary groups, and `umask`)
-- Working directory starts in the mounted project path (not the parent `projects` folder)
-- Re-run on the same project starts a new conversation by default
-- Use `--resume` to continue the last Codex session for that project
-- `sudo` is available for the mapped user inside the container
-- No package/tool installs on your host machine
+- Builds and runs the `docker/Dockerfile` for the Codex environment.
+- Supports an optional intermediate base image build from a provided Dockerfile/path.
+- Mounts your project under a stable container path:
+  `/home/<local_user>/projects/<project-name>`
+- Mounts persistent Codex state on the host.
+- Supports read-only and read-write mount overrides.
+- Supports `--resume` to continue the latest Codex session for the project.
 
-## Prerequisites
+## Requirements
 
-- Docker with Compose plugin (`docker compose`)
-- NVIDIA GPU driver + `nvidia-container-toolkit` installed on the host
-- Optional: `OPENAI_API_KEY` (env var or `.credentials` file)
+- Docker and `nvidia-container-toolkit` for GPU mode.
+- Node.js and Yarn (for the React frontend in `web/`).
 
-## Run
+## Quick start
 
 ```bash
-chmod +x run_codex.sh
-./run_codex.sh
+uv run codex_image --project /path/to/project
 ```
 
-By default, `PROJECT_PATH` is your current directory (`$PWD`).
-If you rerun `run_codex.sh` from the same `PROJECT_PATH` and a previous session exists,
-it resumes that project session automatically.
+Defaults for `--project` is `.`.
 
-To run against any project directory:
+## Common options
+
+- `--project PATH`
+- `--resume`
+- `--config-file PATH` (default: repo `config/codex.config.toml`)
+- `--credentials-file PATH` and/or `--openai-api-key`
+- `--base PATH` (Dockerfile path or directory with Dockerfile)
+- `--base-image TAG` (default: `nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04`)
+- `--ro-mount /host/path:/container/path`
+- `--rw-mount /host/path:/container/path`
+- `--env-var KEY=VALUE` (repeatable)
+- `--setup-script "cmd1\ncmd2"` and `--snapshot-image-tag TAG` (build/reuse a setup snapshot image)
+- `--prepare-snapshot-only` (build/reuse snapshot and exit)
+- `--local-user`, `--local-group`, `--local-uid`, `--local-gid`
+- `--local-supplementary-gids`, `--local-supplementary-groups`, `--local-umask`
+- `--codex-home-path PATH`
+
+## Examples
+
+Use a different project and pass through a command:
 
 ```bash
-PROJECT_PATH="$HOME/projects/any-repo" ./run_codex.sh
+uv run codex_image --project /path/to/project -- bash -lc 'id && pwd'
 ```
 
-If `PROJECT_PATH="$HOME/projects/any-repo"`, container cwd will be:
-
-`$HOME/projects/any-repo`
-
-You can resume the previous session in the same project with:
+Build/run against a custom base Dockerfile:
 
 ```bash
-PROJECT_PATH="/path/to/project" ./run_codex.sh --resume
+uv run codex_image --project /path/to/project --base /path/to/base/Dockerfile
 ```
 
-Optional: choose where Codex home/auth state lives on your host:
+Add mounts:
 
 ```bash
-CODEX_HOME_PATH="$HOME/.cache/codex-home" ./run_codex.sh
+uv run codex_image \
+  --project /path/to/project \
+  --ro-mount /mnt/datasets:/mnt/datasets \
+  --rw-mount /var/ccache_cache:/var/ccache_cache \
+  --env-var WANDB_MODE=offline
 ```
 
-Optional: use a different Codex defaults file:
+Resume last session:
 
 ```bash
-CODEX_CONFIG_FILE="$HOME/.config/codex/config.toml" ./run_codex.sh
+uv run codex_image --project /path/to/project --resume
 ```
 
-Optional: override the base image used by this Codex container:
+## Usage model
+
+- Supported launcher: `uv run codex_image`.
+- All behavior is controlled with CLI arguments.
+
+## Local web panel (`codex_hub`)
+
+Build the React frontend first:
 
 ```bash
-BASE_IMAGE="your-local-base-image:tag" ./run_codex.sh
+cd web
+yarn install
+yarn build
 ```
 
-Preferred: pass only a local base path (directory with `Dockerfile`, or Dockerfile path):
+`uv run codex_hub` now auto-builds the frontend when needed, so the manual build step above is optional.
 
 ```bash
-./run_codex.sh --base "$HOME/projects/av/ci/x86_docker"
-```
-
-or:
-
-```bash
-./run_codex.sh --base "$HOME/projects/av/ci/x86_docker/Dockerfile.x86"
-```
-
-Default behavior for `--base`:
-- Uses the provided Dockerfile directory as build context.
-- Auto-generates a stable project-specific base image tag.
-- No extra env vars required.
-
-Advanced/legacy env-driven base override still supported:
-
-```bash
-BASE_DOCKER_CONTEXT="$HOME/projects/av/ci/x86_docker" ./run_codex.sh
-```
-
-Optional: add extra read-only mounts at launch (repeatable):
-
-```bash
-./run_codex.sh \
-  --ro-mount "$HOME/datasets:/mnt/datasets" \
-  --ro-mount "$HOME/models:/mnt/models"
-```
-
-Optional: add extra read-write mounts at launch (repeatable):
-
-```bash
-./run_codex.sh \
-  --rw-mount "/var/ccache_cache:/var/ccache_cache" \
-  --rw-mount "$HOME/work-cache:/mnt/work-cache"
-```
-
-If you only want to add host ccache into the container:
-
-```bash
-./run_codex.sh --rw-mount "/var/ccache_cache:/var/ccache_cache"
-```
-
-Optional: override identity mapping variables (normally auto-detected):
-
-```bash
-LOCAL_USER="$(id -un)" \
-LOCAL_GROUP="$(id -gn)" \
-LOCAL_UID="$(id -u)" \
-LOCAL_GID="$(id -g)" \
-LOCAL_SUPP_GIDS="$(id -G | tr ' ' ',')" \
-LOCAL_SUPP_GROUPS="$(id -Gn | tr ' ' ',')" \
-LOCAL_UMASK="$(umask)" \
-./run_codex.sh
-```
-
-If you prefer a credentials file, create `.credentials` next to `run_codex.sh`:
-
-```bash
-cp .credentials.example .credentials
-# then edit .credentials with your key
-```
-
-If no API key is set, the container still starts so you can use Codex external device login.
-If both are set, exported `OPENAI_API_KEY` takes precedence over `.credentials`.
-`codex.config.toml` intentionally does not contain credentials.
-
-To use a different credentials file path:
-
-```bash
-CREDENTIALS_FILE="$HOME/.config/codex/.credentials" ./run_codex.sh
+uv run codex_hub
 ```
 
 Optional:
 
 ```bash
-PROJECT_PATH="$HOME/projects/some-other-repo" ./run_codex.sh
+uv run codex_hub --data-dir /path/to/state --config-file /path/to/config.toml --host 127.0.0.1 --port 8765
 ```
 
-To start a shell in the same container instead of launching Codex directly:
+Then open:
 
 ```bash
-./run_codex.sh bash
+http://127.0.0.1:8765
 ```
 
-Use `--` if your command includes flags that should not be parsed by the launcher:
+To access from another machine on the same network:
 
 ```bash
-./run_codex.sh --rw-mount "/var/ccache_cache:/var/ccache_cache" -- bash -lc 'ls -la /var/ccache_cache | head'
+uv run codex_hub --host 0.0.0.0 --port 8765
 ```
 
-Sudo verification inside container:
+Then open:
 
 ```bash
-./run_codex.sh bash -lc 'sudo -n whoami'
+http://<hub-host-ip>:8765
 ```
 
-GPU verification inside the container:
+Frontend development (React + Vite, with API proxy to `codex_hub`):
 
 ```bash
-./run_codex.sh bash -lc 'nvidia-smi'
+cd web
+yarn dev --host 0.0.0.0 --port 5173
 ```
 
-Quick verification that file ownership is preserved:
+Capabilities:
 
-```bash
-PROJECT_PATH="$HOME/projects/any-repo" ./run_codex.sh bash -lc 'id && pwd && touch .perm-test'
-ls -ln "$HOME/projects/any-repo/.perm-test"
-```
+- Add projects by Git repository URL.
+- Add/create a project-level setup snapshot container image at project creation time (and rebuild on project settings changes).
+- Start chats immediately with no chat-start configuration prompts; each new chat launches from the project snapshot image.
+- Set a per-project setup script in the UI (multiline; each non-empty line runs sequentially in the container with the checked-out project as working directory).
+- Setup snapshots are cached per project and reused for new chats (cache key changes when setup/base/default mount/default env settings change).
+- Set a per-project base image source as either a Docker image tag or a Dockerfile path/directory inside the checked-out repo.
+- Configure default/new-chat volumes with `Add volume` UI widgets (local path, container path, read-only/read-write mode).
+- Configure default/new-chat environment variables with `Add environment variable` UI widgets.
+- Close chats (workspace is reset to the remote default branch and reused).
+- Delete chats explicitly from the UI (this removes that workspace).
+- Each chat shows both the host workspace path and the container working folder.

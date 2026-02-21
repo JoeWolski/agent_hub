@@ -1,0 +1,23 @@
+[project]
+name = "codex-tools"
+version = "0.1.0"
+description = "CLI utilities for launching the Codex containerized environment"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "click>=8.1",
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+  "websockets>=12.0",
+]
+
+[project.scripts]
+codex_image = "codex_image.cli:main"
+codex_hub = "codex_hub.server:main"
+
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_image", "src/codex_hub"]
