@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -70,6 +73,221 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(loaded["setup_snapshot_image"], self.state._project_setup_snapshot_tag(project))
         self.assertEqual(loaded["build_status"], "ready")
 
+    def test_openai_credentials_round_trip_status(self) -> None:
+        initial = self.state.openai_auth_status()
+        self.assertFalse(initial["connected"])
+        self.assertEqual(initial["key_hint"], "")
+
+        with patch("agent_hub.server._verify_openai_api_key", return_value=None) as verify_call:
+            saved = self.state.connect_openai("sk-test-abcdefghijklmnopqrstuvwxyz1234")
+
+        verify_call.assert_called_once_with("sk-test-abcdefghijklmnopqrstuvwxyz1234")
+        self.assertTrue(saved["connected"])
+        self.assertTrue(saved["key_hint"].startswith("sk-tes"))
+        self.assertTrue(saved["updated_at"])
+        self.assertTrue(self.state.openai_credentials_file.exists())
+
+        mode = self.state.openai_credentials_file.stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+        payload = self.state.auth_settings_payload()
+        self.assertIn("providers", payload)
+        self.assertIn("openai", payload["providers"])
+        self.assertTrue(payload["providers"]["openai"]["connected"])
+
+        disconnected = self.state.disconnect_openai()
+        self.assertFalse(disconnected["connected"])
+        self.assertFalse(self.state.openai_credentials_file.exists())
+
+    def test_connect_openai_skips_verification_when_requested(self) -> None:
+        with patch("agent_hub.server._verify_openai_api_key") as verify_call:
+            saved = self.state.connect_openai("sk-test-abcdefghijklmnopqrstuvwxyz1234", verify=False)
+        verify_call.assert_not_called()
+        self.assertTrue(saved["connected"])
+
+    def test_connect_openai_verify_failure_does_not_persist_key(self) -> None:
+        with patch(
+            "agent_hub.server._verify_openai_api_key",
+            side_effect=HTTPException(status_code=400, detail="OpenAI rejected the API key."),
+        ):
+            with self.assertRaises(HTTPException):
+                self.state.connect_openai("sk-test-abcdefghijklmnopqrstuvwxyz1234")
+        self.assertFalse(self.state.openai_credentials_file.exists())
+
+    def test_first_url_in_text_trims_trailing_punctuation(self) -> None:
+        value = hub_server._first_url_in_text(
+            "Starting local login server on http://localhost:1455.",
+            "http://localhost",
+        )
+        self.assertEqual(value, "http://localhost:1455")
+
+    def test_parse_local_callback_allows_trailing_period(self) -> None:
+        local_url, callback_port, callback_path = hub_server._parse_local_callback("http://localhost:1455.")
+        self.assertEqual(callback_port, 1455)
+        self.assertEqual(callback_path, "/auth/callback")
+        self.assertTrue(local_url.startswith("http://localhost:1455"))
+
+    def test_openai_auth_status_reports_account_credentials(self) -> None:
+        self.state.openai_codex_auth_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state.openai_codex_auth_file.write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "refresh_token": "rt-test",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        status = self.state.openai_auth_status()
+        self.assertTrue(status["account_connected"])
+        self.assertEqual(status["account_auth_mode"], "chatgpt")
+        self.assertTrue(status["account_updated_at"])
+
+    def test_start_openai_account_login_uses_host_network(self) -> None:
+        captured: dict[str, list[str]] = {}
+
+        def fake_popen(cmd: list[str], **kwargs):
+            del kwargs
+            captured["cmd"] = list(cmd)
+            return SimpleNamespace(pid=4321, stdout=None, wait=lambda: 0, poll=lambda: None)
+
+        with patch("agent_hub.server.shutil.which", return_value="/usr/bin/docker"), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch(
+            "agent_hub.server.subprocess.Popen",
+            side_effect=fake_popen,
+        ), patch.object(
+            hub_server.HubState,
+            "_start_openai_login_reader",
+            return_value=None,
+        ):
+            payload = self.state.start_openai_account_login(method="browser_callback")
+
+        cmd = captured["cmd"]
+        self.assertIn("--network", cmd)
+        self.assertIn("host", cmd)
+        self.assertIn("codex", cmd)
+        self.assertIn("login", cmd)
+        self.assertNotIn("--device-auth", cmd)
+        self.assertIn("session", payload)
+
+    def test_start_openai_account_login_device_auth_includes_flag(self) -> None:
+        captured: dict[str, list[str]] = {}
+
+        def fake_popen(cmd: list[str], **kwargs):
+            del kwargs
+            captured["cmd"] = list(cmd)
+            return SimpleNamespace(pid=4322, stdout=None, wait=lambda: 0, poll=lambda: None)
+
+        with patch("agent_hub.server.shutil.which", return_value="/usr/bin/docker"), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch(
+            "agent_hub.server.subprocess.Popen",
+            side_effect=fake_popen,
+        ), patch.object(
+            hub_server.HubState,
+            "_start_openai_login_reader",
+            return_value=None,
+        ):
+            payload = self.state.start_openai_account_login(method="device_auth")
+
+        cmd = captured["cmd"]
+        self.assertIn("--device-auth", cmd)
+        self.assertIn("session", payload)
+
+    def test_forward_openai_account_callback_proxies_to_local_server(self) -> None:
+        captured: dict[str, str] = {}
+
+        class CallbackHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                captured["path"] = self.path
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, format: str, *args) -> None:  # noqa: A003
+                del format, args
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), CallbackHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            callback_port = int(server.server_address[1])
+            self.state._openai_login_session = hub_server.OpenAIAccountLoginSession(
+                id="session-test",
+                process=SimpleNamespace(pid=9991, poll=lambda: None),
+                container_name="container-test",
+                started_at="2026-02-21T00:00:00Z",
+                status="waiting_for_browser",
+                callback_port=callback_port,
+                callback_path="/auth/callback",
+            )
+            with patch("agent_hub.server._is_process_running", return_value=True):
+                result = self.state.forward_openai_account_callback("code=abc&state=xyz", path="/auth/callback")
+            self.assertTrue(result["forwarded"])
+            self.assertEqual(result["status_code"], 200)
+            self.assertEqual(captured["path"], "/auth/callback?code=abc&state=xyz")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1.0)
+
+    def test_parse_env_vars_rejects_openai_api_key(self) -> None:
+        with self.assertRaises(HTTPException):
+            hub_server._parse_env_vars(["OPENAI_API_KEY=sk-test-abcdef"])
+
+    def test_start_chat_filters_reserved_openai_env_vars(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=["OPENAI_API_KEY=should_not_pass", "FOO=bar"],
+            agent_args=[],
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        class DummyProc:
+            pid = 4242
+
+        def fake_spawn(_: hub_server.HubState, _chat_id: str, cmd: list[str]) -> DummyProc:
+            captured["cmd"] = list(cmd)
+            return DummyProc()
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+            fake_spawn,
+        ):
+            self.state.start_chat(chat["id"])
+
+        cmd = captured["cmd"]
+        self.assertNotIn("OPENAI_API_KEY=should_not_pass", cmd)
+        self.assertIn("FOO=bar", cmd)
+
     def test_start_chat_builds_cmd_with_mounts_env_and_repo_base_path(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
@@ -117,6 +335,8 @@ class HubStateTests(unittest.TestCase):
         workspace = self.state.chat_workdir(chat["id"])
         self.assertIn("--base", cmd)
         self.assertIn(str(workspace / "docker" / "base"), cmd)
+        self.assertIn("--credentials-file", cmd)
+        self.assertIn(str(self.state.openai_credentials_file), cmd)
         self.assertIn("--ro-mount", cmd)
         self.assertIn(f"{self.host_ro}:/ro_data", cmd)
         self.assertIn("--rw-mount", cmd)
@@ -284,6 +504,8 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("--prepare-snapshot-only", cmd)
         self.assertIn("--snapshot-image-tag", cmd)
         self.assertIn("--setup-script", cmd)
+        self.assertIn("--credentials-file", cmd)
+        self.assertIn(str(self.state.openai_credentials_file), cmd)
 
     def test_resize_terminal_sets_pty_size(self) -> None:
         runtime = hub_server.ChatRuntime(process=SimpleNamespace(pid=1), master_fd=42)

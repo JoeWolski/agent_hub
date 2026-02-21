@@ -37,7 +37,7 @@ Defaults for `--project` is `.`.
 - `--base-image TAG` (default: `nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04`)
 - `--ro-mount /host/path:/container/path`
 - `--rw-mount /host/path:/container/path`
-- `--env-var KEY=VALUE` (repeatable)
+- `--env-var KEY=VALUE` (repeatable; `OPENAI_API_KEY` is reserved for the authentication settings flow)
 - `--setup-script "cmd1\ncmd2"` and `--snapshot-image-tag TAG` (build/reuse a setup snapshot image)
 - `--prepare-snapshot-only` (build/reuse snapshot and exit)
 - `--local-user`, `--local-group`, `--local-uid`, `--local-gid`
@@ -136,6 +136,8 @@ Capabilities:
 - Set a per-project base image source as either a Docker image tag or a Dockerfile path/directory inside the checked-out repo.
 - Configure default/new-chat volumes with `Add volume` UI widgets (local path, container path, read-only/read-write mode).
 - Configure default/new-chat environment variables with `Add environment variable` UI widgets.
+- Configure OpenAI credentials in `Settings -> Authentication -> OpenAI`; credentials are stored server-side and passed to chat instances via `--credentials-file`.
+- OpenAI connect can optionally verify the key with a non-persistent server-side API check before saving.
 - Close chats (workspace is reset to the remote default branch and reused).
 - Delete chats explicitly from the UI (this removes that workspace).
 - Each chat shows both the host workspace path and the container working folder.

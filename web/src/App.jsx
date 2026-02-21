@@ -452,7 +452,154 @@ function projectDraftFromProject(project) {
   };
 }
 
-export default function App() {
+function normalizeOpenAiProviderStatus(rawProvider) {
+  return {
+    provider: "openai",
+    connected: Boolean(rawProvider?.connected),
+    keyHint: String(rawProvider?.key_hint || ""),
+    updatedAt: String(rawProvider?.updated_at || ""),
+    accountConnected: Boolean(rawProvider?.account_connected),
+    accountAuthMode: String(rawProvider?.account_auth_mode || ""),
+    accountUpdatedAt: String(rawProvider?.account_updated_at || "")
+  };
+}
+
+function normalizeOpenAiAccountSession(rawSession) {
+  if (!rawSession || typeof rawSession !== "object") {
+    return null;
+  }
+  return {
+    id: String(rawSession.id || ""),
+    method: String(rawSession.method || "browser_callback"),
+    status: String(rawSession.status || ""),
+    startedAt: String(rawSession.started_at || ""),
+    completedAt: String(rawSession.completed_at || ""),
+    exitCode: rawSession.exit_code == null ? null : Number(rawSession.exit_code),
+    error: String(rawSession.error || ""),
+    running: Boolean(rawSession.running),
+    loginUrl: String(rawSession.login_url || ""),
+    deviceCode: String(rawSession.device_code || ""),
+    localCallbackUrl: String(rawSession.local_callback_url || ""),
+    callbackPort: Number(rawSession.callback_port || 0) || 0,
+    callbackPath: String(rawSession.callback_path || "/auth/callback"),
+    logTail: String(rawSession.log_tail || "")
+  };
+}
+
+function buildProxiedOpenAiLoginUrl(loginUrl) {
+  const raw = String(loginUrl || "").trim();
+  if (!raw) {
+    return "";
+  }
+  try {
+    const parsed = new URL(raw);
+    if (!parsed.searchParams.has("redirect_uri")) {
+      return raw;
+    }
+    parsed.searchParams.set("redirect_uri", `${window.location.origin}/openai-auth/callback`);
+    return parsed.toString();
+  } catch {
+    return raw;
+  }
+}
+
+function extractCallbackQuery(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  if (raw.startsWith("?")) {
+    return raw.slice(1);
+  }
+  if (raw.startsWith("http://") || raw.startsWith("https://")) {
+    try {
+      const parsed = new URL(raw);
+      return parsed.search ? parsed.search.slice(1) : "";
+    } catch {
+      return "";
+    }
+  }
+  if (raw.includes("?")) {
+    return raw.split("?", 2)[1] || "";
+  }
+  return raw;
+}
+
+function formatTimestamp(isoText) {
+  const normalized = String(isoText || "").trim();
+  if (!normalized) {
+    return "Never";
+  }
+  const parsed = new Date(normalized);
+  if (Number.isNaN(parsed.getTime())) {
+    return normalized;
+  }
+  return parsed.toLocaleString();
+}
+
+function OpenAiAuthCallbackPage() {
+  const [status, setStatus] = useState("forwarding");
+  const [message, setMessage] = useState("Forwarding callback to the OpenAI login container...");
+
+  useEffect(() => {
+    let cancelled = false;
+    async function forwardCallback() {
+      const search = window.location.search || "";
+      if (!search || search === "?") {
+        if (!cancelled) {
+          setStatus("error");
+          setMessage("Missing callback query parameters.");
+        }
+        return;
+      }
+
+      try {
+        const payload = await fetchJson(`/api/settings/auth/openai/account/callback${search}`);
+        if (cancelled) {
+          return;
+        }
+        const forwarded = payload?.callback;
+        if (forwarded?.forwarded) {
+          setStatus("complete");
+          setMessage(
+            forwarded?.response_summary
+              ? `Callback forwarded. ${forwarded.response_summary}`
+              : "Callback forwarded. Return to Agent Hub and wait for login status to become connected."
+          );
+        } else {
+          setStatus("error");
+          setMessage("Callback forwarding did not complete.");
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setStatus("error");
+          setMessage(err.message || String(err));
+        }
+      }
+    }
+
+    forwardCallback();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <main className="callback-page">
+      <section className="panel callback-panel">
+        <h2>OpenAI Account Login</h2>
+        <p className={`meta callback-status ${status}`}>{message}</p>
+        <div className="actions">
+          <button type="button" className="btn-primary" onClick={() => window.location.assign("/")}>
+            Return to Agent Hub
+          </button>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function HubApp() {
   const [hubState, setHubState] = useState({ projects: [], chats: [] });
   const [error, setError] = useState("");
   const [createForm, setCreateForm] = useState(() => emptyCreateForm());
@@ -467,6 +614,22 @@ export default function App() {
   const [pendingSessions, setPendingSessions] = useState([]);
   const [pendingProjectBuilds, setPendingProjectBuilds] = useState({});
   const [pendingChatStarts, setPendingChatStarts] = useState({});
+  const [openAiProviderStatus, setOpenAiProviderStatus] = useState(() =>
+    normalizeOpenAiProviderStatus(null)
+  );
+  const [openAiAuthLoaded, setOpenAiAuthLoaded] = useState(false);
+  const [openAiCardExpanded, setOpenAiCardExpanded] = useState(false);
+  const [openAiCardExpansionInitialized, setOpenAiCardExpansionInitialized] = useState(false);
+  const [openAiDraftKey, setOpenAiDraftKey] = useState("");
+  const [verifyOpenAiOnSave, setVerifyOpenAiOnSave] = useState(true);
+  const [showOpenAiDraftKey, setShowOpenAiDraftKey] = useState(false);
+  const [openAiSaving, setOpenAiSaving] = useState(false);
+  const [openAiDisconnecting, setOpenAiDisconnecting] = useState(false);
+  const [openAiAccountSession, setOpenAiAccountSession] = useState(null);
+  const [openAiAccountStarting, setOpenAiAccountStarting] = useState(false);
+  const [openAiAccountCancelling, setOpenAiAccountCancelling] = useState(false);
+  const [openAiAccountDisconnecting, setOpenAiAccountDisconnecting] = useState(false);
+  const [openAiAccountCallbackInput, setOpenAiAccountCallbackInput] = useState("");
 
   const refreshState = useCallback(async () => {
     const payload = await fetchJson("/api/state");
@@ -510,6 +673,17 @@ export default function App() {
       }
       return next;
     });
+  }, []);
+
+  const refreshAuthSettings = useCallback(async () => {
+    const [authPayload, sessionPayload] = await Promise.all([
+      fetchJson("/api/settings/auth"),
+      fetchJson("/api/settings/auth/openai/account/session")
+    ]);
+    const provider = authPayload?.providers?.openai;
+    setOpenAiProviderStatus(normalizeOpenAiProviderStatus(provider));
+    setOpenAiAccountSession(normalizeOpenAiAccountSession(sessionPayload?.session));
+    setOpenAiAuthLoaded(true);
   }, []);
 
   const visibleChats = useMemo(() => {
@@ -576,7 +750,7 @@ export default function App() {
 
     async function refreshAndHandleError() {
       try {
-        await refreshState();
+        await Promise.all([refreshState(), refreshAuthSettings()]);
         if (mounted) {
           setError("");
         }
@@ -594,7 +768,7 @@ export default function App() {
       mounted = false;
       clearInterval(interval);
     };
-  }, [refreshState]);
+  }, [refreshState, refreshAuthSettings]);
 
   useEffect(() => {
     setProjectDrafts((prev) => {
@@ -690,6 +864,42 @@ export default function App() {
       clearInterval(interval);
     };
   }, [hubState.projects]);
+
+  useEffect(() => {
+    if (!openAiAccountSession?.running) {
+      return undefined;
+    }
+    let cancelled = false;
+
+    async function refreshAccountSession() {
+      try {
+        const payload = await fetchJson("/api/settings/auth/openai/account/session");
+        if (cancelled) {
+          return;
+        }
+        setOpenAiAccountSession(normalizeOpenAiAccountSession(payload?.session));
+        if (payload?.account_connected) {
+          setOpenAiProviderStatus((prev) => ({
+            ...prev,
+            accountConnected: true,
+            accountAuthMode: String(payload?.account_auth_mode || prev.accountAuthMode || "chatgpt"),
+            accountUpdatedAt: String(payload?.account_updated_at || prev.accountUpdatedAt || "")
+          }));
+        }
+      } catch {
+        if (!cancelled) {
+          setOpenAiAccountSession((prev) => prev);
+        }
+      }
+    }
+
+    refreshAccountSession();
+    const interval = setInterval(refreshAccountSession, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [openAiAccountSession?.id, openAiAccountSession?.running]);
 
   const projectsById = useMemo(() => {
     const map = new Map();
@@ -965,6 +1175,115 @@ export default function App() {
     }
   }
 
+  async function handleConnectOpenAi(event) {
+    event.preventDefault();
+    const apiKey = openAiDraftKey.trim();
+    if (!apiKey) {
+      setError("OpenAI API key is required.");
+      return;
+    }
+
+    setOpenAiSaving(true);
+    try {
+      const payload = await fetchJson("/api/settings/auth/openai/connect", {
+        method: "POST",
+        body: JSON.stringify({ api_key: apiKey, verify: verifyOpenAiOnSave })
+      });
+      setOpenAiProviderStatus(normalizeOpenAiProviderStatus(payload?.provider));
+      setOpenAiDraftKey("");
+      setShowOpenAiDraftKey(false);
+      setError("");
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setOpenAiSaving(false);
+    }
+  }
+
+  async function handleDisconnectOpenAi() {
+    setOpenAiDisconnecting(true);
+    try {
+      const payload = await fetchJson("/api/settings/auth/openai/disconnect", {
+        method: "POST"
+      });
+      setOpenAiProviderStatus(normalizeOpenAiProviderStatus(payload?.provider));
+      setOpenAiDraftKey("");
+      setShowOpenAiDraftKey(false);
+      setError("");
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setOpenAiDisconnecting(false);
+    }
+  }
+
+  async function handleStartOpenAiAccountLogin(method) {
+    setOpenAiAccountStarting(true);
+    try {
+      const payload = await fetchJson("/api/settings/auth/openai/account/start", {
+        method: "POST",
+        body: JSON.stringify({ method })
+      });
+      setOpenAiAccountSession(normalizeOpenAiAccountSession(payload?.session));
+      setError("");
+      refreshAuthSettings().catch(() => {});
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setOpenAiAccountStarting(false);
+    }
+  }
+
+  async function handleCancelOpenAiAccountLogin() {
+    setOpenAiAccountCancelling(true);
+    try {
+      const payload = await fetchJson("/api/settings/auth/openai/account/cancel", {
+        method: "POST"
+      });
+      setOpenAiAccountSession(normalizeOpenAiAccountSession(payload?.session));
+      setError("");
+      refreshAuthSettings().catch(() => {});
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setOpenAiAccountCancelling(false);
+    }
+  }
+
+  async function handleDisconnectOpenAiAccount() {
+    setOpenAiAccountDisconnecting(true);
+    try {
+      const payload = await fetchJson("/api/settings/auth/openai/account/disconnect", {
+        method: "POST"
+      });
+      setOpenAiProviderStatus(normalizeOpenAiProviderStatus(payload?.provider));
+      setError("");
+      refreshAuthSettings().catch(() => {});
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setOpenAiAccountDisconnecting(false);
+    }
+  }
+
+  async function handleForwardOpenAiAccountCallback(event) {
+    event.preventDefault();
+    const query = extractCallbackQuery(openAiAccountCallbackInput);
+    if (!query) {
+      setError("Paste the full callback URL (or query string) from the localhost error page.");
+      return;
+    }
+    try {
+      const payload = await fetchJson(`/api/settings/auth/openai/account/callback?${query}`);
+      setOpenAiAccountSession(normalizeOpenAiAccountSession(payload?.session));
+      setOpenAiAccountCallbackInput("");
+      setError("");
+      refreshAuthSettings().catch(() => {});
+    } catch (err) {
+      setError(err.message || String(err));
+    }
+  }
+
   const chatsByProject = useMemo(() => {
     const byProject = new Map();
     for (const project of hubState.projects) {
@@ -980,6 +1299,43 @@ export default function App() {
     }
     return { byProject, orphanChats };
   }, [hubState.projects, visibleChats]);
+
+  const openAiAccountProxyLoginUrl = useMemo(
+    () => buildProxiedOpenAiLoginUrl(openAiAccountSession?.loginUrl),
+    [openAiAccountSession?.loginUrl]
+  );
+  const openAiAccountDirectLoginUrl = String(openAiAccountSession?.loginUrl || "").trim();
+  const openAiAccountSessionMethod = String(openAiAccountSession?.method || "");
+  const openAiAccountLoginInFlight = Boolean(
+    openAiAccountSession &&
+      ["starting", "running", "waiting_for_browser", "waiting_for_device_code", "callback_received"].includes(
+        String(openAiAccountSession.status || "")
+      )
+  );
+  const openAiBrowserCallbackInFlight = openAiAccountLoginInFlight && openAiAccountSessionMethod === "browser_callback";
+  const openAiDeviceAuthInFlight = openAiAccountLoginInFlight && openAiAccountSessionMethod === "device_auth";
+  const openAiOverallConnected = openAiProviderStatus.accountConnected || openAiProviderStatus.connected;
+  const openAiConnectionSummary = openAiProviderStatus.accountConnected && openAiProviderStatus.connected
+    ? "Connected with OpenAI account and API key."
+    : openAiProviderStatus.accountConnected
+      ? "Connected with OpenAI account."
+      : openAiProviderStatus.connected
+        ? "Connected with API key."
+        : "Not connected yet. Expand this section and choose one login method.";
+
+  useEffect(() => {
+    if (!openAiAuthLoaded || openAiCardExpansionInitialized) {
+      return;
+    }
+    setOpenAiCardExpanded(!openAiOverallConnected);
+    setOpenAiCardExpansionInitialized(true);
+  }, [openAiAuthLoaded, openAiCardExpansionInitialized, openAiOverallConnected]);
+
+  useEffect(() => {
+    if (openAiAccountLoginInFlight) {
+      setOpenAiCardExpanded(true);
+    }
+  }, [openAiAccountLoginInFlight]);
 
   return (
     <div className="app-root">
@@ -1003,6 +1359,13 @@ export default function App() {
               onClick={() => setActiveTab("chats")}
             >
               Chats
+            </button>
+            <button
+              type="button"
+              className={`tab-button ${activeTab === "settings" ? "active" : ""}`}
+              onClick={() => setActiveTab("settings")}
+            >
+              Settings
             </button>
           </div>
         </div>
@@ -1261,7 +1624,7 @@ export default function App() {
               })}
             </div>
           </section>
-        ) : (
+        ) : activeTab === "chats" ? (
           <section className="panel">
             <h2>Chats</h2>
             <div className="stack">
@@ -1516,8 +1879,279 @@ export default function App() {
               ) : null}
             </div>
           </section>
+        ) : (
+          <section className="panel">
+            <h2>Settings</h2>
+            <article className="card auth-provider-card">
+              <div className="project-head">
+                <h3>OpenAI</h3>
+                <div className="connection-summary">
+                  <span className={`connection-pill ${openAiOverallConnected ? "connected" : "disconnected"}`}>
+                    {openAiOverallConnected ? "connected" : "not connected"}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-small"
+                    onClick={() => {
+                      setOpenAiCardExpansionInitialized(true);
+                      setOpenAiCardExpanded((expanded) => !expanded);
+                    }}
+                  >
+                    {openAiCardExpanded ? "Hide details" : "Show details"}
+                  </button>
+                </div>
+              </div>
+              <p className="meta">{openAiConnectionSummary}</p>
+              {openAiCardExpanded ? (
+                <>
+                  <p className="meta">
+                    Connect with either your OpenAI account or an API key. New chat instances and project setup runs will use
+                    whichever credential is available.
+                  </p>
+                  <div className="actions">
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={handleCancelOpenAiAccountLogin}
+                      disabled={!openAiAccountLoginInFlight || openAiAccountCancelling}
+                    >
+                      {openAiAccountCancelling ? <SpinnerLabel text="Cancelling..." /> : "Cancel account login"}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={handleDisconnectOpenAiAccount}
+                      disabled={
+                        !openAiProviderStatus.accountConnected ||
+                        openAiAccountDisconnecting ||
+                        openAiAccountLoginInFlight
+                      }
+                    >
+                      {openAiAccountDisconnecting ? <SpinnerLabel text="Disconnecting..." /> : "Disconnect account"}
+                    </button>
+                  </div>
+                  {openAiAccountSession ? (
+                    <div className="stack compact">
+                      <div className="meta">
+                        Account login status: {openAiAccountSession.status || "starting"}
+                      </div>
+                      {openAiAccountSession.error ? (
+                        <div className="meta build-error">{openAiAccountSession.error}</div>
+                      ) : null}
+                      {openAiAccountSession.logTail ? (
+                        <pre className="log-box settings-auth-log">{openAiAccountSession.logTail}</pre>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  <div className="settings-auth-block">
+                    <h4>Login with OpenAI account (browser)</h4>
+                    <ol className="settings-auth-help-list">
+                      <li>Click <strong>Start browser login</strong>.</li>
+                      <li>Click <strong>Open auth page</strong> and complete sign-in and consent.</li>
+                      <li>If the browser ends on a localhost error page, copy the full URL and submit it below.</li>
+                    </ol>
+                    <div className="meta">
+                      Account mode: {openAiProviderStatus.accountAuthMode || "none"}
+                    </div>
+                    <div className="meta">
+                      Last account update: {formatTimestamp(openAiProviderStatus.accountUpdatedAt)}
+                    </div>
+                    <div className="actions">
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        onClick={() => handleStartOpenAiAccountLogin("browser_callback")}
+                        disabled={
+                          openAiAccountStarting ||
+                          openAiAccountCancelling ||
+                          openAiAccountDisconnecting ||
+                          openAiBrowserCallbackInFlight
+                        }
+                      >
+                        {openAiAccountStarting
+                          ? <SpinnerLabel text="Starting login..." />
+                          : openAiBrowserCallbackInFlight
+                            ? "Browser login running"
+                            : "Start browser login"}
+                      </button>
+                      {openAiAccountDirectLoginUrl && openAiAccountSessionMethod === "browser_callback" ? (
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => window.open(openAiAccountProxyLoginUrl, "_blank", "noopener,noreferrer")}
+                        >
+                          Open auth page
+                        </button>
+                      ) : null}
+                      {openAiAccountDirectLoginUrl &&
+                      openAiAccountSessionMethod === "browser_callback" &&
+                      openAiAccountProxyLoginUrl !== openAiAccountDirectLoginUrl ? (
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => window.open(openAiAccountDirectLoginUrl, "_blank", "noopener,noreferrer")}
+                        >
+                          Open direct localhost URL
+                        </button>
+                      ) : null}
+                    </div>
+                    {openAiAccountSessionMethod === "browser_callback" ? (
+                      <div className="stack compact">
+                        <p className="meta">
+                          Local callback URL:{" "}
+                          <code>{openAiAccountSession?.localCallbackUrl || "http://localhost:1455/auth/callback"}</code>
+                        </p>
+                        <form className="stack compact" onSubmit={handleForwardOpenAiAccountCallback}>
+                          <div className="settings-auth-input-row">
+                            <input
+                              value={openAiAccountCallbackInput}
+                              onChange={(event) => setOpenAiAccountCallbackInput(event.target.value)}
+                              placeholder="Paste callback URL (or query like code=...&state=...)"
+                              autoComplete="off"
+                              spellCheck={false}
+                            />
+                          </div>
+                          <div className="actions">
+                            <button type="submit" className="btn-secondary">
+                              Submit callback URL
+                            </button>
+                          </div>
+                        </form>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="settings-auth-block">
+                    <h4>Login with OpenAI account (device code)</h4>
+                    <ol className="settings-auth-help-list">
+                      <li>Click <strong>Start device code login</strong>.</li>
+                      <li>Click <strong>Open device auth page</strong>.</li>
+                      <li>Enter the one-time code shown below, then approve access.</li>
+                    </ol>
+                    <div className="actions">
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        onClick={() => handleStartOpenAiAccountLogin("device_auth")}
+                        disabled={
+                          openAiAccountStarting ||
+                          openAiAccountCancelling ||
+                          openAiAccountDisconnecting ||
+                          openAiDeviceAuthInFlight
+                        }
+                      >
+                        {openAiAccountStarting
+                          ? <SpinnerLabel text="Starting login..." />
+                          : openAiDeviceAuthInFlight
+                            ? "Device login running"
+                            : "Start device code login"}
+                      </button>
+                      {openAiAccountDirectLoginUrl && openAiAccountSessionMethod === "device_auth" ? (
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => window.open(openAiAccountDirectLoginUrl, "_blank", "noopener,noreferrer")}
+                        >
+                          Open device auth page
+                        </button>
+                      ) : null}
+                    </div>
+                    {openAiAccountSessionMethod === "device_auth" && openAiAccountSession?.deviceCode ? (
+                      <p className="meta">
+                        Enter one-time code: <code>{openAiAccountSession.deviceCode}</code>
+                      </p>
+                    ) : null}
+                  </div>
+
+                  <div className="settings-auth-block">
+                    <h4>Login with API key</h4>
+                    <div className="settings-auth-help">
+                      <p className="meta settings-auth-help-title">How to get an OpenAI API key</p>
+                      <ol className="settings-auth-help-list">
+                        <li>
+                          Open{" "}
+                          <a
+                            href="https://platform.openai.com/api-keys"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            https://platform.openai.com/api-keys
+                          </a>
+                          {" "}and sign in.
+                        </li>
+                        <li>Create a new secret key.</li>
+                        <li>Copy the key immediately (it may only be shown once).</li>
+                        <li>Paste it here and keep &quot;Verify with OpenAI before saving&quot; enabled.</li>
+                      </ol>
+                    </div>
+                    <div className="meta">Saved key: {openAiProviderStatus.keyHint || "none"}</div>
+                    <div className="meta">Last updated: {formatTimestamp(openAiProviderStatus.updatedAt)}</div>
+
+                    <form className="stack compact" onSubmit={handleConnectOpenAi}>
+                      <div className="settings-auth-input-row">
+                        <input
+                          type={showOpenAiDraftKey ? "text" : "password"}
+                          value={openAiDraftKey}
+                          onChange={(event) => setOpenAiDraftKey(event.target.value)}
+                          placeholder="Paste OpenAI API key (sk-...)"
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => setShowOpenAiDraftKey((prev) => !prev)}
+                        >
+                          {showOpenAiDraftKey ? "Hide" : "Show"}
+                        </button>
+                      </div>
+                      <label className="settings-checkbox-row">
+                        <input
+                          type="checkbox"
+                          checked={verifyOpenAiOnSave}
+                          onChange={(event) => setVerifyOpenAiOnSave(event.target.checked)}
+                        />
+                        <span>Verify with OpenAI before saving</span>
+                      </label>
+                      <div className="actions">
+                        <button
+                          type="submit"
+                          className="btn-primary"
+                          disabled={openAiSaving || openAiDisconnecting}
+                        >
+                          {openAiSaving
+                            ? <SpinnerLabel text={verifyOpenAiOnSave ? "Verifying..." : "Saving..."} />
+                            : "Connect API key"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          disabled={!openAiProviderStatus.connected || openAiSaving || openAiDisconnecting}
+                          onClick={handleDisconnectOpenAi}
+                        >
+                          {openAiDisconnecting ? <SpinnerLabel text="Disconnecting..." /> : "Disconnect API key"}
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                  <p className="meta settings-auth-note">
+                    API keys are stored only on this machine with restricted file permissions and are never returned by the API
+                    after save.
+                  </p>
+                </>
+              ) : null}
+            </article>
+          </section>
         )}
       </main>
     </div>
   );
+}
+
+export default function App() {
+  if (window.location.pathname === "/openai-auth/callback") {
+    return <OpenAiAuthCallbackPage />;
+  }
+  return <HubApp />;
 }
