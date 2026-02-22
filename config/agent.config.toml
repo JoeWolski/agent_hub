@@ -35,6 +35,7 @@ You may create, commit, and push feature branches as needed.
 Before creating a new branch, examine recent local branch history to identify established naming patterns.
 Name new branches to match the repository's existing branch naming practices.
 When presenting a completed feature, open a pull request and provide the pull request link.
+In the final summary message, print the branch name and pull request link as the last items (in that order), not at the beginning.
 Create pull requests as draft initially.
 If a pull request has been promoted out of draft, do not revert it back to draft.
 Pull request bodies must be valid markdown with these non-empty sections in this exact order:
