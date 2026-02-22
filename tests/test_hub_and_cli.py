@@ -496,10 +496,18 @@ class HubStateTests(unittest.TestCase):
             artifact["download_url"],
             f"/api/chats/{chat['id']}/artifacts/{artifact['id']}/download",
         )
+        self.assertEqual(
+            artifact["preview_url"],
+            f"/api/chats/{chat['id']}/artifacts/{artifact['id']}/preview",
+        )
 
         listed = self.state.list_chat_artifacts(chat["id"])
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0]["id"], artifact["id"])
+        self.assertEqual(
+            listed[0]["preview_url"],
+            f"/api/chats/{chat['id']}/artifacts/{artifact['id']}/preview",
+        )
 
         payload = self.state.state_payload()
         chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
@@ -508,6 +516,38 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(len(chat_payload["artifacts"]), 1)
         self.assertEqual(chat_payload["artifact_current_ids"], [artifact["id"]])
         self.assertEqual(chat_payload["artifact_prompt_history"], [])
+
+    def test_resolve_chat_artifact_preview_uses_media_type_without_download_name(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        workspace = self.state.chat_workdir(chat["id"])
+        workspace.mkdir(parents=True, exist_ok=True)
+        artifact_file = workspace / "plot.png"
+        artifact_file.write_bytes(b"png-bytes")
+
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["artifact_publish_token_hash"] = hub_server._hash_artifact_publish_token("token-preview")
+        self.state.save(state_data)
+
+        artifact = self.state.publish_chat_artifact(
+            chat_id=chat["id"],
+            token="token-preview",
+            submitted_path="plot.png",
+            name="plot output",
+        )
+        preview_path, media_type = self.state.resolve_chat_artifact_preview(chat["id"], artifact["id"])
+        self.assertEqual(preview_path, artifact_file.resolve())
+        self.assertEqual(media_type, "image/png")
 
     def test_record_chat_title_prompt_archives_current_artifacts_by_previous_prompt(self) -> None:
         project = self.state.add_project(
@@ -563,6 +603,10 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(
             history_payload["artifacts"][0]["download_url"],
             f"/api/chats/{chat['id']}/artifacts/{artifact['id']}/download",
+        )
+        self.assertEqual(
+            history_payload["artifacts"][0]["preview_url"],
+            f"/api/chats/{chat['id']}/artifacts/{artifact['id']}/preview",
         )
 
     def test_load_backfills_current_artifact_ids_for_legacy_state(self) -> None:

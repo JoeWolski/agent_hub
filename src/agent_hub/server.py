@@ -2206,14 +2206,20 @@ class HubState:
     def _chat_artifact_download_url(chat_id: str, artifact_id: str) -> str:
         return f"/api/chats/{chat_id}/artifacts/{artifact_id}/download"
 
+    @staticmethod
+    def _chat_artifact_preview_url(chat_id: str, artifact_id: str) -> str:
+        return f"/api/chats/{chat_id}/artifacts/{artifact_id}/preview"
+
     def _chat_artifact_public_payload(self, chat_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        artifact_id = str(artifact.get("id") or "")
         return {
-            "id": str(artifact.get("id") or ""),
+            "id": artifact_id,
             "name": _normalize_artifact_name(artifact.get("name"), fallback=Path(str(artifact.get("relative_path") or "")).name),
             "relative_path": str(artifact.get("relative_path") or ""),
             "size_bytes": int(artifact.get("size_bytes") or 0),
             "created_at": str(artifact.get("created_at") or ""),
-            "download_url": self._chat_artifact_download_url(chat_id, str(artifact.get("id") or "")),
+            "preview_url": self._chat_artifact_preview_url(chat_id, artifact_id),
+            "download_url": self._chat_artifact_download_url(chat_id, artifact_id),
         }
 
     def _chat_artifact_history_public_payload(self, chat_id: str, history_entry: dict[str, Any]) -> dict[str, Any]:
@@ -2356,8 +2362,16 @@ class HubState:
             raise HTTPException(status_code=404, detail="Artifact file is no longer available.")
 
         filename = _normalize_artifact_name(match.get("name"), fallback=resolved.name)
-        media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        media_type = (
+            mimetypes.guess_type(filename)[0]
+            or mimetypes.guess_type(resolved.name)[0]
+            or "application/octet-stream"
+        )
         return resolved, filename, media_type
+
+    def resolve_chat_artifact_preview(self, chat_id: str, artifact_id: str) -> tuple[Path, str]:
+        artifact_path, _filename, media_type = self.resolve_chat_artifact_download(chat_id, artifact_id)
+        return artifact_path, media_type
 
     def project(self, project_id: str) -> dict[str, Any] | None:
         return self.load()["projects"].get(project_id)
@@ -4678,6 +4692,11 @@ def main(
     def api_download_chat_artifact(chat_id: str, artifact_id: str) -> FileResponse:
         artifact_path, filename, media_type = state.resolve_chat_artifact_download(chat_id, artifact_id)
         return FileResponse(path=str(artifact_path), filename=filename, media_type=media_type)
+
+    @app.get("/api/chats/{chat_id}/artifacts/{artifact_id}/preview")
+    def api_preview_chat_artifact(chat_id: str, artifact_id: str) -> FileResponse:
+        artifact_path, media_type = state.resolve_chat_artifact_preview(chat_id, artifact_id)
+        return FileResponse(path=str(artifact_path), media_type=media_type)
 
     @app.get("/api/chats/{chat_id}/logs", response_class=PlainTextResponse)
     def api_chat_logs(chat_id: str) -> str:

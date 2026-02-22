@@ -519,6 +519,21 @@ function CloseIcon() {
   );
 }
 
+function DownloadArrowIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      <path
+        d="M10 3.75v8.5m0 0 3-3m-3 3-3-3M4.5 14.25h11"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.75"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 function ChatTerminal({ chatId, running }) {
   const shellRef = useRef(null);
   const hostRef = useRef(null);
@@ -1067,6 +1082,7 @@ function HubApp() {
   const [collapsedProjectChats, setCollapsedProjectChats] = useState({});
   const [chatStartSettingsByProject, setChatStartSettingsByProject] = useState({});
   const [fullscreenChatId, setFullscreenChatId] = useState("");
+  const [artifactPreview, setArtifactPreview] = useState(null);
   const createChatQueueRef = useRef(new Map());
   const createChatActiveProjectsRef = useRef(new Set());
   const [pendingSessions, setPendingSessions] = useState([]);
@@ -2062,17 +2078,31 @@ function HubApp() {
   }, [visibleChats, fullscreenChatId]);
 
   useEffect(() => {
-    if (activeTab !== "chats" && fullscreenChatId) {
-      setFullscreenChatId("");
+    if (activeTab !== "chats") {
+      if (fullscreenChatId) {
+        setFullscreenChatId("");
+      }
+      if (artifactPreview) {
+        setArtifactPreview(null);
+      }
     }
-  }, [activeTab, fullscreenChatId]);
+  }, [activeTab, fullscreenChatId, artifactPreview]);
 
   useEffect(() => {
-    if (!fullscreenChatId) {
+    if (!fullscreenChatId && !artifactPreview) {
       return undefined;
     }
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [fullscreenChatId, artifactPreview]);
+
+  useEffect(() => {
+    if (!fullscreenChatId || artifactPreview) {
+      return undefined;
+    }
     const onKeyDown = (event) => {
       if (event.key === "Escape") {
         setFullscreenChatId("");
@@ -2080,10 +2110,24 @@ function HubApp() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
-      document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [fullscreenChatId]);
+  }, [fullscreenChatId, artifactPreview]);
+
+  useEffect(() => {
+    if (!artifactPreview) {
+      return undefined;
+    }
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setArtifactPreview(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [artifactPreview]);
 
   function resolveServerChatId(chat) {
     return String(chat?.server_chat_id || chat?.id || "");
@@ -2199,13 +2243,18 @@ function HubApp() {
       const artifactId = String(artifact?.id || "");
       const artifactName = String(artifact?.name || artifact?.relative_path || "artifact");
       const iconDescriptor = resolveArtifactIcon(artifact);
+      const previewKind =
+        iconDescriptor.variant === "image" || iconDescriptor.variant === "video" ? iconDescriptor.variant : "";
+      const previewUrl = String(artifact?.preview_url || artifact?.download_url || "");
+      const downloadUrl = String(artifact?.download_url || "");
+      const canPreview = Boolean(previewKind && previewUrl);
       const artifactMeta = [
         formatBytes(artifact?.size_bytes),
         formatTimestamp(artifact?.created_at)
       ]
         .filter(Boolean)
         .join(" • ");
-      const hoverMeta = artifactMeta || (artifact?.download_url ? "Ready to download" : "Unavailable");
+      const hoverMeta = artifactMeta || (downloadUrl ? "Ready to download" : "Unavailable");
       const bubbleContent = (
         <>
           <span className="chat-artifact-icon" aria-hidden="true">
@@ -2215,12 +2264,35 @@ function HubApp() {
           <span className="chat-artifact-meta-hover">{hoverMeta}</span>
         </>
       );
-      if (artifact?.download_url) {
+      if (canPreview) {
+        return (
+          <button
+            key={`${keyPrefix}-${artifactId || artifactName}`}
+            type="button"
+            className="chat-artifact-bubble chat-artifact-bubble-action"
+            aria-label={`Preview ${artifactName}`}
+            title={`${artifactName} (preview)`}
+            onClick={() =>
+              setArtifactPreview({
+                chatId: chat.id,
+                artifactId,
+                name: artifactName,
+                kind: previewKind,
+                previewUrl,
+                downloadUrl: downloadUrl || previewUrl
+              })
+            }
+          >
+            {bubbleContent}
+          </button>
+        );
+      }
+      if (downloadUrl) {
         return (
           <a
             key={`${keyPrefix}-${artifactId || artifactName}`}
             className="chat-artifact-bubble"
-            href={String(artifact.download_url)}
+            href={downloadUrl}
             download={artifactName}
             aria-label={`Download ${artifactName}`}
             title={artifactName}
@@ -3182,6 +3254,55 @@ function HubApp() {
         )}
         </main>
       </div>
+      {artifactPreview ? (
+        <div className="artifact-preview-overlay" role="presentation" onClick={() => setArtifactPreview(null)}>
+          <section
+            className="artifact-preview-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`Preview ${artifactPreview.name}`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="artifact-preview-header">
+              <h3 className="artifact-preview-title" title={artifactPreview.name}>{artifactPreview.name}</h3>
+              <div className="artifact-preview-actions">
+                <a
+                  className="icon-button artifact-preview-action"
+                  href={artifactPreview.downloadUrl || artifactPreview.previewUrl}
+                  download={artifactPreview.name}
+                  aria-label={`Download ${artifactPreview.name}`}
+                  title={`Download ${artifactPreview.name}`}
+                >
+                  <DownloadArrowIcon />
+                </a>
+                <button
+                  type="button"
+                  className="icon-button artifact-preview-action"
+                  aria-label={`Close preview for ${artifactPreview.name}`}
+                  title="Close preview"
+                  onClick={() => setArtifactPreview(null)}
+                >
+                  <CloseIcon />
+                </button>
+              </div>
+            </header>
+            <div className="artifact-preview-body">
+              {artifactPreview.kind === "video" ? (
+                <video
+                  className="artifact-preview-video"
+                  src={artifactPreview.previewUrl}
+                  controls
+                  autoPlay
+                  preload="metadata"
+                  playsInline
+                />
+              ) : (
+                <img className="artifact-preview-image" src={artifactPreview.previewUrl} alt={artifactPreview.name} />
+              )}
+            </div>
+          </section>
+        </div>
+      ) : null}
 
     </div>
   );
