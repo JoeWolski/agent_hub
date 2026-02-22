@@ -4534,7 +4534,7 @@ class HubState:
             "--env",
             f"CONTAINER_HOME={container_home}",
             "--env",
-            f"PATH={container_home}/.codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            f"PATH={container_home}/.local/bin:{container_home}/.codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             DEFAULT_AGENT_IMAGE,
             "codex",
             "login",

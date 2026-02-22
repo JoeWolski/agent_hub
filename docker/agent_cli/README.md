@@ -16,6 +16,8 @@ docker build \
 # Claude runtime
 docker build \
   -f docker/agent_cli/Dockerfile \
+  --build-arg LOCAL_USER="$USER" \
+  --build-arg LOCAL_HOME="/home/$USER" \
   --build-arg AGENT_PROVIDER=claude \
   -t agent-ubuntu2204-claude:latest .
 

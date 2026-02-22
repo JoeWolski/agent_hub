@@ -384,7 +384,14 @@ def _snapshot_runtime_image_for_provider(snapshot_tag: str, agent_provider: str)
     return f"agent-runtime-{_sanitize_tag_component(agent_provider)}-{_short_hash(snapshot_tag)}"
 
 
-def _build_runtime_image(*, base_image: str, target_image: str, agent_provider: str) -> None:
+def _build_runtime_image(
+    *,
+    base_image: str,
+    target_image: str,
+    agent_provider: str,
+    local_user: str,
+    local_home: str,
+) -> None:
     click.echo(
         f"Building runtime image '{target_image}' from {DEFAULT_DOCKERFILE} "
         f"(base={base_image}, provider={agent_provider})"
@@ -399,6 +406,10 @@ def _build_runtime_image(*, base_image: str, target_image: str, agent_provider: 
             f"BASE_IMAGE={base_image}",
             "--build-arg",
             f"AGENT_PROVIDER={agent_provider}",
+            "--build-arg",
+            f"LOCAL_USER={local_user}",
+            "--build-arg",
+            f"LOCAL_HOME={local_home}",
             "-t",
             target_image,
             str(_repo_root()),
@@ -815,7 +826,7 @@ def main(
         "--env",
         f"CONTAINER_HOME={container_home_path}",
         "--env",
-        f"PATH={container_home_path}/.codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        f"PATH={container_home_path}/.local/bin:{container_home_path}/.codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "--env",
         "NVIDIA_VISIBLE_DEVICES=all",
         "--env",
@@ -859,6 +870,8 @@ def main(
                 base_image=ensure_selected_base_image(),
                 target_image=DEFAULT_SETUP_RUNTIME_IMAGE,
                 agent_provider=AGENT_PROVIDER_NONE,
+                local_user=user,
+                local_home=container_home_path,
             )
             script = (setup_script or "").strip() or ":"
             click.echo(f"Building setup snapshot image '{snapshot_tag}'")
@@ -920,6 +933,8 @@ def main(
                     base_image=snapshot_tag,
                     target_image=provider_snapshot_runtime_image,
                     agent_provider=selected_agent_provider,
+                    local_user=user,
+                    local_home=container_home_path,
                 )
             runtime_image = provider_snapshot_runtime_image
     elif prepare_snapshot_only:
@@ -929,6 +944,8 @@ def main(
             base_image=ensure_selected_base_image(),
             target_image=runtime_image,
             agent_provider=selected_agent_provider,
+            local_user=user,
+            local_home=container_home_path,
         )
 
     if prepare_snapshot_only:

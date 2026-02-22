@@ -4058,6 +4058,9 @@ class CliEnvVarTests(unittest.TestCase):
             assert build_cmd is not None
             self.assertIn(f"BASE_IMAGE={snapshot_tag}", build_cmd)
             self.assertIn("AGENT_PROVIDER=claude", build_cmd)
+            expected_user = image_cli._default_user()
+            self.assertIn(f"LOCAL_USER={expected_user}", build_cmd)
+            self.assertIn(f"LOCAL_HOME=/home/{expected_user}", build_cmd)
             run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
@@ -4115,6 +4118,9 @@ class CliEnvVarTests(unittest.TestCase):
             assert build_cmd is not None
             self.assertIn(f"BASE_IMAGE={snapshot_tag}", build_cmd)
             self.assertIn("AGENT_PROVIDER=gemini", build_cmd)
+            expected_user = image_cli._default_user()
+            self.assertIn(f"LOCAL_USER={expected_user}", build_cmd)
+            self.assertIn(f"LOCAL_HOME=/home/{expected_user}", build_cmd)
             run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None

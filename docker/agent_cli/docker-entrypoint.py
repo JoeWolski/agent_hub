@@ -131,13 +131,13 @@ def _prepare_git_credentials(local_uid: int, local_gid: int) -> None:
 
 
 def _ensure_user_and_groups() -> None:
-    local_user = os.environ.get("LOCAL_USER", "agent")
+    local_user = os.environ.get("LOCAL_USER") or os.environ.get("USER", "root")
     local_group = os.environ.get("LOCAL_GROUP", local_user)
-    local_uid = int(os.environ.get("LOCAL_UID", "1000"))
-    local_gid = int(os.environ.get("LOCAL_GID", "1000"))
+    local_uid = int(os.environ.get("LOCAL_UID", str(os.getuid())))
+    local_gid = int(os.environ.get("LOCAL_GID", str(os.getgid())))
     local_supp_gids = os.environ.get("LOCAL_SUPP_GIDS", "").strip()
     local_supp_groups = os.environ.get("LOCAL_SUPP_GROUPS", "").strip()
-    local_home = os.environ.get("LOCAL_HOME", f"/home/{local_user}")
+    local_home = os.environ.get("LOCAL_HOME", str(Path.home()))
     local_umask = os.environ.get("LOCAL_UMASK", "0022")
 
     if local_umask and len(local_umask) in (3, 4) and local_umask.isdigit():
