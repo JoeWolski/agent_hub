@@ -519,12 +519,9 @@ function CloseIcon() {
   );
 }
 
-function ChatTerminal({ chatId, running, isFullscreen = false }) {
+function ChatTerminal({ chatId, running }) {
   const shellRef = useRef(null);
   const hostRef = useRef(null);
-  const triggerResizeRef = useRef((force = false) => {
-    void force;
-  });
   const [status, setStatus] = useState(running ? "connecting" : "offline");
 
   useEffect(() => {
@@ -557,10 +554,7 @@ function ChatTerminal({ chatId, running, isFullscreen = false }) {
     const ws = new WebSocket(terminalSocketUrl(chatId));
     setStatus("connecting");
     const sentSizeRef = { cols: 0, rows: 0 };
-    const pendingSizeRef = { cols: 0, rows: 0 };
     let resizeFrame = null;
-    let delayedResizeOne = null;
-    let delayedResizeTwo = null;
 
     const sendInput = (text) => {
       const payload = String(text || "");
@@ -586,8 +580,6 @@ function ChatTerminal({ chatId, running, isFullscreen = false }) {
       const nextCols = Math.max(1, Number(cols) || 1);
       const nextRows = Math.max(1, Number(rows) || 1);
       if (ws.readyState !== WebSocket.OPEN) {
-        pendingSizeRef.cols = nextCols;
-        pendingSizeRef.rows = nextRows;
         return;
       }
       if (!force && nextCols === sentSizeRef.cols && nextRows === sentSizeRef.rows) {
@@ -629,23 +621,9 @@ function ChatTerminal({ chatId, running, isFullscreen = false }) {
         }
       }
     });
-    const terminalResizeDisposable = terminal.onResize(({ cols, rows }) => {
-      sendResize(cols, rows);
-    });
-
     const onOpen = () => {
       setStatus("connected");
       fitAndResize(true);
-      if (pendingSizeRef.cols > 0 && pendingSizeRef.rows > 0) {
-        sendResize(pendingSizeRef.cols, pendingSizeRef.rows, true);
-      }
-      scheduleFitAndResize(true);
-      delayedResizeOne = window.setTimeout(() => {
-        fitAndResize(true);
-      }, 90);
-      delayedResizeTwo = window.setTimeout(() => {
-        fitAndResize(true);
-      }, 250);
       terminal.focus();
     };
     const onMessage = (event) => {
@@ -659,10 +637,6 @@ function ChatTerminal({ chatId, running, isFullscreen = false }) {
     const onError = () => {
       setStatus("error");
     };
-    const onResize = () => {
-      scheduleFitAndResize();
-    };
-
     const onShellPointerDown = () => {
       terminal.focus();
     };
@@ -683,29 +657,31 @@ function ChatTerminal({ chatId, running, isFullscreen = false }) {
     }
 
     let resizeObserver;
+    let onWindowResize = null;
     if (typeof ResizeObserver !== "undefined" && shellElement) {
       resizeObserver = new ResizeObserver(() => {
         scheduleFitAndResize();
       });
       resizeObserver.observe(shellElement);
-      if (hostRef.current) {
-        resizeObserver.observe(hostRef.current);
-      }
+    } else {
+      onWindowResize = () => {
+        scheduleFitAndResize();
+      };
+      window.addEventListener("resize", onWindowResize);
     }
-
-    triggerResizeRef.current = scheduleFitAndResize;
 
     ws.addEventListener("open", onOpen);
     ws.addEventListener("message", onMessage);
     ws.addEventListener("close", onClose);
     ws.addEventListener("error", onError);
-    window.addEventListener("resize", onResize);
 
     return () => {
       if (resizeObserver) {
         resizeObserver.disconnect();
       }
-      triggerResizeRef.current = () => {};
+      if (onWindowResize) {
+        window.removeEventListener("resize", onWindowResize);
+      }
       if (shellElement) {
         shellElement.removeEventListener("pointerdown", onShellPointerDown);
         shellElement.removeEventListener("paste", onShellPaste);
@@ -713,40 +689,18 @@ function ChatTerminal({ chatId, running, isFullscreen = false }) {
       if (resizeFrame != null) {
         cancelAnimationFrame(resizeFrame);
       }
-      if (delayedResizeOne != null) {
-        window.clearTimeout(delayedResizeOne);
-      }
-      if (delayedResizeTwo != null) {
-        window.clearTimeout(delayedResizeTwo);
-      }
-      window.removeEventListener("resize", onResize);
       ws.removeEventListener("open", onOpen);
       ws.removeEventListener("message", onMessage);
       ws.removeEventListener("close", onClose);
       ws.removeEventListener("error", onError);
       inputDisposable.dispose();
       keyDisposable.dispose();
-      terminalResizeDisposable.dispose();
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         ws.close();
       }
       terminal.dispose();
     };
   }, [chatId, running]);
-
-  useEffect(() => {
-    if (!running) {
-      return;
-    }
-    triggerResizeRef.current(true);
-    const delays = [60, 140, 320, 700];
-    const timers = delays.map((delayMs) => window.setTimeout(() => {
-      triggerResizeRef.current(true);
-    }, delayMs));
-    return () => {
-      timers.forEach((timerId) => window.clearTimeout(timerId));
-    };
-  }, [isFullscreen, running]);
 
   return (
     <div className="terminal-shell chat-terminal-shell" ref={shellRef}>
@@ -2428,7 +2382,6 @@ function HubApp() {
                 key={`${resolvedChatId}-${isFullscreenChat ? "fullscreen" : "inline"}`}
                 chatId={resolvedChatId}
                 running={isRunning}
-                isFullscreen={isFullscreenChat}
               />
             ) : chatHasServer ? (
               <div className="stack compact">
