@@ -95,6 +95,18 @@ No manual artifact wiring is required for `agent_hub` chats:
 - Node.js + Corepack (only when frontend build is needed).
 - Optional NVIDIA GPU + `nvidia-container-toolkit` for GPU passthrough.
 
+## Mobile (Capacitor)
+
+If you want an Android/iOS wrapper around the existing Agent Hub web server, see:
+
+- `docs/mobile_capacitor.md`
+
+This includes Linux-first deploy scripts:
+
+- `tools/mobile/deploy_android.sh`
+- `tools/mobile/deploy_ios_via_ssh.sh` (Linux -> macOS via SSH)
+- `tools/mobile/deploy_ios_on_macos.sh` (direct on macOS)
+
 ## `agent_cli` (detailed)
 
 `agent_cli` is the runtime launcher. It builds images (if needed), mounts project/config/state paths, and starts the selected in-container agent process (`codex` by default, `claude` when requested).
