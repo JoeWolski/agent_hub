@@ -2492,7 +2492,7 @@ function HubApp() {
         </div>
       </header>
 
-      <div className="content-shell">
+      <div className={`content-shell ${activeTab === "chats" ? "content-shell-chats" : ""}`.trim()}>
         {error ? <div className="error-banner">{error}</div> : null}
 
         <main className="layout">

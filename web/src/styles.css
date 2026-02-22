@@ -248,6 +248,11 @@ code {
   padding: var(--space-3);
 }
 
+/* Chats prioritize terminal real estate over narrow document-style layout width. */
+.content-shell-chats {
+  max-width: none;
+}
+
 .error-banner {
   margin-bottom: var(--space-3);
   padding: 12px var(--space-2);
