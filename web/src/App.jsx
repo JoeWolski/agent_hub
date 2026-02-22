@@ -519,12 +519,24 @@ function CloseIcon() {
   );
 }
 
-function ChatTerminal({ chatId, running, isFullscreen = false }) {
+function DownloadArrowIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      <path
+        d="M10 3.75v8.5m0 0 3-3m-3 3-3-3M4.5 14.25h11"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.75"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function ChatTerminal({ chatId, running }) {
   const shellRef = useRef(null);
   const hostRef = useRef(null);
-  const triggerResizeRef = useRef((force = false) => {
-    void force;
-  });
   const [status, setStatus] = useState(running ? "connecting" : "offline");
 
   useEffect(() => {
@@ -557,10 +569,7 @@ function ChatTerminal({ chatId, running, isFullscreen = false }) {
     const ws = new WebSocket(terminalSocketUrl(chatId));
     setStatus("connecting");
     const sentSizeRef = { cols: 0, rows: 0 };
-    const pendingSizeRef = { cols: 0, rows: 0 };
     let resizeFrame = null;
-    let delayedResizeOne = null;
-    let delayedResizeTwo = null;
 
     const sendInput = (text) => {
       const payload = String(text || "");
@@ -586,8 +595,6 @@ function ChatTerminal({ chatId, running, isFullscreen = false }) {
       const nextCols = Math.max(1, Number(cols) || 1);
       const nextRows = Math.max(1, Number(rows) || 1);
       if (ws.readyState !== WebSocket.OPEN) {
-        pendingSizeRef.cols = nextCols;
-        pendingSizeRef.rows = nextRows;
         return;
       }
       if (!force && nextCols === sentSizeRef.cols && nextRows === sentSizeRef.rows) {
@@ -629,23 +636,9 @@ function ChatTerminal({ chatId, running, isFullscreen = false }) {
         }
       }
     });
-    const terminalResizeDisposable = terminal.onResize(({ cols, rows }) => {
-      sendResize(cols, rows);
-    });
-
     const onOpen = () => {
       setStatus("connected");
       fitAndResize(true);
-      if (pendingSizeRef.cols > 0 && pendingSizeRef.rows > 0) {
-        sendResize(pendingSizeRef.cols, pendingSizeRef.rows, true);
-      }
-      scheduleFitAndResize(true);
-      delayedResizeOne = window.setTimeout(() => {
-        fitAndResize(true);
-      }, 90);
-      delayedResizeTwo = window.setTimeout(() => {
-        fitAndResize(true);
-      }, 250);
       terminal.focus();
     };
     const onMessage = (event) => {
@@ -659,10 +652,6 @@ function ChatTerminal({ chatId, running, isFullscreen = false }) {
     const onError = () => {
       setStatus("error");
     };
-    const onResize = () => {
-      scheduleFitAndResize();
-    };
-
     const onShellPointerDown = () => {
       terminal.focus();
     };
@@ -683,29 +672,31 @@ function ChatTerminal({ chatId, running, isFullscreen = false }) {
     }
 
     let resizeObserver;
+    let onWindowResize = null;
     if (typeof ResizeObserver !== "undefined" && shellElement) {
       resizeObserver = new ResizeObserver(() => {
         scheduleFitAndResize();
       });
       resizeObserver.observe(shellElement);
-      if (hostRef.current) {
-        resizeObserver.observe(hostRef.current);
-      }
+    } else {
+      onWindowResize = () => {
+        scheduleFitAndResize();
+      };
+      window.addEventListener("resize", onWindowResize);
     }
-
-    triggerResizeRef.current = scheduleFitAndResize;
 
     ws.addEventListener("open", onOpen);
     ws.addEventListener("message", onMessage);
     ws.addEventListener("close", onClose);
     ws.addEventListener("error", onError);
-    window.addEventListener("resize", onResize);
 
     return () => {
       if (resizeObserver) {
         resizeObserver.disconnect();
       }
-      triggerResizeRef.current = () => {};
+      if (onWindowResize) {
+        window.removeEventListener("resize", onWindowResize);
+      }
       if (shellElement) {
         shellElement.removeEventListener("pointerdown", onShellPointerDown);
         shellElement.removeEventListener("paste", onShellPaste);
@@ -713,40 +704,18 @@ function ChatTerminal({ chatId, running, isFullscreen = false }) {
       if (resizeFrame != null) {
         cancelAnimationFrame(resizeFrame);
       }
-      if (delayedResizeOne != null) {
-        window.clearTimeout(delayedResizeOne);
-      }
-      if (delayedResizeTwo != null) {
-        window.clearTimeout(delayedResizeTwo);
-      }
-      window.removeEventListener("resize", onResize);
       ws.removeEventListener("open", onOpen);
       ws.removeEventListener("message", onMessage);
       ws.removeEventListener("close", onClose);
       ws.removeEventListener("error", onError);
       inputDisposable.dispose();
       keyDisposable.dispose();
-      terminalResizeDisposable.dispose();
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         ws.close();
       }
       terminal.dispose();
     };
   }, [chatId, running]);
-
-  useEffect(() => {
-    if (!running) {
-      return;
-    }
-    triggerResizeRef.current(true);
-    const delays = [60, 140, 320, 700];
-    const timers = delays.map((delayMs) => window.setTimeout(() => {
-      triggerResizeRef.current(true);
-    }, delayMs));
-    return () => {
-      timers.forEach((timerId) => window.clearTimeout(timerId));
-    };
-  }, [isFullscreen, running]);
 
   return (
     <div className="terminal-shell chat-terminal-shell" ref={shellRef}>
@@ -923,6 +892,17 @@ function normalizeOpenAiProviderStatus(rawProvider) {
     accountConnected: Boolean(rawProvider?.account_connected),
     accountAuthMode: String(rawProvider?.account_auth_mode || ""),
     accountUpdatedAt: String(rawProvider?.account_updated_at || "")
+  };
+}
+
+function normalizeGithubProviderStatus(rawProvider) {
+  return {
+    provider: "github",
+    connected: Boolean(rawProvider?.connected),
+    keyHint: String(rawProvider?.key_hint || ""),
+    updatedAt: String(rawProvider?.updated_at || ""),
+    knownHostsEntries: Number(rawProvider?.known_hosts_entries || 0) || 0,
+    knownHostsUpdatedAt: String(rawProvider?.known_hosts_updated_at || "")
   };
 }
 
@@ -1113,6 +1093,7 @@ function HubApp() {
   const [collapsedProjectChats, setCollapsedProjectChats] = useState({});
   const [chatStartSettingsByProject, setChatStartSettingsByProject] = useState({});
   const [fullscreenChatId, setFullscreenChatId] = useState("");
+  const [artifactPreview, setArtifactPreview] = useState(null);
   const createChatQueueRef = useRef(new Map());
   const createChatActiveProjectsRef = useRef(new Set());
   const [pendingSessions, setPendingSessions] = useState([]);
@@ -1138,6 +1119,14 @@ function HubApp() {
   const [openAiTitleTestPrompt, setOpenAiTitleTestPrompt] = useState("");
   const [openAiTitleTestRunning, setOpenAiTitleTestRunning] = useState(false);
   const [openAiTitleTestResult, setOpenAiTitleTestResult] = useState(null);
+  const [githubProviderStatus, setGithubProviderStatus] = useState(() =>
+    normalizeGithubProviderStatus(null)
+  );
+  const [githubCardExpanded, setGithubCardExpanded] = useState(true);
+  const [githubDraftPrivateKey, setGithubDraftPrivateKey] = useState("");
+  const [githubDraftKnownHosts, setGithubDraftKnownHosts] = useState("");
+  const [githubSaving, setGithubSaving] = useState(false);
+  const [githubDisconnecting, setGithubDisconnecting] = useState(false);
   const stateRefreshInFlightRef = useRef(false);
   const stateRefreshQueuedRef = useRef(false);
   const authRefreshInFlightRef = useRef(false);
@@ -1196,8 +1185,10 @@ function HubApp() {
       fetchJson("/api/settings/auth"),
       fetchJson("/api/settings/auth/openai/account/session")
     ]);
-    const provider = authPayload?.providers?.openai;
-    setOpenAiProviderStatus(normalizeOpenAiProviderStatus(provider));
+    const openAiProvider = authPayload?.providers?.openai;
+    const githubProvider = authPayload?.providers?.github;
+    setOpenAiProviderStatus(normalizeOpenAiProviderStatus(openAiProvider));
+    setGithubProviderStatus(normalizeGithubProviderStatus(githubProvider));
     setOpenAiAccountSession(normalizeOpenAiAccountSession(sessionPayload?.session));
     setOpenAiAuthLoaded(true);
   }, []);
@@ -1329,8 +1320,10 @@ function HubApp() {
     let ws = null;
 
     const applyAuthPayload = (authPayload) => {
-      const provider = authPayload?.providers?.openai;
-      setOpenAiProviderStatus(normalizeOpenAiProviderStatus(provider));
+      const openAiProvider = authPayload?.providers?.openai;
+      const githubProvider = authPayload?.providers?.github;
+      setOpenAiProviderStatus(normalizeOpenAiProviderStatus(openAiProvider));
+      setGithubProviderStatus(normalizeGithubProviderStatus(githubProvider));
       setOpenAiAuthLoaded(true);
     };
 
@@ -1911,6 +1904,52 @@ function HubApp() {
     }
   }
 
+  async function handleConnectGithubSsh(event) {
+    event.preventDefault();
+    const privateKey = String(githubDraftPrivateKey || "").trim();
+    if (!privateKey) {
+      setError("GitHub SSH private key is required.");
+      return;
+    }
+
+    setGithubSaving(true);
+    try {
+      const knownHosts = String(githubDraftKnownHosts || "").trim();
+      const payload = await fetchJson("/api/settings/auth/github/connect", {
+        method: "POST",
+        body: JSON.stringify({
+          private_key: privateKey,
+          ...(knownHosts ? { known_hosts: knownHosts } : {})
+        })
+      });
+      setGithubProviderStatus(normalizeGithubProviderStatus(payload?.provider));
+      setGithubDraftPrivateKey("");
+      setError("");
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setGithubSaving(false);
+    }
+  }
+
+  async function handleDisconnectGithubSsh() {
+    setGithubDisconnecting(true);
+    try {
+      const payload = await fetchJson("/api/settings/auth/github/disconnect", {
+        method: "POST"
+      });
+      setGithubProviderStatus(normalizeGithubProviderStatus(payload?.provider));
+      setGithubDraftPrivateKey("");
+      setGithubDraftKnownHosts("");
+      setGithubCardExpanded(true);
+      setError("");
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setGithubDisconnecting(false);
+    }
+  }
+
   async function handleStartOpenAiAccountLogin(method) {
     setOpenAiAccountStarting(true);
     try {
@@ -2072,6 +2111,10 @@ function HubApp() {
       : openAiProviderStatus.connected
         ? "Connected with API key."
         : "Not connected yet. Expand this section and choose one login method.";
+  const githubConnected = githubProviderStatus.connected;
+  const githubConnectionSummary = githubConnected
+    ? "SSH credentials are configured and will be mounted into chat containers."
+    : "Not connected yet. Add a GitHub SSH private key to enable git+ssh inside containers.";
 
   useEffect(() => {
     if (!openAiAuthLoaded || openAiCardExpansionInitialized) {
@@ -2108,17 +2151,31 @@ function HubApp() {
   }, [visibleChats, fullscreenChatId]);
 
   useEffect(() => {
-    if (activeTab !== "chats" && fullscreenChatId) {
-      setFullscreenChatId("");
+    if (activeTab !== "chats") {
+      if (fullscreenChatId) {
+        setFullscreenChatId("");
+      }
+      if (artifactPreview) {
+        setArtifactPreview(null);
+      }
     }
-  }, [activeTab, fullscreenChatId]);
+  }, [activeTab, fullscreenChatId, artifactPreview]);
 
   useEffect(() => {
-    if (!fullscreenChatId) {
+    if (!fullscreenChatId && !artifactPreview) {
       return undefined;
     }
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [fullscreenChatId, artifactPreview]);
+
+  useEffect(() => {
+    if (!fullscreenChatId || artifactPreview) {
+      return undefined;
+    }
     const onKeyDown = (event) => {
       if (event.key === "Escape") {
         setFullscreenChatId("");
@@ -2126,10 +2183,24 @@ function HubApp() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
-      document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [fullscreenChatId]);
+  }, [fullscreenChatId, artifactPreview]);
+
+  useEffect(() => {
+    if (!artifactPreview) {
+      return undefined;
+    }
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setArtifactPreview(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [artifactPreview]);
 
   function resolveServerChatId(chat) {
     return String(chat?.server_chat_id || chat?.id || "");
@@ -2245,13 +2316,18 @@ function HubApp() {
       const artifactId = String(artifact?.id || "");
       const artifactName = String(artifact?.name || artifact?.relative_path || "artifact");
       const iconDescriptor = resolveArtifactIcon(artifact);
+      const previewKind =
+        iconDescriptor.variant === "image" || iconDescriptor.variant === "video" ? iconDescriptor.variant : "";
+      const previewUrl = String(artifact?.preview_url || artifact?.download_url || "");
+      const downloadUrl = String(artifact?.download_url || "");
+      const canPreview = Boolean(previewKind && previewUrl);
       const artifactMeta = [
         formatBytes(artifact?.size_bytes),
         formatTimestamp(artifact?.created_at)
       ]
         .filter(Boolean)
         .join(" • ");
-      const hoverMeta = artifactMeta || (artifact?.download_url ? "Ready to download" : "Unavailable");
+      const hoverMeta = artifactMeta || (downloadUrl ? "Ready to download" : "Unavailable");
       const bubbleContent = (
         <>
           <span className="chat-artifact-icon" aria-hidden="true">
@@ -2261,12 +2337,35 @@ function HubApp() {
           <span className="chat-artifact-meta-hover">{hoverMeta}</span>
         </>
       );
-      if (artifact?.download_url) {
+      if (canPreview) {
+        return (
+          <button
+            key={`${keyPrefix}-${artifactId || artifactName}`}
+            type="button"
+            className="chat-artifact-bubble chat-artifact-bubble-action"
+            aria-label={`Preview ${artifactName}`}
+            title={`${artifactName} (preview)`}
+            onClick={() =>
+              setArtifactPreview({
+                chatId: chat.id,
+                artifactId,
+                name: artifactName,
+                kind: previewKind,
+                previewUrl,
+                downloadUrl: downloadUrl || previewUrl
+              })
+            }
+          >
+            {bubbleContent}
+          </button>
+        );
+      }
+      if (downloadUrl) {
         return (
           <a
             key={`${keyPrefix}-${artifactId || artifactName}`}
             className="chat-artifact-bubble"
-            href={String(artifact.download_url)}
+            href={downloadUrl}
             download={artifactName}
             aria-label={`Download ${artifactName}`}
             title={artifactName}
@@ -2428,7 +2527,6 @@ function HubApp() {
                 key={`${resolvedChatId}-${isFullscreenChat ? "fullscreen" : "inline"}`}
                 chatId={resolvedChatId}
                 running={isRunning}
-                isFullscreen={isFullscreenChat}
               />
             ) : chatHasServer ? (
               <div className="stack compact">
@@ -2896,6 +2994,7 @@ function HubApp() {
                 </select>
               </label>
             </div>
+            <div className="settings-provider-list">
             <article className="card auth-provider-card">
               <div className="project-head">
                 <h3>OpenAI</h3>
@@ -3225,10 +3324,140 @@ function HubApp() {
                 </>
               ) : null}
             </article>
+            <article className="card auth-provider-card">
+              <div className="project-head">
+                <h3>GitHub</h3>
+                <div className="connection-summary">
+                  <span className={`connection-pill ${githubConnected ? "connected" : "disconnected"}`}>
+                    {githubConnected ? "connected" : "not connected"}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-small"
+                    onClick={() => setGithubCardExpanded((expanded) => !expanded)}
+                  >
+                    {githubCardExpanded ? "Hide details" : "Show details"}
+                  </button>
+                </div>
+              </div>
+              <p className="meta">{githubConnectionSummary}</p>
+              {githubCardExpanded ? (
+                <>
+                  <p className="meta">
+                    Configure a dedicated GitHub SSH key for in-container git operations. These credentials are mounted only
+                    into chat and project setup containers.
+                  </p>
+                  <div className="settings-auth-block">
+                    <h4>Connect with SSH key</h4>
+                    <ol className="settings-auth-help-list">
+                      <li>Create a dedicated GitHub deploy key or machine-user SSH key.</li>
+                      <li>Paste the private key below.</li>
+                      <li>
+                        Optional: paste known-host entries for strict host pinning. Leave blank to allow first-use host key
+                        trust with persistence.
+                      </li>
+                    </ol>
+                    <div className="meta">Saved key fingerprint: {githubProviderStatus.keyHint || "none"}</div>
+                    <div className="meta">Last updated: {formatTimestamp(githubProviderStatus.updatedAt)}</div>
+                    <div className="meta">
+                      Known hosts: {githubProviderStatus.knownHostsEntries} entr{githubProviderStatus.knownHostsEntries === 1 ? "y" : "ies"}
+                    </div>
+                    <div className="meta">Known hosts updated: {formatTimestamp(githubProviderStatus.knownHostsUpdatedAt)}</div>
+                    <form className="stack compact" onSubmit={handleConnectGithubSsh}>
+                      <textarea
+                        className="script-input settings-secret-textarea"
+                        value={githubDraftPrivateKey}
+                        onChange={(event) => setGithubDraftPrivateKey(event.target.value)}
+                        placeholder={"-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"}
+                        spellCheck={false}
+                      />
+                      <textarea
+                        className="script-input settings-secret-textarea"
+                        value={githubDraftKnownHosts}
+                        onChange={(event) => setGithubDraftKnownHosts(event.target.value)}
+                        placeholder={"Optional known_hosts lines (example)\ngithub.com ssh-ed25519 AAAA..."}
+                        spellCheck={false}
+                      />
+                      <div className="actions">
+                        <button
+                          type="submit"
+                          className="btn-primary"
+                          disabled={githubSaving || githubDisconnecting}
+                        >
+                          {githubSaving ? <SpinnerLabel text="Saving..." /> : "Connect SSH key"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          disabled={!githubProviderStatus.connected || githubSaving || githubDisconnecting}
+                          onClick={handleDisconnectGithubSsh}
+                        >
+                          {githubDisconnecting ? <SpinnerLabel text="Disconnecting..." /> : "Disconnect SSH key"}
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                  <p className="meta settings-auth-note">
+                    SSH private keys are stored only on this machine with restricted permissions and are never returned by the
+                    API after save.
+                  </p>
+                </>
+              ) : null}
+            </article>
+            </div>
           </section>
         )}
         </main>
       </div>
+      {artifactPreview ? (
+        <div className="artifact-preview-overlay" role="presentation" onClick={() => setArtifactPreview(null)}>
+          <section
+            className="artifact-preview-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`Preview ${artifactPreview.name}`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="artifact-preview-header">
+              <h3 className="artifact-preview-title" title={artifactPreview.name}>{artifactPreview.name}</h3>
+              <div className="artifact-preview-actions">
+                <a
+                  className="icon-button artifact-preview-action"
+                  href={artifactPreview.downloadUrl || artifactPreview.previewUrl}
+                  download={artifactPreview.name}
+                  aria-label={`Download ${artifactPreview.name}`}
+                  title={`Download ${artifactPreview.name}`}
+                >
+                  <DownloadArrowIcon />
+                </a>
+                <button
+                  type="button"
+                  className="icon-button artifact-preview-action"
+                  aria-label={`Close preview for ${artifactPreview.name}`}
+                  title="Close preview"
+                  onClick={() => setArtifactPreview(null)}
+                >
+                  <CloseIcon />
+                </button>
+              </div>
+            </header>
+            <div className="artifact-preview-body">
+              {artifactPreview.kind === "video" ? (
+                <video
+                  className="artifact-preview-video"
+                  src={artifactPreview.previewUrl}
+                  controls
+                  autoPlay
+                  preload="metadata"
+                  playsInline
+                />
+              ) : (
+                <img className="artifact-preview-image" src={artifactPreview.previewUrl} alt={artifactPreview.name} />
+              )}
+            </div>
+          </section>
+        </div>
+      ) : null}
 
     </div>
   );
