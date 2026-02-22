@@ -917,15 +917,17 @@ button:focus-visible {
   gap: 8px;
 }
 
-.chat-artifact-preview-group {
-  display: grid;
-  gap: 8px;
+.chat-artifact-bubble-row {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-gutter: stable both-edges;
 }
 
 .chat-artifact-preview-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 8px;
   flex-wrap: wrap;
 }
@@ -1032,8 +1034,11 @@ button:focus-visible {
 }
 
 .chat-artifact-bubble-action {
+  width: auto;
+  max-width: 100%;
   cursor: pointer;
   font: inherit;
+  justify-content: flex-start;
 }
 
 .chat-artifact-bubble:hover {

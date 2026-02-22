@@ -2952,7 +2952,6 @@ function HubApp() {
 
             {currentArtifacts.length > 0 ? (
               <section className="chat-artifacts" aria-label={`Generated files for ${titleText}`}>
-                <div className="meta">Attached files</div>
                 {nonPreviewableCurrentArtifacts.length > 0 ? (
                   <div className="chat-artifact-list">
                     {nonPreviewableCurrentArtifacts.map(({ artifact, index, artifactInfo }) =>
@@ -2961,9 +2960,8 @@ function HubApp() {
                   </div>
                 ) : null}
                 {previewableCurrentArtifacts.length > 0 ? (
-                  <div className="chat-artifact-preview-group">
+                  <>
                     <div className="chat-artifact-preview-header">
-                      <div className="meta">Previewable files</div>
                       <button
                         type="button"
                         className="btn-secondary btn-small chat-artifact-thumbnail-toggle"
@@ -2986,13 +2984,13 @@ function HubApp() {
                         )}
                       </div>
                     ) : (
-                      <div className="chat-artifact-list">
+                      <div className="chat-artifact-list chat-artifact-bubble-row">
                         {previewableCurrentArtifacts.map(({ artifact, index, artifactInfo }) =>
                           renderArtifactBubble(artifact, `current-preview-bubble-${index}`, artifactInfo)
                         )}
                       </div>
                     )}
-                  </div>
+                  </>
                 ) : null}
               </section>
             ) : null}
