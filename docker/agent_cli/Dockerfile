@@ -19,15 +19,20 @@ RUN apt-get update \
     sudo \
  && rm -rf /var/lib/apt/lists/*
 
+RUN if ! id -u agent >/dev/null 2>&1; then \
+      groupadd --gid 1000 agent || true; \
+      useradd --uid 1000 --gid 1000 --home-dir /home/agent --create-home --shell /bin/bash agent; \
+    fi \
+ && mkdir -p /home/agent/projects /home/agent/.cache/uv /home/agent/.codex \
+ && chown -R agent:agent /home/agent
+
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get update \
  && apt-get install -y --no-install-recommends nodejs \
  && case "${AGENT_PROVIDER}" in \
       codex) npm install -g @openai/codex ;; \
-      claude) export HOME=/root PATH=/root/.local/bin:$PATH \
-              && curl -fsSL https://claude.ai/install.sh | bash - \
-              && test -x /root/.local/bin/claude \
-              && cp -L /root/.local/bin/claude /usr/local/bin/claude \
+      claude) sudo -u agent -H bash -lc 'set -euo pipefail; export PATH="$HOME/.local/bin:$PATH"; curl -fsSL https://claude.ai/install.sh | bash -; test -x "$HOME/.local/bin/claude"' \
+              && cp -L /home/agent/.local/bin/claude /usr/local/bin/claude \
               && /usr/local/bin/claude --version >/dev/null ;; \
       gemini) npm install -g @google/gemini-cli ;; \
       none) echo "Skipping agent CLI install for setup image." ;; \
@@ -35,13 +40,6 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     esac \
  && npm cache clean --force \
  && rm -rf /var/lib/apt/lists/*
-
-RUN if ! id -u agent >/dev/null 2>&1; then \
-      groupadd --gid 1000 agent || true; \
-      useradd --uid 1000 --gid 1000 --home-dir /home/agent --create-home --shell /bin/bash agent; \
-    fi \
- && mkdir -p /home/agent/projects /home/agent/.cache/uv /home/agent/.codex \
- && chown -R agent:agent /home/agent
 
 COPY docker/agent_cli/docker-entrypoint.py /usr/local/bin/docker-entrypoint.py
 COPY docker/agent_cli/hub_artifact /usr/local/bin/hub_artifact
