@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Iterable, Tuple
 
@@ -352,7 +353,8 @@ def main(
     container_project_path = f"{container_home_path}/projects/{container_project_name}"
 
     host_agent_home = Path(agent_home_path or (Path.home() / ".agent-home" / user)).resolve()
-    (host_agent_home / ".codex").mkdir(parents=True, exist_ok=True)
+    host_codex_dir = host_agent_home / ".codex"
+    host_codex_dir.mkdir(parents=True, exist_ok=True)
     (host_agent_home / "projects").mkdir(parents=True, exist_ok=True)
 
     api_key = openai_api_key
@@ -437,9 +439,9 @@ def main(
         "--workdir",
         container_project_path,
         "--volume",
-        f"{host_agent_home}:{container_home_path}",
-        "--volume",
         f"{project_path}:{container_project_path}",
+        "--volume",
+        f"{host_codex_dir}:{container_home_path}/.codex",
         "--volume",
         f"{config_path}:{container_home_path}/.codex/config.toml:ro",
         "--env",
@@ -471,6 +473,9 @@ def main(
         "--env",
         f"CONTAINER_PROJECT_PATH={container_project_path}",
     ]
+
+    if sys.platform.startswith("linux"):
+        run_args.extend(["--add-host", "host.docker.internal:host-gateway"])
 
     if api_key:
         run_args.extend(["--env", f"OPENAI_API_KEY={api_key}"])

@@ -24,6 +24,27 @@ def _group_name_for_gid(gid: str) -> str | None:
     return result.stdout.split(":", 1)[0]
 
 
+def _ensure_path_owner(path: Path, uid: int, gid: int) -> None:
+    try:
+        os.chown(path, uid, gid)
+    except OSError:
+        pass
+
+
+def _ensure_runtime_home_paths(local_home: str, local_uid: int, local_gid: int) -> None:
+    home_path = Path(local_home)
+    cache_dir = home_path / ".cache"
+    uv_cache_dir = cache_dir / "uv"
+    projects_dir = home_path / "projects"
+
+    for path in (home_path, cache_dir, uv_cache_dir, projects_dir):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        _ensure_path_owner(path, local_uid, local_gid)
+
+
 def _ensure_user_and_groups() -> None:
     local_user = os.environ.get("LOCAL_USER", "agent")
     local_group = os.environ.get("LOCAL_GROUP", local_user)
@@ -126,8 +147,7 @@ def _ensure_user_and_groups() -> None:
         sudoers_file.write_text(f"{local_user} ALL=(ALL:ALL) NOPASSWD:ALL\n")
         sudoers_file.chmod(0o440)
 
-    os.makedirs(local_home, exist_ok=True)
-    os.chown(local_home, local_uid, local_gid)
+    _ensure_runtime_home_paths(local_home, local_uid, local_gid)
 
     os.execvp("gosu", ["gosu", local_user, *command])
 

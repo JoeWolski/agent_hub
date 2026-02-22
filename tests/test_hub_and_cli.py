@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
+import signal
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -227,6 +230,9 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("codex", cmd)
         self.assertIn("login", cmd)
         self.assertNotIn("--device-auth", cmd)
+        container_home = f"/home/{self.state.local_user}"
+        self.assertNotIn(f"{self.state.host_agent_home}:{container_home}", cmd)
+        self.assertIn(f"{self.state.host_codex_dir}:{container_home}/.codex", cmd)
         self.assertIn("session", payload)
 
     def test_start_openai_account_login_device_auth_includes_flag(self) -> None:
@@ -332,6 +338,9 @@ class HubStateTests(unittest.TestCase):
         ), patch(
             "agent_hub.server._docker_image_exists",
             return_value=True,
+        ), patch(
+            "agent_hub.server._new_artifact_publish_token",
+            return_value="artifact-token-test",
         ), patch.object(
             hub_server.HubState,
             "_spawn_chat_process",
@@ -379,6 +388,9 @@ class HubStateTests(unittest.TestCase):
         ), patch(
             "agent_hub.server._docker_image_exists",
             return_value=True,
+        ), patch(
+            "agent_hub.server._new_artifact_publish_token",
+            return_value="artifact-token-test",
         ), patch.object(
             hub_server.HubState,
             "_spawn_chat_process",
@@ -400,12 +412,22 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("--env-var", cmd)
         self.assertIn("FOO=bar", cmd)
         self.assertIn("EMPTY=", cmd)
+        self.assertIn(
+            f"AGENT_HUB_ARTIFACTS_URL=http://host.docker.internal:{hub_server.DEFAULT_PORT}/api/chats/{chat['id']}/artifacts/publish",
+            cmd,
+        )
+        self.assertIn("AGENT_HUB_ARTIFACT_TOKEN=artifact-token-test", cmd)
         self.assertIn("--snapshot-image-tag", cmd)
         self.assertIn(self.state._project_setup_snapshot_tag(project), cmd)
         self.assertIn("--", cmd)
         self.assertIn("--model", cmd)
         self.assertIn("gpt-5", cmd)
         self.assertIn('model_reasoning_effort="high"', cmd)
+        started_chat = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(
+            started_chat["artifact_publish_token_hash"],
+            hub_server._hash_artifact_publish_token("artifact-token-test"),
+        )
 
     def test_start_chat_rejects_base_path_outside_workspace(self) -> None:
         project = self.state.add_project(
@@ -430,9 +452,203 @@ class HubStateTests(unittest.TestCase):
 
         with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
             hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
         ):
             with self.assertRaises(HTTPException):
                 self.state.start_chat(chat["id"])
+
+    def test_publish_chat_artifact_registers_download_metadata(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        workspace = self.state.chat_workdir(chat["id"])
+        output_dir = workspace / "outputs"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        artifact_file = output_dir / "summary.txt"
+        artifact_file.write_text("artifact payload\n", encoding="utf-8")
+
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["artifact_publish_token_hash"] = hub_server._hash_artifact_publish_token("token-abc")
+        state_data["chats"][chat["id"]]["artifact_publish_token_issued_at"] = "2026-02-21T00:00:00Z"
+        self.state.save(state_data)
+
+        artifact = self.state.publish_chat_artifact(
+            chat_id=chat["id"],
+            token="token-abc",
+            submitted_path="outputs/summary.txt",
+            name="Run Summary",
+        )
+        self.assertEqual(artifact["name"], "Run Summary")
+        self.assertEqual(artifact["relative_path"], "outputs/summary.txt")
+        self.assertEqual(artifact["size_bytes"], len("artifact payload\n"))
+        self.assertEqual(
+            artifact["download_url"],
+            f"/api/chats/{chat['id']}/artifacts/{artifact['id']}/download",
+        )
+
+        listed = self.state.list_chat_artifacts(chat["id"])
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["id"], artifact["id"])
+
+        payload = self.state.state_payload()
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertNotIn("artifact_publish_token_hash", chat_payload)
+        self.assertNotIn("artifact_publish_token_issued_at", chat_payload)
+        self.assertEqual(len(chat_payload["artifacts"]), 1)
+        self.assertEqual(chat_payload["artifact_current_ids"], [artifact["id"]])
+        self.assertEqual(chat_payload["artifact_prompt_history"], [])
+
+    def test_record_chat_title_prompt_archives_current_artifacts_by_previous_prompt(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        workspace = self.state.chat_workdir(chat["id"])
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "notes.txt").write_text("run output\n", encoding="utf-8")
+
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["artifact_publish_token_hash"] = hub_server._hash_artifact_publish_token("token-archive")
+        state_data["chats"][chat["id"]]["title_user_prompts"] = ["summarize yesterday's run logs"]
+        self.state.save(state_data)
+
+        artifact = self.state.publish_chat_artifact(
+            chat_id=chat["id"],
+            token="token-archive",
+            submitted_path="notes.txt",
+            name="Run Notes",
+        )
+
+        with patch.object(hub_server.HubState, "_schedule_chat_title_generation") as schedule_title:
+            result = self.state.record_chat_title_prompt(chat["id"], "generate retry recommendations")
+            self.assertTrue(result["recorded"])
+            schedule_title.assert_called_once_with(chat["id"])
+
+        updated = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(updated["artifact_current_ids"], [])
+        self.assertEqual(len(updated["artifact_prompt_history"]), 1)
+        archived_entry = updated["artifact_prompt_history"][0]
+        self.assertEqual(archived_entry["prompt"], "summarize yesterday's run logs")
+        self.assertTrue(archived_entry["archived_at"])
+        self.assertEqual(len(archived_entry["artifacts"]), 1)
+        self.assertEqual(archived_entry["artifacts"][0]["id"], artifact["id"])
+        self.assertEqual(updated["title_user_prompts"][-1], "generate retry recommendations")
+
+        payload = self.state.state_payload()
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(chat_payload["artifact_current_ids"], [])
+        self.assertEqual(len(chat_payload["artifact_prompt_history"]), 1)
+        history_payload = chat_payload["artifact_prompt_history"][0]
+        self.assertEqual(history_payload["prompt"], "summarize yesterday's run logs")
+        self.assertEqual(len(history_payload["artifacts"]), 1)
+        self.assertEqual(
+            history_payload["artifacts"][0]["download_url"],
+            f"/api/chats/{chat['id']}/artifacts/{artifact['id']}/download",
+        )
+
+    def test_load_backfills_current_artifact_ids_for_legacy_state(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["artifacts"] = [
+            {
+                "id": "artifact-legacy",
+                "name": "Legacy File",
+                "relative_path": "legacy.txt",
+                "size_bytes": 12,
+                "created_at": "2026-02-21T00:00:00Z",
+            }
+        ]
+        state_data["chats"][chat["id"]].pop("artifact_current_ids", None)
+        self.state.save(state_data)
+
+        loaded = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(loaded["artifact_current_ids"], ["artifact-legacy"])
+
+    def test_publish_chat_artifact_rejects_invalid_token(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        workspace = self.state.chat_workdir(chat["id"])
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "output.txt").write_text("artifact", encoding="utf-8")
+
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["artifact_publish_token_hash"] = hub_server._hash_artifact_publish_token("token-good")
+        self.state.save(state_data)
+
+        with self.assertRaises(HTTPException) as ctx:
+            self.state.publish_chat_artifact(
+                chat_id=chat["id"],
+                token="token-bad",
+                submitted_path="output.txt",
+            )
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_publish_chat_artifact_rejects_paths_outside_workspace(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["artifact_publish_token_hash"] = hub_server._hash_artifact_publish_token("token-abc")
+        self.state.save(state_data)
+
+        with self.assertRaises(HTTPException) as ctx:
+            self.state.publish_chat_artifact(
+                chat_id=chat["id"],
+                token="token-abc",
+                submitted_path="../outside.txt",
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
 
     def test_create_and_start_chat_rejects_when_project_build_is_not_ready(self) -> None:
         project = self.state.add_project(
@@ -615,9 +831,32 @@ class HubStateTests(unittest.TestCase):
         runtime = hub_server.ChatRuntime(process=SimpleNamespace(pid=1), master_fd=42)
         with patch.object(hub_server.HubState, "_runtime_for_chat", return_value=runtime), patch(
             "agent_hub.server.fcntl.ioctl"
-        ) as ioctl_mock:
+        ) as ioctl_mock, patch(
+            "agent_hub.server.os.getpgid",
+            return_value=1,
+        ) as getpgid_mock, patch(
+            "agent_hub.server.os.killpg"
+        ) as killpg_mock:
             self.state.resize_terminal("chat-1", 120, 40)
         self.assertEqual(ioctl_mock.call_count, 1)
+        getpgid_mock.assert_called_once_with(1)
+        killpg_mock.assert_called_once_with(1, signal.SIGWINCH)
+
+    def test_resize_terminal_falls_back_to_process_signal_when_group_signal_fails(self) -> None:
+        runtime = hub_server.ChatRuntime(process=SimpleNamespace(pid=4321), master_fd=42)
+        with patch.object(hub_server.HubState, "_runtime_for_chat", return_value=runtime), patch(
+            "agent_hub.server.fcntl.ioctl"
+        ), patch(
+            "agent_hub.server.os.getpgid",
+            return_value=4321,
+        ), patch(
+            "agent_hub.server.os.killpg",
+            side_effect=OSError("group signal failed"),
+        ), patch(
+            "agent_hub.server.os.kill"
+        ) as kill_mock:
+            self.state.resize_terminal("chat-1", 100, 30)
+        kill_mock.assert_called_once_with(4321, signal.SIGWINCH)
 
     def test_attach_terminal_returns_full_chat_log_history(self) -> None:
         project = self.state.add_project(
@@ -724,6 +963,7 @@ class HubStateTests(unittest.TestCase):
         state_data = self.state.load()
         state_data["chats"][chat["id"]]["status"] = "running"
         state_data["chats"][chat["id"]]["pid"] = 9876
+        state_data["chats"][chat["id"]]["artifact_publish_token_hash"] = hub_server._hash_artifact_publish_token("token-live")
         self.state.save(state_data)
 
         with patch("agent_hub.server._stop_process") as stop_process, patch.object(
@@ -735,6 +975,7 @@ class HubStateTests(unittest.TestCase):
         close_runtime.assert_called_once_with(chat["id"])
         self.assertEqual(result["status"], "stopped")
         self.assertIsNone(result["pid"])
+        self.assertEqual(result["artifact_publish_token_hash"], "")
         self.assertTrue(workspace.exists())
         self.assertTrue((workspace / "sentinel.txt").exists())
         self.assertIn(chat["id"], self.state.load()["chats"])
@@ -799,7 +1040,14 @@ class HubStateTests(unittest.TestCase):
             agent_args=[],
         )
         self.state.chat_log(chat["id"]).write_text(
-            "Tip: example\n> how do i run tests?\nUse uv run python -m unittest discover -s tests -v\n",
+            (
+                "Tip: example\n"
+                "\x1b[34m. Older status line\x1b[0m\n"
+                "> how do i run tests?\n"
+                "Intermediary output\n"
+                "\x1b[32m. Use uv run python -m unittest discover -s tests -v\x1b[0m\n"
+                "> fix login timeout handling\n"
+            ),
             encoding="utf-8",
         )
         state_data = self.state.load()
@@ -814,7 +1062,293 @@ class HubStateTests(unittest.TestCase):
 
         chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
         self.assertEqual(chat_payload["display_name"], "Run python unit tests")
-        self.assertTrue(chat_payload["display_subtitle"].startswith("Use uv run python -m unittest"))
+        self.assertEqual(chat_payload["display_subtitle"], "Use uv run python -m unittest discover -s tests -v")
+
+    def test_state_payload_subtitle_strips_terminal_control_fragments(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        self.state.chat_log(chat["id"]).write_text(
+            (
+                "]10;rgb:e7e7/eded/f7f7 . Remove terminal color payload first\n"
+                "> next prompt\n"
+            ),
+            encoding="utf-8",
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 1111
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._is_process_running", return_value=True):
+            payload = self.state.state_payload()
+
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(chat_payload["display_subtitle"], "Remove terminal color payload first")
+
+    def test_state_payload_subtitle_uses_created_line_before_prompt(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        self.state.chat_log(chat["id"]).write_text(
+            (
+                "• Ran hub_artifact publish empty_test_files/*\n"
+                "  └ Artifact published: test.bash (/api/chats/test/artifacts/a/download)\n"
+                "    Artifact published: test.bat (/api/chats/test/artifacts/b/download)\n"
+                "    … +113 lines\n"
+                "    Artifact upload progress: 113/113 processed; 113 succeeded; 0 failed.\n"
+                "    Published 113 artifacts.\n"
+                "\n"
+                "────────────────────────────────────────────────────────────────────────\n"
+                "\n"
+                "• Created 113 empty test files under empty_test_files/ (named like test.<ext>, spanning common code, config, doc, data, media, and archive extensions).\n"
+                "\n"
+                "  Published artifacts: 113/113 succeeded via hub_artifact publish empty_test_files/*.\n"
+                "\n"
+                "› Explain this codebase\n"
+            ),
+            encoding="utf-8",
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 1111
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._is_process_running", return_value=True):
+            payload = self.state.state_payload()
+
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(
+            chat_payload["display_subtitle"],
+            "Created 113 empty test files under empty_test_files/ (named like test.<ext>, spanning common code, config, doc, data, media, and archive extensions).",
+        )
+
+    def test_state_payload_subtitle_uses_hollow_bullet_working_line_before_prompt(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        self.state.chat_log(chat["id"]).write_text(
+            (
+                "› Make me empty example files of all common file extensions\n"
+                "\n"
+                "◦ Working (11s • esc to interrupt)\n"
+                "\n"
+                "› Implement {feature}\n"
+            ),
+            encoding="utf-8",
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 1111
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._is_process_running", return_value=True):
+            payload = self.state.state_payload()
+
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(chat_payload["display_subtitle"], "Working (11s • esc to interrupt)")
+
+    def test_state_payload_subtitle_uses_alternate_circle_marker_before_prompt(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        self.state.chat_log(chat["id"]).write_text(
+            (
+                "› Make me empty example files of all common file extensions\n"
+                "\n"
+                "◉ Working (11s • esc to interrupt)\n"
+                "\n"
+                "› Implement {feature}\n"
+            ),
+            encoding="utf-8",
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 1111
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._is_process_running", return_value=True):
+            payload = self.state.state_payload()
+
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(chat_payload["display_subtitle"], "Working (11s • esc to interrupt)")
+
+    def test_state_payload_subtitle_uses_last_animated_working_line_before_prompt(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        self.state.chat_log(chat["id"]).write_text(
+            (
+                "› Make me empty example files of all common file extensions\n"
+                "◦ Working (9s • esc to interrupt)\r"
+                "\x1b[2K◦ Working (10s • esc to interrupt)\r"
+                "\x1b[2K◦ Working (11s • esc to interrupt)\r"
+                "› Implement {feature}\n"
+            ),
+            encoding="utf-8",
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 1111
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._is_process_running", return_value=True):
+            payload = self.state.state_payload()
+
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(chat_payload["display_subtitle"], "Working (11s • esc to interrupt)")
+
+    def test_state_payload_subtitle_uses_spinner_working_line_before_prompt(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        self.state.chat_log(chat["id"]).write_text(
+            (
+                "› Make me empty example files of all common file extensions\n"
+                "⠋ Working (9s • esc to interrupt)\r"
+                "\x1b[2K⠙ Working (10s • esc to interrupt)\r"
+                "\x1b[2K⠹ Working (11s • esc to interrupt)\r"
+                "› Implement {feature}\n"
+            ),
+            encoding="utf-8",
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 1111
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._is_process_running", return_value=True):
+            payload = self.state.state_payload()
+
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(chat_payload["display_subtitle"], "Working (11s • esc to interrupt)")
+
+    def test_state_payload_subtitle_uses_cursor_animation_working_line_before_prompt(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        self.state.chat_log(chat["id"]).write_text(
+            (
+                "› Make me empty example files of all common file extensions\n"
+                "\x1b[?2026h\x1b[15;2H\x1b[0m\x1b[49m\x1b[K⠋ Working (9s • esc to interrupt)\x1b[19;3H\x1b[?2026l"
+                "\x1b[?2026h\x1b[15;2H\x1b[0m\x1b[49m\x1b[K⠙ Working (10s • esc to interrupt)\x1b[19;3H\x1b[?2026l"
+                "\x1b[?2026h\x1b[15;2H\x1b[0m\x1b[49m\x1b[K⠹ Working (11s • esc to interrupt)\x1b[19;3H\x1b[?2026l"
+                "\n› Implement {feature}\n"
+            ),
+            encoding="utf-8",
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 1111
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._is_process_running", return_value=True):
+            payload = self.state.state_payload()
+
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(chat_payload["display_subtitle"], "Working (11s • esc to interrupt)")
+
+    def test_state_payload_subtitle_prefers_waiting_background_terminal_line(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        self.state.chat_log(chat["id"]).write_text(
+            (
+                "• Files are generated under example_files/common_extensions (155 files total).\n"
+                "\n"
+                "• Ran hub_artifact publish example_files/common_extensions\n"
+                "  └ Artifact published: Dockerfile (/api/chats/test/artifacts/a/download)\n"
+                "    Artifact upload progress: 155/155 processed; 155 succeeded; 0 failed.\n"
+                "    Published 155 artifacts.\n"
+                "\n"
+                "\u200b• Waiting for background terminal (49s • esc to interrupt)\n"
+                "\n"
+                "› Use /skills to list available skills\n"
+            ),
+            encoding="utf-8",
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 1111
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._is_process_running", return_value=True):
+            payload = self.state.state_payload()
+
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(chat_payload["display_subtitle"], "Waiting for background terminal (49s • esc to interrupt)")
 
     def test_write_terminal_input_records_prompt_only_on_submit(self) -> None:
         project = self.state.add_project(
@@ -1309,7 +1843,302 @@ class HubStateTests(unittest.TestCase):
         self.assertIn(stopped_chat["id"], post["chats"])
 
 
+class HubArtifactCommandTests(unittest.TestCase):
+    def _make_fake_curl(self, fake_bin: Path) -> Path:
+        fake_bin.mkdir(parents=True, exist_ok=True)
+        curl_script = fake_bin / "curl"
+        curl_script.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+
+payload=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --data)
+      payload="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "${payload}" ]]; then
+  echo "missing --data payload" >&2
+  exit 2
+fi
+
+printf '%s\\n' "${payload}" >> "${HUB_ARTIFACT_CURL_LOG:?}"
+
+python3 - "${payload}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+body = json.loads(sys.argv[1])
+path = str(body.get("path") or "")
+fail_once_path = str(os.environ.get("HUB_ARTIFACT_FAIL_ONCE_PATH") or "")
+fail_once_marker = str(os.environ.get("HUB_ARTIFACT_FAIL_ONCE_MARKER") or "")
+always_fail_path = str(os.environ.get("HUB_ARTIFACT_ALWAYS_FAIL_PATH") or "")
+
+if always_fail_path and path == always_fail_path:
+    print(f"simulated upload failure for {path}", file=sys.stderr)
+    sys.exit(75)
+
+if fail_once_path and path == fail_once_path and fail_once_marker:
+    marker = Path(fail_once_marker)
+    if not marker.exists():
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("failed-once", encoding="utf-8")
+        print(f"simulated transient upload failure for {path}", file=sys.stderr)
+        sys.exit(75)
+
+name = str(body.get("name") or Path(path).name or "artifact")
+print(json.dumps({
+    "artifact": {
+        "name": name,
+        "relative_path": path,
+        "download_url": f"/download/{name}",
+    }
+}))
+PY
+""",
+            encoding="utf-8",
+        )
+        curl_script.chmod(0o755)
+        return curl_script
+
+    def _run_publish(self, *args: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(ROOT / "docker" / "hub_artifact"), "publish", *args],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_hub_artifact_publish_accepts_file_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            file_one = tmp_path / "a.txt"
+            file_two = tmp_path / "b.txt"
+            file_one.write_text("a", encoding="utf-8")
+            file_two.write_text("b", encoding="utf-8")
+
+            fake_bin = tmp_path / "fake-bin"
+            self._make_fake_curl(fake_bin)
+            curl_log = tmp_path / "curl.log"
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env["HUB_ARTIFACT_CURL_LOG"] = str(curl_log)
+            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
+            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
+
+            result = self._run_publish(str(file_one), str(file_two), env=env)
+            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+            self.assertIn("Artifact published: a.txt", result.stdout)
+            self.assertIn("Artifact published: b.txt", result.stdout)
+            self.assertIn("Published 2 artifacts.", result.stdout)
+
+            payloads = [json.loads(line) for line in curl_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(payloads), 2)
+            self.assertEqual(payloads[0]["path"], str(file_one))
+            self.assertEqual(payloads[1]["path"], str(file_two))
+            self.assertNotIn("name", payloads[0])
+            self.assertNotIn("name", payloads[1])
+
+    def test_hub_artifact_publish_accepts_directory_and_rejects_subdirectories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_bin = tmp_path / "fake-bin"
+            self._make_fake_curl(fake_bin)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
+            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
+
+            flat_dir = tmp_path / "flat"
+            flat_dir.mkdir(parents=True, exist_ok=True)
+            (flat_dir / "z.txt").write_text("z", encoding="utf-8")
+            (flat_dir / "a.txt").write_text("a", encoding="utf-8")
+            flat_log = tmp_path / "flat.log"
+            env["HUB_ARTIFACT_CURL_LOG"] = str(flat_log)
+
+            ok_result = self._run_publish(str(flat_dir), env=env)
+            self.assertEqual(ok_result.returncode, 0, msg=ok_result.stderr or ok_result.stdout)
+            payloads = [json.loads(line) for line in flat_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(payloads), 2)
+            self.assertEqual(payloads[0]["path"], str(flat_dir / "a.txt"))
+            self.assertEqual(payloads[1]["path"], str(flat_dir / "z.txt"))
+
+            nested_dir = tmp_path / "nested"
+            nested_dir.mkdir(parents=True, exist_ok=True)
+            (nested_dir / "keep.txt").write_text("k", encoding="utf-8")
+            (nested_dir / "child").mkdir(parents=True, exist_ok=True)
+            nested_log = tmp_path / "nested.log"
+            env["HUB_ARTIFACT_CURL_LOG"] = str(nested_log)
+
+            fail_result = self._run_publish(str(nested_dir), env=env)
+            self.assertNotEqual(fail_result.returncode, 0)
+            self.assertIn("Subdirectories are not supported for artifact publish", fail_result.stderr)
+            self.assertFalse(nested_log.exists())
+
+    def test_hub_artifact_publish_rejects_name_for_multiple_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            file_one = tmp_path / "a.txt"
+            file_two = tmp_path / "b.txt"
+            file_one.write_text("a", encoding="utf-8")
+            file_two.write_text("b", encoding="utf-8")
+            fake_bin = tmp_path / "fake-bin"
+            self._make_fake_curl(fake_bin)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env["HUB_ARTIFACT_CURL_LOG"] = str(tmp_path / "curl.log")
+            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
+            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
+
+            result = self._run_publish(str(file_one), str(file_two), "--name", "Combined", env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--name can only be used when publishing exactly one file.", result.stderr)
+
+    def test_hub_artifact_publish_accepts_archive_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive_file = tmp_path / "bundle.zip"
+            archive_file.write_text("zip payload", encoding="utf-8")
+            fake_bin = tmp_path / "fake-bin"
+            self._make_fake_curl(fake_bin)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env["HUB_ARTIFACT_CURL_LOG"] = str(tmp_path / "curl.log")
+            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
+            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
+
+            result = self._run_publish(str(archive_file), env=env)
+            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+            self.assertIn("Artifact published: bundle.zip", result.stdout)
+            payloads = [json.loads(line) for line in Path(env["HUB_ARTIFACT_CURL_LOG"]).read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(payloads), 1)
+            self.assertEqual(payloads[0]["path"], str(archive_file))
+
+    def test_hub_artifact_publish_retries_only_failed_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            file_one = tmp_path / "a.txt"
+            file_two = tmp_path / "b.txt"
+            file_one.write_text("a", encoding="utf-8")
+            file_two.write_text("b", encoding="utf-8")
+            fake_bin = tmp_path / "fake-bin"
+            self._make_fake_curl(fake_bin)
+            curl_log = tmp_path / "curl.log"
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env["HUB_ARTIFACT_CURL_LOG"] = str(curl_log)
+            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
+            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
+            env["HUB_ARTIFACT_MAX_ATTEMPTS"] = "2"
+            env["HUB_ARTIFACT_RETRY_DELAY_BASE_SEC"] = "0"
+            env["HUB_ARTIFACT_FAIL_ONCE_PATH"] = str(file_two)
+            env["HUB_ARTIFACT_FAIL_ONCE_MARKER"] = str(tmp_path / "failed-once.marker")
+
+            result = self._run_publish(str(file_one), str(file_two), env=env)
+            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+            self.assertIn(f"Retrying artifact publish (2/2): {file_two}", result.stderr)
+
+            payloads = [json.loads(line) for line in curl_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+            uploaded_paths = [payload["path"] for payload in payloads]
+            self.assertEqual(uploaded_paths.count(str(file_one)), 1)
+            self.assertEqual(uploaded_paths.count(str(file_two)), 2)
+            self.assertEqual(uploaded_paths[0], str(file_one))
+
+    def test_hub_artifact_publish_reports_failed_paths_after_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            file_one = tmp_path / "a.txt"
+            file_two = tmp_path / "b.txt"
+            file_one.write_text("a", encoding="utf-8")
+            file_two.write_text("b", encoding="utf-8")
+            fake_bin = tmp_path / "fake-bin"
+            self._make_fake_curl(fake_bin)
+            curl_log = tmp_path / "curl.log"
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env["HUB_ARTIFACT_CURL_LOG"] = str(curl_log)
+            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
+            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
+            env["HUB_ARTIFACT_MAX_ATTEMPTS"] = "2"
+            env["HUB_ARTIFACT_RETRY_DELAY_BASE_SEC"] = "0"
+            env["HUB_ARTIFACT_ALWAYS_FAIL_PATH"] = str(file_two)
+
+            result = self._run_publish(str(file_one), str(file_two), env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"Artifact publish failed after 2 attempt(s): {file_two}", result.stderr)
+            self.assertIn("Failed to publish 1 artifact(s):", result.stderr)
+            self.assertIn(f"  - {file_two}", result.stderr)
+            self.assertIn("Artifact published: a.txt", result.stdout)
+
+            payloads = [json.loads(line) for line in curl_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+            uploaded_paths = [payload["path"] for payload in payloads]
+            self.assertEqual(uploaded_paths.count(str(file_one)), 1)
+            self.assertEqual(uploaded_paths.count(str(file_two)), 2)
+
+    def test_hub_artifact_publish_handles_large_file_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            files = []
+            for index in range(200):
+                path = tmp_path / f"file-{index:03d}.txt"
+                path.write_text(f"payload-{index}\n", encoding="utf-8")
+                files.append(path)
+
+            fake_bin = tmp_path / "fake-bin"
+            self._make_fake_curl(fake_bin)
+            curl_log = tmp_path / "curl.log"
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env["HUB_ARTIFACT_CURL_LOG"] = str(curl_log)
+            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
+            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
+            env["HUB_ARTIFACT_PROGRESS_EVERY"] = "50"
+            env["HUB_ARTIFACT_RETRY_DELAY_BASE_SEC"] = "0"
+            env["HUB_ARTIFACT_MAX_ATTEMPTS"] = "3"
+            env["HUB_ARTIFACT_FAIL_ONCE_PATH"] = str(files[137])
+            env["HUB_ARTIFACT_FAIL_ONCE_MARKER"] = str(tmp_path / "failed-once.marker")
+
+            result = self._run_publish(*[str(path) for path in files], env=env)
+            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+            self.assertIn("Published 200 artifacts.", result.stdout)
+            self.assertIn("Artifact upload progress: 200/200 processed;", result.stderr)
+
+            payloads = [json.loads(line) for line in curl_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+            uploaded_paths = [payload["path"] for payload in payloads]
+            self.assertEqual(uploaded_paths.count(str(files[137])), 2)
+            self.assertEqual(len(payloads), 201)
+            self.assertEqual(uploaded_paths.count(str(files[0])), 1)
+            self.assertEqual(uploaded_paths.count(str(files[-1])), 1)
+
+
 class CliEnvVarTests(unittest.TestCase):
+    def test_default_config_uses_developer_instructions_for_file_artifacts(self) -> None:
+        config_path = ROOT / "config" / "agent.config.toml"
+        content = config_path.read_text(encoding="utf-8")
+
+        self.assertIn("\ndeveloper_instructions = \"\"\"\n", content)
+        self.assertNotIn("\ninstructions = \"\"\"\n", content)
+        self.assertIn("hub_artifact publish <path> [<path> ...]", content)
+        self.assertIn("If the user asks for a file", content)
+
     def test_parse_env_var_valid(self) -> None:
         self.assertEqual(image_cli._parse_env_var("FOO=bar", "--env-var"), "FOO=bar")
         self.assertEqual(image_cli._parse_env_var("EMPTY=", "--env-var"), "EMPTY=")
@@ -1451,6 +2280,97 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("codex", run_cmd)
             codex_index = run_cmd.index("codex")
             self.assertIn("--no-alt-screen", run_cmd[codex_index + 1 :])
+
+    def test_cli_mounts_only_codex_dir_for_container_home_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+            agent_home = tmp_path / "agent-home"
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-home-path",
+                        str(agent_home),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+
+            container_home = f"/home/{image_cli._default_user()}"
+            full_home_mount = f"{agent_home.resolve()}:{container_home}"
+            codex_mount = f"{(agent_home / '.codex').resolve()}:{container_home}/.codex"
+            self.assertNotIn(full_home_mount, run_cmd)
+            self.assertIn(codex_mount, run_cmd)
+
+    def test_cli_adds_host_gateway_alias_on_linux(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.sys.platform", "linux"), patch(
+                "agent_cli.cli.shutil.which",
+                return_value="/usr/bin/docker",
+            ), patch(
+                "agent_cli.cli._read_openai_api_key",
+                return_value=None,
+            ), patch(
+                "agent_cli.cli._docker_image_exists",
+                return_value=True,
+            ), patch(
+                "agent_cli.cli._run",
+                side_effect=fake_run,
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            self.assertIn("--add-host", run_cmd)
+            self.assertIn("host.docker.internal:host-gateway", run_cmd)
 
     def test_agent_hub_main_clean_start_invokes_state_cleanup(self) -> None:
         runner = CliRunner()

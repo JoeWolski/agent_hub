@@ -36,6 +36,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .corepack
+.corepack_cache
 
 # Local env and runtime state
 .env

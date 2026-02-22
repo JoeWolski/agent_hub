@@ -1,6 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
+import {
+  MdArchive,
+  MdAudiotrack,
+  MdCode,
+  MdDescription,
+  MdImage,
+  MdInsertDriveFile,
+  MdPictureAsPdf,
+  MdSlideshow,
+  MdTableChart,
+  MdTextSnippet,
+  MdVideocam
+} from "react-icons/md";
 
 const THEME_STORAGE_KEY = "agent_hub_theme";
 const START_MODEL_OPTIONS = ["default", "gpt-5.3-codex", "gpt-5.3-codex-spark"];
@@ -194,6 +207,208 @@ function setupCommandCount(text) {
     .filter(Boolean).length;
 }
 
+function formatBytes(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size) || size < 0) {
+    return "0 B";
+  }
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  const units = ["KB", "MB", "GB", "TB"];
+  let normalized = size / 1024;
+  let unitIndex = 0;
+  while (normalized >= 1024 && unitIndex < units.length - 1) {
+    normalized /= 1024;
+    unitIndex += 1;
+  }
+  return `${normalized.toFixed(normalized >= 10 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+const FALLBACK_LIBRARY_ICON_EXTENSIONS = {
+  code: new Set([
+    "bash",
+    "c",
+    "cc",
+    "cfg",
+    "clj",
+    "conf",
+    "cpp",
+    "cs",
+    "css",
+    "cxx",
+    "dockerfile",
+    "go",
+    "h",
+    "hpp",
+    "html",
+    "ini",
+    "ipynb",
+    "java",
+    "js",
+    "json",
+    "jsx",
+    "kt",
+    "kts",
+    "less",
+    "lua",
+    "m",
+    "mdx",
+    "php",
+    "ps1",
+    "py",
+    "r",
+    "rb",
+    "rs",
+    "sass",
+    "scala",
+    "scss",
+    "sh",
+    "sql",
+    "swift",
+    "toml",
+    "ts",
+    "tsx",
+    "xml",
+    "yaml",
+    "yml",
+    "zsh"
+  ]),
+  image: new Set(["avif", "bmp", "gif", "heic", "ico", "jpeg", "jpg", "png", "svg", "tif", "tiff", "webp"]),
+  pdf: new Set(["pdf"]),
+  archive: new Set([
+    "7z",
+    "bz2",
+    "gz",
+    "iso",
+    "jar",
+    "rar",
+    "tar",
+    "tar.bz2",
+    "tar.gz",
+    "tar.xz",
+    "tgz",
+    "tbz2",
+    "txz",
+    "war",
+    "xz",
+    "zip",
+    "zst"
+  ]),
+  audio: new Set(["aac", "flac", "m4a", "mp3", "ogg", "opus", "wav", "wma"]),
+  video: new Set(["avi", "flv", "m4v", "mkv", "mov", "mp4", "webm", "wmv"]),
+  table: new Set(["csv", "ods", "tsv", "xls", "xlsx"]),
+  slide: new Set(["key", "odp", "ppt", "pptx"]),
+  document: new Set(["doc", "docx", "odt", "rtf"]),
+  text: new Set(["log", "md", "rst", "txt"]),
+  binary: new Set(["bin", "dat", "exe", "dll", "so", "o", "a"])
+};
+const FALLBACK_LIBRARY_ICON_COMPONENTS = {
+  code: MdCode,
+  image: MdImage,
+  pdf: MdPictureAsPdf,
+  archive: MdArchive,
+  audio: MdAudiotrack,
+  video: MdVideocam,
+  table: MdTableChart,
+  slide: MdSlideshow,
+  document: MdDescription,
+  text: MdTextSnippet,
+  binary: MdInsertDriveFile
+};
+const FALLBACK_LIBRARY_ICON_COLORS = {
+  code: { background: "#2563eb", foreground: "#f8fafc", border: "#1d4ed8" },
+  image: { background: "#16a34a", foreground: "#f0fdf4", border: "#15803d" },
+  pdf: { background: "#dc2626", foreground: "#fef2f2", border: "#b91c1c" },
+  archive: { background: "#f59e0b", foreground: "#451a03", border: "#d97706" },
+  audio: { background: "#7c3aed", foreground: "#faf5ff", border: "#6d28d9" },
+  video: { background: "#db2777", foreground: "#fdf2f8", border: "#be185d" },
+  table: { background: "#0ea5e9", foreground: "#f0f9ff", border: "#0284c7" },
+  slide: { background: "#f97316", foreground: "#fff7ed", border: "#ea580c" },
+  document: { background: "#14b8a6", foreground: "#f0fdfa", border: "#0f766e" },
+  text: { background: "#0f766e", foreground: "#ecfeff", border: "#0e7490" },
+  binary: { background: "#c2410c", foreground: "#fff7ed", border: "#9a3412" }
+};
+const FALLBACK_LIBRARY_DEFAULT_COLORS = { background: "#0e7490", foreground: "#f0f9ff", border: "#155e75" };
+
+function artifactIconCandidates(artifact) {
+  const uniqueCandidates = new Set();
+
+  function addCandidate(value) {
+    const candidate = String(value || "").trim().toLowerCase().replace(/^\./, "");
+    if (candidate) {
+      uniqueCandidates.add(candidate);
+    }
+  }
+
+  function collectFromPath(rawPath) {
+    const normalized = String(rawPath || "").trim();
+    if (!normalized) {
+      return;
+    }
+    const basename = normalized.split(/[\\/]/).pop() || "";
+    const lowered = basename.toLowerCase();
+    if (!lowered) {
+      return;
+    }
+    addCandidate(lowered);
+    const parts = lowered.split(".").filter(Boolean);
+    if (parts.length <= 1) {
+      return;
+    }
+    for (let index = 1; index < parts.length; index += 1) {
+      addCandidate(parts.slice(index).join("."));
+    }
+    addCandidate(parts[parts.length - 1]);
+  }
+
+  collectFromPath(artifact?.name);
+  collectFromPath(artifact?.relative_path);
+  return uniqueCandidates;
+}
+
+function fallbackLibraryIconVariant(candidates) {
+  for (const candidate of candidates) {
+    const extension = candidate.includes(".") ? candidate.split(".").pop() : candidate;
+    if (!extension) {
+      continue;
+    }
+    for (const [variant, knownExtensions] of Object.entries(FALLBACK_LIBRARY_ICON_EXTENSIONS)) {
+      if (knownExtensions.has(candidate) || knownExtensions.has(extension)) {
+        return variant;
+      }
+    }
+  }
+  return null;
+}
+
+function resolveArtifactIcon(artifact) {
+  const candidates = artifactIconCandidates(artifact);
+  const fallbackVariant = fallbackLibraryIconVariant(candidates);
+  if (fallbackVariant) {
+    return { variant: fallbackVariant };
+  }
+  return { variant: "binary" };
+}
+
+function renderArtifactIcon(iconDescriptor) {
+  const IconComponent = FALLBACK_LIBRARY_ICON_COMPONENTS[iconDescriptor.variant] || MdInsertDriveFile;
+  const colors = FALLBACK_LIBRARY_ICON_COLORS[iconDescriptor.variant] || FALLBACK_LIBRARY_DEFAULT_COLORS;
+  return (
+    <span
+      className="chat-artifact-icon-fallback"
+      style={{
+        backgroundColor: colors.background,
+        color: colors.foreground,
+        borderColor: colors.border
+      }}
+      aria-hidden="true"
+    >
+      <IconComponent />
+    </span>
+  );
+}
+
 function projectStatusInfo(buildStatus) {
   if (buildStatus === "ready") {
     return { key: "ready", label: "Ready" };
@@ -304,9 +519,12 @@ function CloseIcon() {
   );
 }
 
-function ChatTerminal({ chatId, running }) {
+function ChatTerminal({ chatId, running, isFullscreen = false }) {
   const shellRef = useRef(null);
   const hostRef = useRef(null);
+  const triggerResizeRef = useRef((force = false) => {
+    void force;
+  });
   const [status, setStatus] = useState(running ? "connecting" : "offline");
 
   useEffect(() => {
@@ -338,6 +556,11 @@ function ChatTerminal({ chatId, running }) {
 
     const ws = new WebSocket(terminalSocketUrl(chatId));
     setStatus("connecting");
+    const sentSizeRef = { cols: 0, rows: 0 };
+    const pendingSizeRef = { cols: 0, rows: 0 };
+    let resizeFrame = null;
+    let delayedResizeOne = null;
+    let delayedResizeTwo = null;
 
     const sendInput = (text) => {
       const payload = String(text || "");
@@ -359,13 +582,35 @@ function ChatTerminal({ chatId, running }) {
       return sendInput(normalized);
     };
 
-    const sendResize = () => {
+    const sendResize = (cols = terminal.cols, rows = terminal.rows, force = false) => {
+      const nextCols = Math.max(1, Number(cols) || 1);
+      const nextRows = Math.max(1, Number(rows) || 1);
       if (ws.readyState !== WebSocket.OPEN) {
+        pendingSizeRef.cols = nextCols;
+        pendingSizeRef.rows = nextRows;
         return;
       }
-      const cols = Math.max(1, terminal.cols || 1);
-      const rows = Math.max(1, terminal.rows || 1);
-      ws.send(JSON.stringify({ type: "resize", cols, rows }));
+      if (!force && nextCols === sentSizeRef.cols && nextRows === sentSizeRef.rows) {
+        return;
+      }
+      ws.send(JSON.stringify({ type: "resize", cols: nextCols, rows: nextRows }));
+      sentSizeRef.cols = nextCols;
+      sentSizeRef.rows = nextRows;
+    };
+
+    const fitAndResize = (force = false) => {
+      fitAddon.fit();
+      sendResize(terminal.cols, terminal.rows, force);
+    };
+
+    const scheduleFitAndResize = (force = false) => {
+      if (resizeFrame != null) {
+        cancelAnimationFrame(resizeFrame);
+      }
+      resizeFrame = requestAnimationFrame(() => {
+        resizeFrame = null;
+        fitAndResize(force);
+      });
     };
 
     const inputDisposable = terminal.onData((data) => {
@@ -384,11 +629,23 @@ function ChatTerminal({ chatId, running }) {
         }
       }
     });
+    const terminalResizeDisposable = terminal.onResize(({ cols, rows }) => {
+      sendResize(cols, rows);
+    });
 
     const onOpen = () => {
       setStatus("connected");
-      fitAddon.fit();
-      sendResize();
+      fitAndResize(true);
+      if (pendingSizeRef.cols > 0 && pendingSizeRef.rows > 0) {
+        sendResize(pendingSizeRef.cols, pendingSizeRef.rows, true);
+      }
+      scheduleFitAndResize(true);
+      delayedResizeOne = window.setTimeout(() => {
+        fitAndResize(true);
+      }, 90);
+      delayedResizeTwo = window.setTimeout(() => {
+        fitAndResize(true);
+      }, 250);
       terminal.focus();
     };
     const onMessage = (event) => {
@@ -403,8 +660,7 @@ function ChatTerminal({ chatId, running }) {
       setStatus("error");
     };
     const onResize = () => {
-      fitAddon.fit();
-      sendResize();
+      scheduleFitAndResize();
     };
 
     const onShellPointerDown = () => {
@@ -429,11 +685,15 @@ function ChatTerminal({ chatId, running }) {
     let resizeObserver;
     if (typeof ResizeObserver !== "undefined" && shellElement) {
       resizeObserver = new ResizeObserver(() => {
-        fitAddon.fit();
-        sendResize();
+        scheduleFitAndResize();
       });
       resizeObserver.observe(shellElement);
+      if (hostRef.current) {
+        resizeObserver.observe(hostRef.current);
+      }
     }
+
+    triggerResizeRef.current = scheduleFitAndResize;
 
     ws.addEventListener("open", onOpen);
     ws.addEventListener("message", onMessage);
@@ -445,9 +705,19 @@ function ChatTerminal({ chatId, running }) {
       if (resizeObserver) {
         resizeObserver.disconnect();
       }
+      triggerResizeRef.current = () => {};
       if (shellElement) {
         shellElement.removeEventListener("pointerdown", onShellPointerDown);
         shellElement.removeEventListener("paste", onShellPaste);
+      }
+      if (resizeFrame != null) {
+        cancelAnimationFrame(resizeFrame);
+      }
+      if (delayedResizeOne != null) {
+        window.clearTimeout(delayedResizeOne);
+      }
+      if (delayedResizeTwo != null) {
+        window.clearTimeout(delayedResizeTwo);
       }
       window.removeEventListener("resize", onResize);
       ws.removeEventListener("open", onOpen);
@@ -456,12 +726,27 @@ function ChatTerminal({ chatId, running }) {
       ws.removeEventListener("error", onError);
       inputDisposable.dispose();
       keyDisposable.dispose();
+      terminalResizeDisposable.dispose();
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         ws.close();
       }
       terminal.dispose();
     };
   }, [chatId, running]);
+
+  useEffect(() => {
+    if (!running) {
+      return;
+    }
+    triggerResizeRef.current(true);
+    const delays = [60, 140, 320, 700];
+    const timers = delays.map((delayMs) => window.setTimeout(() => {
+      triggerResizeRef.current(true);
+    }, delayMs));
+    return () => {
+      timers.forEach((timerId) => window.clearTimeout(timerId));
+    };
+  }, [isFullscreen, running]);
 
   return (
     <div className="terminal-shell chat-terminal-shell" ref={shellRef}>
@@ -1897,6 +2182,55 @@ function HubApp() {
     const titleStatus = String(chat.title_status || "idle").toLowerCase();
     const volumeCount = (chat.ro_mounts || []).length + (chat.rw_mounts || []).length;
     const envCount = (chat.env_vars || []).length;
+    const artifacts = Array.isArray(chat.artifacts) ? chat.artifacts : [];
+    const artifactById = new Map(
+      artifacts
+        .map((artifact) => [String(artifact?.id || ""), artifact])
+        .filter(([artifactId]) => artifactId)
+    );
+    const hasCurrentArtifactIds = Array.isArray(chat.artifact_current_ids);
+    const currentArtifactIds = hasCurrentArtifactIds
+      ? chat.artifact_current_ids
+        .map((artifactId) => String(artifactId || "").trim())
+        .filter((artifactId, index, source) =>
+          artifactId && source.indexOf(artifactId) === index && artifactById.has(artifactId)
+        )
+      : artifacts
+        .map((artifact) => String(artifact?.id || "").trim())
+        .filter(Boolean);
+    const currentArtifacts = currentArtifactIds
+      .map((artifactId) => artifactById.get(artifactId))
+      .filter(Boolean);
+    const artifactPromptHistory = Array.isArray(chat.artifact_prompt_history)
+      ? chat.artifact_prompt_history
+        .map((entry) => {
+          const prompt = String(entry?.prompt || "").trim();
+          if (!prompt) {
+            return null;
+          }
+          const entryArtifacts = (Array.isArray(entry?.artifacts) ? entry.artifacts : [])
+            .map((artifact) => {
+              const artifactId = String(artifact?.id || "").trim();
+              if (artifactId && artifactById.has(artifactId)) {
+                return artifactById.get(artifactId);
+              }
+              if (!artifact || typeof artifact !== "object") {
+                return null;
+              }
+              return artifact;
+            })
+            .filter(Boolean);
+          if (entryArtifacts.length === 0) {
+            return null;
+          }
+          return {
+            prompt,
+            archivedAt: String(entry?.archived_at || ""),
+            artifacts: entryArtifacts
+          };
+        })
+        .filter(Boolean)
+      : [];
     const rowOpen = fullscreenChatId === chat.id ? true : (openChats[chat.id] ?? true);
     const detailsOpen = openChatDetails[chat.id] ?? false;
     const isFullscreenChat = fullscreenChatId === chat.id;
@@ -1906,6 +2240,51 @@ function HubApp() {
     const rowSubtitle = isStarting
       ? "Starting chat and preparing terminal..."
       : chat.display_subtitle || "No recent assistant summary yet.";
+
+    const renderArtifactBubble = (artifact, keyPrefix = "artifact") => {
+      const artifactId = String(artifact?.id || "");
+      const artifactName = String(artifact?.name || artifact?.relative_path || "artifact");
+      const iconDescriptor = resolveArtifactIcon(artifact);
+      const artifactMeta = [
+        formatBytes(artifact?.size_bytes),
+        formatTimestamp(artifact?.created_at)
+      ]
+        .filter(Boolean)
+        .join(" • ");
+      const hoverMeta = artifactMeta || (artifact?.download_url ? "Ready to download" : "Unavailable");
+      const bubbleContent = (
+        <>
+          <span className="chat-artifact-icon" aria-hidden="true">
+            {renderArtifactIcon(iconDescriptor)}
+          </span>
+          <span className="chat-artifact-name" title={artifactName}>{artifactName}</span>
+          <span className="chat-artifact-meta-hover">{hoverMeta}</span>
+        </>
+      );
+      if (artifact?.download_url) {
+        return (
+          <a
+            key={`${keyPrefix}-${artifactId || artifactName}`}
+            className="chat-artifact-bubble"
+            href={String(artifact.download_url)}
+            download={artifactName}
+            aria-label={`Download ${artifactName}`}
+            title={artifactName}
+          >
+            {bubbleContent}
+          </a>
+        );
+      }
+      return (
+        <span
+          key={`${keyPrefix}-${artifactId || artifactName}`}
+          className="chat-artifact-bubble chat-artifact-bubble-unavailable"
+          title={artifactName}
+        >
+          {bubbleContent}
+        </span>
+      );
+    };
 
     return (
       <article className={containerClassName} key={chat.id}>
@@ -2011,6 +2390,30 @@ function HubApp() {
                   <div className="meta">Setup snapshot image: {chat.setup_snapshot_image}</div>
                 ) : null}
                 <div className="meta">Volumes: {volumeCount} | Env vars: {envCount}</div>
+                {artifactPromptHistory.length > 0 ? (
+                  <details className="details-block chat-artifact-history-block">
+                    <summary className="details-summary">Historical files ({artifactPromptHistory.length})</summary>
+                    <div className="chat-artifact-history-list">
+                      {artifactPromptHistory.map((historyEntry, index) => (
+                        <section
+                          className="chat-artifact-history-entry"
+                          key={`history-${chat.id}-${index}-${historyEntry.prompt}`}
+                        >
+                          <div className="meta chat-artifact-history-label">
+                            Prompt:{" "}
+                            <span className="chat-artifact-history-prompt">{historyEntry.prompt}</span>
+                            {historyEntry.archivedAt ? ` (${formatTimestamp(historyEntry.archivedAt)})` : ""}
+                          </div>
+                          <div className="chat-artifact-list">
+                            {historyEntry.artifacts.map((artifact, artifactIndex) =>
+                              renderArtifactBubble(artifact, `history-${index}-${artifactIndex}`)
+                            )}
+                          </div>
+                        </section>
+                      ))}
+                    </div>
+                  </details>
+                ) : null}
               </section>
             ) : null}
 
@@ -2021,7 +2424,12 @@ function HubApp() {
                 </div>
               </div>
             ) : isRunning ? (
-              <ChatTerminal chatId={resolvedChatId} running={isRunning} />
+              <ChatTerminal
+                key={`${resolvedChatId}-${isFullscreenChat ? "fullscreen" : "inline"}`}
+                chatId={resolvedChatId}
+                running={isRunning}
+                isFullscreen={isFullscreenChat}
+              />
             ) : chatHasServer ? (
               <div className="stack compact">
                 <div className="meta chat-terminal-stopped">Chat is stopped. Start it to reconnect the terminal.</div>
@@ -2035,6 +2443,15 @@ function HubApp() {
                   </button>
                 </div>
               </div>
+            ) : null}
+
+            {currentArtifacts.length > 0 ? (
+              <section className="chat-artifacts" aria-label={`Generated files for ${titleText}`}>
+                <div className="meta">Attached files</div>
+                <div className="chat-artifact-list">
+                  {currentArtifacts.map((artifact, index) => renderArtifactBubble(artifact, `current-${index}`))}
+                </div>
+              </section>
             ) : null}
           </div>
         ) : null}

@@ -20,6 +20,9 @@
 - Persist user/app state on the backend so sessions are consistent across devices.
 - Reconcile optimistic client state with server state without causing abrupt UI jumps.
 - Ensure shutdown/cleanup paths are deterministic and do not require repeated user intervention.
+- Do not bundle multiple files into zip/tar archives by default; upload original files individually.
+- Only upload archive files when the user explicitly asks for an archive upload.
+- If an upload batch partially fails, retry only failed files and never re-upload files that already succeeded.
 
 ## Implementation quality
 

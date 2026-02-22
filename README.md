@@ -141,3 +141,4 @@ Capabilities:
 - Close chats (workspace is reset to the remote default branch and reused).
 - Delete chats explicitly from the UI (this removes that workspace).
 - Each chat shows both the host workspace path and the container working folder.
+- Agents can publish generated files into a chat artifact list with `hub_artifact publish <path> [<path> ...]`; this accepts individual files, or a directory of files (no subdirectories), and published artifacts appear in the chat card with download links.

@@ -17,11 +17,16 @@ project_doc_auto_load_extra_filenames = [
 ]
 project_doc_max_bytes = 131072
 
-instructions = """
+developer_instructions = """
 You are working on an advanced robotics codebase.
 Optimize for correctness, reliability, and deterministic behavior.
 Prefer robust fixes with explicit tests and validation commands.
 When behavior could affect safety, call out assumptions and failure modes.
+When you generate user-deliverable files, publish them with `hub_artifact publish <path> [<path> ...]`.
+Use a repo-relative path when possible.
+If the user asks for a file, do not stop after creating it: publish it in the same turn and report the artifact.
+Do not bundle multiple files into zip/tar archives by default; publish original files individually.
+Only publish archive files when the user explicitly requests an archive.
 """
 
 [profiles.fast]

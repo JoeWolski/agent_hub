@@ -4,11 +4,14 @@ import asyncio
 import codecs
 import fcntl
 import hashlib
+import hmac
 import json
 import logging
+import mimetypes
 import os
 import queue
 import re
+import secrets
 import signal
 import struct
 import subprocess
@@ -47,7 +50,8 @@ DEFAULT_PTY_COLS = 160
 DEFAULT_PTY_ROWS = 48
 CHAT_PREVIEW_LOG_MAX_BYTES = 150_000
 CHAT_TITLE_MAX_CHARS = 72
-CHAT_SUBTITLE_MAX_CHARS = 120
+CHAT_SUBTITLE_MAX_CHARS = 240
+CHAT_SUBTITLE_MARKERS = (".", "•", "◦", "∙", "·", "●", "○", "▪", "▫", "‣", "⁃")
 CHAT_TITLE_PROMPT_MAX_ITEMS = 16
 CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS = 64
 CHAT_TITLE_API_TIMEOUT_SECONDS = 8.0
@@ -60,6 +64,11 @@ CHAT_TITLE_AUTH_MODE_NONE = "none"
 CHAT_TITLE_NO_CREDENTIALS_ERROR = (
     "No OpenAI credentials configured for chat title generation. Connect an OpenAI account or API key in Settings."
 )
+CHAT_ARTIFACTS_MAX_ITEMS = 200
+CHAT_ARTIFACT_PROMPT_HISTORY_MAX_ITEMS = 64
+CHAT_ARTIFACT_PROMPT_LABEL_MAX_CHARS = 2000
+CHAT_ARTIFACT_NAME_MAX_CHARS = 180
+CHAT_ARTIFACT_PATH_MAX_CHARS = 1024
 ANSI_ESCAPE_RE = re.compile(
     r"\x1B(?:"
     r"[@-Z\\-_]"
@@ -68,6 +77,10 @@ ANSI_ESCAPE_RE = re.compile(
     r"|P[^\x1B\x07]*(?:\x07|\x1B\\)"
     r")"
 )
+TERMINAL_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+LEADING_INVISIBLE_RE = re.compile(r"^[\u200b\u200c\u200d\u2060\ufeff\u200e\u200f]+")
+ANSI_CURSOR_POSITION_RE = re.compile(r"\x1b\[[0-9;?]*[Hf]")
+ANSI_ERASE_IN_LINE_RE = re.compile(r"\x1b\[[0-9;?]*K")
 OSC_COLOR_RESPONSE_FRAGMENT_RE = re.compile(
     r"(?:^|\s)\]?\d{1,3};(?:rgb|rgba):[0-9a-f]{2,4}/[0-9a-f]{2,4}/[0-9a-f]{2,4}",
     re.IGNORECASE,
@@ -690,18 +703,119 @@ def _truncate_title(text: str, max_chars: int) -> str:
     return cleaned[: max_chars - 1].rstrip() + "…"
 
 
-def _chat_preview_candidates_from_log(log_path: Path) -> tuple[list[str], list[str]]:
-    if not log_path.exists():
-        return [], []
-    with log_path.open("rb") as log_file:
-        log_file.seek(0, os.SEEK_END)
-        size = log_file.tell()
-        start = size - CHAT_PREVIEW_LOG_MAX_BYTES if size > CHAT_PREVIEW_LOG_MAX_BYTES else 0
-        log_file.seek(start)
-        raw = log_file.read().decode("utf-8", errors="ignore")
+def _new_artifact_publish_token() -> str:
+    return secrets.token_hex(24)
 
-    text = ANSI_ESCAPE_RE.sub("", raw).replace("\r", "\n")
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+def _hash_artifact_publish_token(token: str) -> str:
+    value = str(token or "").strip()
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _normalize_artifact_name(value: Any, fallback: str = "") -> str:
+    candidate = _compact_whitespace(str(value or "")).strip()
+    if not candidate:
+        candidate = _compact_whitespace(str(fallback or "")).strip()
+    if not candidate:
+        candidate = "artifact"
+    if len(candidate) > CHAT_ARTIFACT_NAME_MAX_CHARS:
+        candidate = candidate[: CHAT_ARTIFACT_NAME_MAX_CHARS - 1].rstrip() + "…"
+    return candidate
+
+
+def _coerce_artifact_relative_path(value: Any) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    if not text or len(text) > CHAT_ARTIFACT_PATH_MAX_CHARS:
+        return ""
+
+    parts: list[str] = []
+    for raw_part in text.split("/"):
+        part = raw_part.strip()
+        if not part or part == ".":
+            continue
+        if part == "..":
+            return ""
+        parts.append(part)
+    if not parts:
+        return ""
+    return "/".join(parts)
+
+
+def _normalize_chat_artifacts(raw_artifacts: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_artifacts, list):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for raw_artifact in raw_artifacts:
+        if not isinstance(raw_artifact, dict):
+            continue
+        artifact_id = str(raw_artifact.get("id") or "").strip()
+        relative_path = _coerce_artifact_relative_path(raw_artifact.get("relative_path"))
+        if not artifact_id or not relative_path:
+            continue
+        size_raw = raw_artifact.get("size_bytes")
+        try:
+            size_bytes = int(size_raw)
+        except (TypeError, ValueError):
+            size_bytes = 0
+        if size_bytes < 0:
+            size_bytes = 0
+        entries.append(
+            {
+                "id": artifact_id,
+                "name": _normalize_artifact_name(raw_artifact.get("name"), fallback=Path(relative_path).name),
+                "relative_path": relative_path,
+                "size_bytes": size_bytes,
+                "created_at": str(raw_artifact.get("created_at") or ""),
+            }
+        )
+    return entries[-CHAT_ARTIFACTS_MAX_ITEMS:]
+
+
+def _normalize_chat_current_artifact_ids(raw_ids: Any, artifacts: list[dict[str, Any]]) -> list[str]:
+    if not isinstance(raw_ids, list):
+        return []
+    known_ids = {str(artifact.get("id") or "") for artifact in artifacts}
+    normalized: list[str] = []
+    for raw_id in raw_ids:
+        artifact_id = str(raw_id or "").strip()
+        if not artifact_id or artifact_id in normalized:
+            continue
+        if artifact_id not in known_ids:
+            continue
+        normalized.append(artifact_id)
+    return normalized[-CHAT_ARTIFACTS_MAX_ITEMS:]
+
+
+def _normalize_chat_artifact_prompt_history(raw_history: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_history, list):
+        return []
+    entries: list[dict[str, Any]] = []
+    for raw_entry in raw_history:
+        if not isinstance(raw_entry, dict):
+            continue
+        prompt = _sanitize_submitted_prompt(raw_entry.get("prompt"))
+        if not prompt:
+            continue
+        if len(prompt) > CHAT_ARTIFACT_PROMPT_LABEL_MAX_CHARS:
+            prompt = prompt[:CHAT_ARTIFACT_PROMPT_LABEL_MAX_CHARS].rstrip()
+        artifacts = _normalize_chat_artifacts(raw_entry.get("artifacts"))
+        if not artifacts:
+            continue
+        entries.append(
+            {
+                "prompt": prompt,
+                "archived_at": str(raw_entry.get("archived_at") or ""),
+                "artifacts": artifacts,
+            }
+        )
+    return entries[-CHAT_ARTIFACT_PROMPT_HISTORY_MAX_ITEMS:]
+
+
+def _chat_preview_candidates_from_log(log_path: Path) -> tuple[list[str], list[str]]:
+    lines = _chat_preview_lines_from_log(log_path)
     if not lines:
         return [], []
 
@@ -722,6 +836,39 @@ def _chat_preview_candidates_from_log(log_path: Path) -> tuple[list[str], list[s
             continue
         assistant_candidates.append(line_clean)
     return user_candidates, assistant_candidates
+
+
+def _read_chat_log_preview(log_path: Path) -> str:
+    if not log_path.exists():
+        return ""
+    with log_path.open("rb") as log_file:
+        log_file.seek(0, os.SEEK_END)
+        size = log_file.tell()
+        start = size - CHAT_PREVIEW_LOG_MAX_BYTES if size > CHAT_PREVIEW_LOG_MAX_BYTES else 0
+        log_file.seek(start)
+        return log_file.read().decode("utf-8", errors="ignore")
+
+
+def _sanitize_terminal_log_text(raw_text: str) -> str:
+    text = str(raw_text or "")
+    # Cursor jumps / erase-in-line updates are common in animated terminal output.
+    # Treat them as logical line boundaries so adjacent frames do not collapse.
+    text = ANSI_CURSOR_POSITION_RE.sub("\n", text)
+    text = ANSI_ERASE_IN_LINE_RE.sub("\n", text)
+    text, _ = _strip_ansi_stream("", text)
+    # Preserve carriage-return boundaries from animated terminal updates.
+    text = text.replace("\r", "\n")
+    text = TERMINAL_CONTROL_CHAR_RE.sub("", text)
+    text = OSC_COLOR_RESPONSE_FRAGMENT_RE.sub(" ", text)
+    return text
+
+
+def _chat_preview_lines_from_log(log_path: Path) -> list[str]:
+    raw = _read_chat_log_preview(log_path)
+    if not raw:
+        return []
+    text = _sanitize_terminal_log_text(raw)
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 def _openai_generate_chat_title(
@@ -986,10 +1133,102 @@ def _parse_local_callback(url_text: str) -> tuple[str, int, str]:
 
 
 def _chat_subtitle_from_log(log_path: Path) -> str:
-    _, assistant_candidates = _chat_preview_candidates_from_log(log_path)
-    if not assistant_candidates:
+    lines = _chat_preview_lines_from_log(log_path)
+    if not lines:
         return ""
-    return _short_summary(assistant_candidates[-1], max_words=14, max_chars=CHAT_SUBTITLE_MAX_CHARS)
+
+    def normalize_candidate_line(raw_line: str) -> str:
+        candidate = str(raw_line or "").strip()
+        if not candidate:
+            return ""
+        candidate = LEADING_INVISIBLE_RE.sub("", candidate).strip()
+        while candidate and candidate[0] in "│┃┆┊╎╏":
+            candidate = candidate[1:].lstrip()
+        return candidate
+
+    def strip_known_marker_prefix(candidate: str) -> str:
+        for marker in CHAT_SUBTITLE_MARKERS:
+            if candidate.startswith(marker):
+                return _compact_whitespace(candidate[len(marker) :]).strip()
+        return _compact_whitespace(candidate).strip()
+
+    def strip_status_prefix(candidate: str) -> str:
+        value = _compact_whitespace(candidate).strip()
+        if not value:
+            return ""
+        index = 0
+        while index < len(value):
+            ch = value[index]
+            if ch.isspace() or ch in "./|\\-":
+                index += 1
+                continue
+            codepoint = ord(ch)
+            if ch in CHAT_SUBTITLE_MARKERS:
+                index += 1
+                continue
+            if (
+                codepoint == 0x2219
+                or 0x2022 <= codepoint <= 0x2043
+                or 0x25A0 <= codepoint <= 0x25FF
+            ):
+                index += 1
+                continue
+            if 0x2800 <= codepoint <= 0x28FF:  # braille spinner glyphs
+                index += 1
+                continue
+            break
+        return _compact_whitespace(value[index:]).strip()
+
+    def subtitle_value(line: str) -> str:
+        candidate = normalize_candidate_line(line)
+        if not candidate:
+            return ""
+        if candidate.startswith((">", "›")):
+            return ""
+        if candidate.lower().startswith("you:"):
+            return ""
+        compact = _compact_whitespace(candidate).strip()
+        if not compact:
+            return ""
+        lowered = compact.lower()
+        if "waiting for background terminal" in lowered:
+            return strip_status_prefix(compact) or strip_known_marker_prefix(compact)
+        if "esc to interrupt" in lowered and "working (" in lowered:
+            return strip_status_prefix(compact) or compact
+        for marker in CHAT_SUBTITLE_MARKERS:
+            if compact.startswith(marker):
+                return _compact_whitespace(compact[len(marker) :]).strip()
+        candidate = compact
+        first = candidate[0]
+        remainder = _compact_whitespace(candidate[1:]).strip()
+        if not remainder:
+            return ""
+        if not any(ch.isalpha() for ch in remainder):
+            return ""
+        marker_codepoint = ord(first)
+        if (
+            marker_codepoint == 0x2219  # BULLET OPERATOR
+            or 0x2022 <= marker_codepoint <= 0x2043  # bullets and related punctuation
+            or 0x25A0 <= marker_codepoint <= 0x25FF  # geometric shapes
+            or 0x2800 <= marker_codepoint <= 0x28FF  # braille spinner glyphs
+        ):
+            return remainder
+        return ""
+
+    prompt_index = -1
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].startswith((">", "›")):
+            prompt_index = index
+            break
+
+    search_start = prompt_index - 1 if prompt_index >= 0 else len(lines) - 1
+    for index in range(search_start, -1, -1):
+        subtitle = subtitle_value(lines[index])
+        if subtitle:
+            if len(subtitle) > CHAT_SUBTITLE_MAX_CHARS:
+                return subtitle[: CHAT_SUBTITLE_MAX_CHARS - 1].rstrip() + "…"
+            return subtitle
+    return ""
 
 
 def _default_user() -> str:
@@ -1244,8 +1483,33 @@ def _stop_processes(pids: list[int], timeout_seconds: float = 4.0) -> int:
     return len(active)
 
 
+def _signal_process_group_winch(pid: int) -> None:
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = 0
+
+    if pgid:
+        try:
+            os.killpg(pgid, signal.SIGWINCH)
+            return
+        except OSError:
+            pass
+
+    try:
+        os.kill(pid, signal.SIGWINCH)
+    except OSError:
+        pass
+
+
 class HubState:
-    def __init__(self, data_dir: Path, config_file: Path):
+    def __init__(
+        self,
+        data_dir: Path,
+        config_file: Path,
+        hub_host: str = DEFAULT_HOST,
+        hub_port: int = DEFAULT_PORT,
+    ):
         self.local_user = _default_user()
         self.local_group = _default_group_name()
         self.local_uid = os.getuid()
@@ -1259,6 +1523,8 @@ class HubState:
 
         self.data_dir = data_dir
         self.config_file = config_file
+        self.hub_host = str(hub_host or DEFAULT_HOST)
+        self.hub_port = int(hub_port or DEFAULT_PORT)
         self.state_file = self.data_dir / STATE_FILE_NAME
         self.project_dir = self.data_dir / "projects"
         self.chat_dir = self.data_dir / "chats"
@@ -1330,6 +1596,16 @@ class HubState:
             chat["title_source"] = str(chat.get("title_source") or "openai")
             chat["title_status"] = str(chat.get("title_status") or "idle")
             chat["title_error"] = str(chat.get("title_error") or "")
+            artifacts = _normalize_chat_artifacts(chat.get("artifacts"))
+            chat["artifacts"] = artifacts
+            current_ids_raw = chat.get("artifact_current_ids")
+            if isinstance(current_ids_raw, list):
+                chat["artifact_current_ids"] = _normalize_chat_current_artifact_ids(current_ids_raw, artifacts)
+            else:
+                chat["artifact_current_ids"] = [str(artifact.get("id") or "") for artifact in artifacts if str(artifact.get("id") or "")]
+            chat["artifact_prompt_history"] = _normalize_chat_artifact_prompt_history(chat.get("artifact_prompt_history"))
+            chat["artifact_publish_token_hash"] = str(chat.get("artifact_publish_token_hash") or "")
+            chat["artifact_publish_token_issued_at"] = str(chat.get("artifact_publish_token_issued_at") or "")
         return state
 
     @staticmethod
@@ -1638,7 +1914,7 @@ class HubState:
             "--workdir",
             container_home,
             "--volume",
-            f"{self.host_agent_home}:{container_home}",
+            f"{self.host_codex_dir}:{container_home}/.codex",
             "--volume",
             f"{self.config_file}:{container_home}/.codex/config.toml:ro",
             "--env",
@@ -1923,6 +2199,166 @@ class HubState:
     def project_build_log(self, project_id: str) -> Path:
         return self.log_dir / f"project-{project_id}.log"
 
+    def _chat_artifact_publish_url(self, chat_id: str) -> str:
+        return f"http://host.docker.internal:{self.hub_port}/api/chats/{chat_id}/artifacts/publish"
+
+    @staticmethod
+    def _chat_artifact_download_url(chat_id: str, artifact_id: str) -> str:
+        return f"/api/chats/{chat_id}/artifacts/{artifact_id}/download"
+
+    def _chat_artifact_public_payload(self, chat_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": str(artifact.get("id") or ""),
+            "name": _normalize_artifact_name(artifact.get("name"), fallback=Path(str(artifact.get("relative_path") or "")).name),
+            "relative_path": str(artifact.get("relative_path") or ""),
+            "size_bytes": int(artifact.get("size_bytes") or 0),
+            "created_at": str(artifact.get("created_at") or ""),
+            "download_url": self._chat_artifact_download_url(chat_id, str(artifact.get("id") or "")),
+        }
+
+    def _chat_artifact_history_public_payload(self, chat_id: str, history_entry: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "prompt": _sanitize_submitted_prompt(history_entry.get("prompt"))[:CHAT_ARTIFACT_PROMPT_LABEL_MAX_CHARS],
+            "archived_at": str(history_entry.get("archived_at") or ""),
+            "artifacts": [
+                self._chat_artifact_public_payload(chat_id, artifact)
+                for artifact in _normalize_chat_artifacts(history_entry.get("artifacts"))
+            ],
+        }
+
+    def _resolve_chat_artifact_file(self, chat_id: str, submitted_path: Any) -> tuple[Path, str]:
+        raw_path = str(submitted_path or "").strip()
+        if not raw_path:
+            raise HTTPException(status_code=400, detail="path is required.")
+        if len(raw_path) > CHAT_ARTIFACT_PATH_MAX_CHARS * 2:
+            raise HTTPException(status_code=400, detail="path is too long.")
+
+        workspace = self.chat_workdir(chat_id).resolve()
+        candidate = Path(raw_path).expanduser()
+        resolved = candidate.resolve() if candidate.is_absolute() else (workspace / candidate).resolve()
+        try:
+            relative = resolved.relative_to(workspace)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Artifact path must be inside the chat workspace.") from exc
+        if not resolved.exists():
+            raise HTTPException(status_code=404, detail=f"Artifact file not found: {raw_path}")
+        if not resolved.is_file():
+            raise HTTPException(status_code=400, detail=f"Artifact path is not a file: {raw_path}")
+        relative_path = _coerce_artifact_relative_path(relative.as_posix())
+        if not relative_path:
+            raise HTTPException(status_code=400, detail="Artifact path is invalid.")
+        return resolved, relative_path
+
+    @staticmethod
+    def _require_artifact_publish_token(chat: dict[str, Any], token: Any) -> None:
+        expected_hash = str(chat.get("artifact_publish_token_hash") or "")
+        if not expected_hash:
+            raise HTTPException(status_code=409, detail="Artifact publishing is unavailable until the chat is started.")
+
+        submitted_token = str(token or "").strip()
+        if not submitted_token:
+            raise HTTPException(status_code=401, detail="Missing artifact publish token.")
+        submitted_hash = _hash_artifact_publish_token(submitted_token)
+        if not submitted_hash or not hmac.compare_digest(submitted_hash, expected_hash):
+            raise HTTPException(status_code=403, detail="Invalid artifact publish token.")
+
+    def list_chat_artifacts(self, chat_id: str) -> list[dict[str, Any]]:
+        chat = self.chat(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        artifacts = _normalize_chat_artifacts(chat.get("artifacts"))
+        return [self._chat_artifact_public_payload(chat_id, artifact) for artifact in reversed(artifacts)]
+
+    def publish_chat_artifact(
+        self,
+        chat_id: str,
+        token: Any,
+        submitted_path: Any,
+        name: Any = None,
+    ) -> dict[str, Any]:
+        state = self.load()
+        chat = state["chats"].get(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        self._require_artifact_publish_token(chat, token)
+
+        file_path, relative_path = self._resolve_chat_artifact_file(chat_id, submitted_path)
+        file_stat = file_path.stat()
+        now = _iso_now()
+        artifacts = _normalize_chat_artifacts(chat.get("artifacts"))
+        normalized_name = _normalize_artifact_name(name, fallback=file_path.name)
+
+        existing_index = -1
+        for index, artifact in enumerate(artifacts):
+            if str(artifact.get("relative_path") or "") == relative_path:
+                existing_index = index
+                break
+
+        if existing_index >= 0:
+            artifact_id = str(artifacts[existing_index].get("id") or "") or uuid.uuid4().hex
+            artifacts[existing_index] = {
+                "id": artifact_id,
+                "name": normalized_name,
+                "relative_path": relative_path,
+                "size_bytes": int(file_stat.st_size),
+                "created_at": now,
+            }
+            stored_artifact = artifacts[existing_index]
+        else:
+            stored_artifact = {
+                "id": uuid.uuid4().hex,
+                "name": normalized_name,
+                "relative_path": relative_path,
+                "size_bytes": int(file_stat.st_size),
+                "created_at": now,
+            }
+            artifacts.append(stored_artifact)
+            if len(artifacts) > CHAT_ARTIFACTS_MAX_ITEMS:
+                artifacts = artifacts[-CHAT_ARTIFACTS_MAX_ITEMS:]
+
+        current_ids = _normalize_chat_current_artifact_ids(chat.get("artifact_current_ids"), artifacts)
+        stored_artifact_id = str(stored_artifact.get("id") or "")
+        if stored_artifact_id and stored_artifact_id not in current_ids:
+            current_ids.append(stored_artifact_id)
+        if len(current_ids) > CHAT_ARTIFACTS_MAX_ITEMS:
+            current_ids = current_ids[-CHAT_ARTIFACTS_MAX_ITEMS:]
+
+        chat["artifacts"] = artifacts
+        chat["artifact_current_ids"] = current_ids
+        chat["artifact_prompt_history"] = _normalize_chat_artifact_prompt_history(chat.get("artifact_prompt_history"))
+        chat["updated_at"] = now
+        state["chats"][chat_id] = chat
+        self.save(state, reason="chat_artifact_published")
+        return self._chat_artifact_public_payload(chat_id, stored_artifact)
+
+    def resolve_chat_artifact_download(self, chat_id: str, artifact_id: str) -> tuple[Path, str, str]:
+        state = self.load()
+        chat = state["chats"].get(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+
+        normalized_artifact_id = str(artifact_id or "").strip()
+        if not normalized_artifact_id:
+            raise HTTPException(status_code=400, detail="artifact_id is required.")
+
+        artifacts = _normalize_chat_artifacts(chat.get("artifacts"))
+        match = next((entry for entry in artifacts if str(entry.get("id") or "") == normalized_artifact_id), None)
+        if match is None:
+            raise HTTPException(status_code=404, detail="Artifact not found.")
+
+        workspace = self.chat_workdir(chat_id).resolve()
+        resolved = (workspace / str(match.get("relative_path") or "")).resolve()
+        try:
+            resolved.relative_to(workspace)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Artifact path is invalid.") from exc
+        if not resolved.exists() or not resolved.is_file():
+            raise HTTPException(status_code=404, detail="Artifact file is no longer available.")
+
+        filename = _normalize_artifact_name(match.get("name"), fallback=resolved.name)
+        media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        return resolved, filename, media_type
+
     def project(self, project_id: str) -> dict[str, Any] | None:
         return self.load()["projects"].get(project_id)
 
@@ -2173,6 +2609,11 @@ class HubState:
             "title_source": "openai",
             "title_status": "idle",
             "title_error": "",
+            "artifacts": [],
+            "artifact_current_ids": [],
+            "artifact_prompt_history": [],
+            "artifact_publish_token_hash": "",
+            "artifact_publish_token_issued_at": "",
             "created_at": now,
             "updated_at": now,
         }
@@ -2473,17 +2914,54 @@ class HubState:
         history: list[str] = []
         if isinstance(history_raw, list):
             history = [str(item) for item in history_raw if str(item).strip()]
+
+        artifacts = _normalize_chat_artifacts(chat.get("artifacts"))
+        current_ids_raw = chat.get("artifact_current_ids")
+        if isinstance(current_ids_raw, list):
+            current_ids = _normalize_chat_current_artifact_ids(current_ids_raw, artifacts)
+        else:
+            current_ids = [str(artifact.get("id") or "") for artifact in artifacts if str(artifact.get("id") or "")]
+        artifact_map = {str(artifact.get("id") or ""): artifact for artifact in artifacts}
+        current_artifacts = [dict(artifact_map[artifact_id]) for artifact_id in current_ids if artifact_id in artifact_map]
+        if current_artifacts:
+            source_prompt = _sanitize_submitted_prompt(history[-1]) if history else ""
+            if not source_prompt:
+                source_prompt = "Earlier prompt"
+            if len(source_prompt) > CHAT_ARTIFACT_PROMPT_LABEL_MAX_CHARS:
+                source_prompt = source_prompt[:CHAT_ARTIFACT_PROMPT_LABEL_MAX_CHARS].rstrip()
+            artifact_prompt_history = _normalize_chat_artifact_prompt_history(chat.get("artifact_prompt_history"))
+            archive_time = _iso_now()
+            artifact_prompt_history.append(
+                {
+                    "prompt": source_prompt,
+                    "archived_at": archive_time,
+                    "artifacts": current_artifacts,
+                }
+            )
+            if len(artifact_prompt_history) > CHAT_ARTIFACT_PROMPT_HISTORY_MAX_ITEMS:
+                artifact_prompt_history = artifact_prompt_history[-CHAT_ARTIFACT_PROMPT_HISTORY_MAX_ITEMS:]
+            chat["artifact_prompt_history"] = artifact_prompt_history
+        else:
+            chat["artifact_prompt_history"] = _normalize_chat_artifact_prompt_history(chat.get("artifact_prompt_history"))
+        chat["artifact_current_ids"] = []
+
         if history and _compact_whitespace(str(history[-1])).strip() == submitted:
-            LOGGER.debug("Title prompt ignored for chat=%s: duplicate submission.", chat_id)
+            chat["updated_at"] = _iso_now()
+            state["chats"][chat_id] = chat
+            self.save(state, reason="title_prompt_recorded")
+            LOGGER.debug("Title prompt duplicate for chat=%s; preserved title state and archived current artifacts.", chat_id)
             return False
+
         history.append(submitted)
         if len(history) > CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS:
             history = history[-CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS:]
 
+        now = _iso_now()
         chat["title_user_prompts"] = history
-        chat["title_user_prompts_updated_at"] = _iso_now()
+        chat["title_user_prompts_updated_at"] = now
         chat["title_status"] = "pending"
         chat["title_error"] = ""
+        chat["updated_at"] = now
         state["chats"][chat_id] = chat
         self.save(state, reason="title_prompt_recorded")
         LOGGER.debug("Title prompt recorded for chat=%s prompts=%d", chat_id, len(history))
@@ -2635,6 +3113,7 @@ class HubState:
             self._set_terminal_size(runtime.master_fd, cols, rows)
         except (OSError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Invalid terminal resize request.") from exc
+        _signal_process_group_winch(int(runtime.process.pid))
 
     def clean_start(self) -> dict[str, int]:
         self.cancel_openai_account_login()
@@ -2921,6 +3400,46 @@ class HubState:
             chat_copy["rw_mounts"] = list(chat_copy.get("rw_mounts") or [])
             chat_copy["env_vars"] = list(chat_copy.get("env_vars") or [])
             chat_copy["setup_snapshot_image"] = str(chat_copy.get("setup_snapshot_image") or "")
+            cleaned_artifacts = _normalize_chat_artifacts(chat_copy.get("artifacts"))
+            if chat_id in state["chats"] and cleaned_artifacts != _normalize_chat_artifacts(state["chats"][chat_id].get("artifacts")):
+                state["chats"][chat_id]["artifacts"] = cleaned_artifacts
+                should_save = True
+            current_ids_raw = chat_copy.get("artifact_current_ids")
+            if isinstance(current_ids_raw, list):
+                cleaned_current_artifact_ids = _normalize_chat_current_artifact_ids(current_ids_raw, cleaned_artifacts)
+            else:
+                cleaned_current_artifact_ids = [
+                    str(artifact.get("id") or "")
+                    for artifact in cleaned_artifacts
+                    if str(artifact.get("id") or "")
+                ]
+            if chat_id in state["chats"]:
+                state_current_ids_raw = state["chats"][chat_id].get("artifact_current_ids")
+                if isinstance(state_current_ids_raw, list):
+                    state_current_artifact_ids = _normalize_chat_current_artifact_ids(state_current_ids_raw, cleaned_artifacts)
+                else:
+                    state_current_artifact_ids = [
+                        str(artifact.get("id") or "")
+                        for artifact in cleaned_artifacts
+                        if str(artifact.get("id") or "")
+                    ]
+                if cleaned_current_artifact_ids != state_current_artifact_ids:
+                    state["chats"][chat_id]["artifact_current_ids"] = cleaned_current_artifact_ids
+                    should_save = True
+            cleaned_artifact_prompt_history = _normalize_chat_artifact_prompt_history(chat_copy.get("artifact_prompt_history"))
+            if chat_id in state["chats"] and cleaned_artifact_prompt_history != _normalize_chat_artifact_prompt_history(
+                state["chats"][chat_id].get("artifact_prompt_history")
+            ):
+                state["chats"][chat_id]["artifact_prompt_history"] = cleaned_artifact_prompt_history
+                should_save = True
+            chat_copy["artifacts"] = [self._chat_artifact_public_payload(chat_id, artifact) for artifact in reversed(cleaned_artifacts)]
+            chat_copy["artifact_current_ids"] = cleaned_current_artifact_ids
+            chat_copy["artifact_prompt_history"] = [
+                self._chat_artifact_history_public_payload(chat_id, entry)
+                for entry in reversed(cleaned_artifact_prompt_history)
+            ]
+            chat_copy.pop("artifact_publish_token_hash", None)
+            chat_copy.pop("artifact_publish_token_issued_at", None)
             running = _is_process_running(pid)
             if running:
                 chat_copy["status"] = "running"
@@ -3014,6 +3533,7 @@ class HubState:
         with self._chat_input_lock:
             self._chat_input_buffers[chat_id] = ""
             self._chat_input_ansi_carry[chat_id] = ""
+        artifact_publish_token = _new_artifact_publish_token()
 
         cmd = [
             "uv",
@@ -3034,6 +3554,8 @@ class HubState:
             cmd.extend(["--ro-mount", mount])
         for mount in chat.get("rw_mounts") or []:
             cmd.extend(["--rw-mount", mount])
+        cmd.extend(["--env-var", f"AGENT_HUB_ARTIFACTS_URL={self._chat_artifact_publish_url(chat_id)}"])
+        cmd.extend(["--env-var", f"AGENT_HUB_ARTIFACT_TOKEN={artifact_publish_token}"])
         for env_entry in chat.get("env_vars") or []:
             if _is_reserved_env_entry(str(env_entry)):
                 continue
@@ -3048,6 +3570,8 @@ class HubState:
         chat["pid"] = proc.pid
         chat["setup_snapshot_image"] = snapshot_tag or ""
         chat["container_workspace"] = f"/home/{_default_user()}/projects/{workspace.name}"
+        chat["artifact_publish_token_hash"] = _hash_artifact_publish_token(artifact_publish_token)
+        chat["artifact_publish_token_issued_at"] = _iso_now()
         chat["last_started_at"] = _iso_now()
         chat["updated_at"] = _iso_now()
         state["chats"][chat_id] = chat
@@ -3070,6 +3594,8 @@ class HubState:
 
         chat["status"] = "stopped"
         chat["pid"] = None
+        chat["artifact_publish_token_hash"] = ""
+        chat["artifact_publish_token_issued_at"] = ""
         chat["updated_at"] = _iso_now()
         state["chats"][chat_id] = chat
         self.save(state)
@@ -3797,7 +4323,7 @@ def main(
     if frontend_build:
         _ensure_frontend_built(data_dir)
 
-    state = HubState(data_dir=data_dir, config_file=config_file)
+    state = HubState(data_dir=data_dir, config_file=config_file, hub_host=host, hub_port=port)
     if clean_start:
         summary = state.clean_start()
         click.echo(
@@ -4120,6 +4646,38 @@ def main(
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Invalid JSON payload.")
         return state.record_chat_title_prompt(chat_id, payload.get("prompt"))
+
+    @app.get("/api/chats/{chat_id}/artifacts")
+    def api_list_chat_artifacts(chat_id: str) -> dict[str, Any]:
+        return {"artifacts": state.list_chat_artifacts(chat_id)}
+
+    @app.post("/api/chats/{chat_id}/artifacts/publish")
+    async def api_publish_chat_artifact(chat_id: str, request: Request) -> dict[str, Any]:
+        auth_header = str(request.headers.get("authorization") or "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = str(request.headers.get("x-agent-hub-artifact-token") or "").strip()
+
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        artifact = state.publish_chat_artifact(
+            chat_id=chat_id,
+            token=token,
+            submitted_path=payload.get("path"),
+            name=payload.get("name"),
+        )
+        return {"artifact": artifact}
+
+    @app.get("/api/chats/{chat_id}/artifacts/{artifact_id}/download")
+    def api_download_chat_artifact(chat_id: str, artifact_id: str) -> FileResponse:
+        artifact_path, filename, media_type = state.resolve_chat_artifact_download(chat_id, artifact_id)
+        return FileResponse(path=str(artifact_path), filename=filename, media_type=media_type)
 
     @app.get("/api/chats/{chat_id}/logs", response_class=PlainTextResponse)
     def api_chat_logs(chat_id: str) -> str:

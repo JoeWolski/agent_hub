@@ -24,10 +24,16 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && npm cache clean --force \
  && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /home/agent/projects
+RUN if ! id -u agent >/dev/null 2>&1; then \
+      groupadd --gid 1000 agent || true; \
+      useradd --uid 1000 --gid 1000 --home-dir /home/agent --create-home --shell /bin/bash agent; \
+    fi \
+ && mkdir -p /home/agent/projects /home/agent/.cache/uv /home/agent/.codex \
+ && chown -R agent:agent /home/agent
 
 COPY docker/docker-entrypoint.py /usr/local/bin/docker-entrypoint.py
-RUN chmod +x /usr/local/bin/docker-entrypoint.py
+COPY docker/hub_artifact /usr/local/bin/hub_artifact
+RUN chmod +x /usr/local/bin/docker-entrypoint.py /usr/local/bin/hub_artifact
 
 WORKDIR /home/agent/projects
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]
