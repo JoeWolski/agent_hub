@@ -1,0 +1,6 @@
+{
+  "appId": "com.agenthub.mobile",
+  "appName": "Agent Hub",
+  "webDir": "dist",
+  "bundledWebRuntime": false
+}
