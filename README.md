@@ -84,6 +84,7 @@ No manual artifact wiring is required for `agent_hub` chats:
 - `agent_hub` injects `AGENT_HUB_ARTIFACTS_URL` and `AGENT_HUB_ARTIFACT_TOKEN` into each chat runtime.
 - `agent_hub` passes its config file into each runtime as `~/.codex/config.toml` for Codex.
 - `agent_cli` derives shared prompt/context instructions from that same config and passes them to Claude via `--append-system-prompt`.
+- `agent_cli` also syncs the same shared prompt/context instructions into Gemini's global `~/.gemini/GEMINI.md` via a managed section.
 - The default `config/agent.config.toml` already includes developer instructions telling the agent to publish requested deliverable files with `hub_artifact publish <path> [<path> ...]`.
 - Those config-driven developer instructions are applied automatically in hub-launched chats, so you do not need to manually paste extra prompt boilerplate.
 
@@ -93,9 +94,10 @@ For day-to-day prompt/setup changes, these are the main files that assemble most
 These paths are resolved from each chat's checked-out target project workspace, not from the Agent Hub repository itself (unless Agent Hub is the target project).
 
 1. `config/agent.config.toml`
-   - Single source for shared chat prompt/context settings across Codex and Claude.
+   - Single source for shared chat prompt/context settings across Codex, Claude, and Gemini.
    - Passed into Codex chats as `~/.codex/config.toml`.
    - Used to derive Claude `--append-system-prompt` defaults (`developer_instructions` and project-doc bootstrap hints).
+   - Synced into Gemini's global `~/.gemini/GEMINI.md` as a managed section.
    - Main place for `developer_instructions` and project-doc auto-load settings.
 2. `AGENTS.md` (in the checked-out project repo)
    - Primary repo-specific instruction file loaded by the agent.
@@ -134,11 +136,12 @@ Behavior highlights:
 - Mounts Docker socket (`/var/run/docker.sock`) so runtime tools can access Docker when available.
 - Mounts config file to `~/.codex/config.toml` in the container (Codex runtime).
 - Derives shared prompt/context instructions from the same config and appends them to Claude sessions (`--append-system-prompt`).
+- Derives shared prompt/context instructions from the same config and syncs them to Gemini `~/.gemini/GEMINI.md` (managed section that preserves user-owned content).
 - Persists agent home state across runs with dedicated mounts for `~/.codex`, `~/.claude`, `~/.claude.json`, `~/.config/claude`, and `~/.gemini`.
 - Can build and reuse snapshot images for deterministic setup.
 - Supports project-specific base image source from Docker tag, Dockerfile, or Docker context.
 - Applies permissive in-container defaults unless you explicitly override them with trailing agent args:
-  Codex uses `--ask-for-approval never --sandbox danger-full-access`; Claude uses `--permission-mode bypassPermissions`.
+  Codex uses `--ask-for-approval never --sandbox danger-full-access`; Claude uses `--permission-mode bypassPermissions`; Gemini uses `--approval-mode yolo`.
 - In `agent_hub` repo-path mode, a Dockerfile file path uses repository-root build context, while a directory path uses that directory as context.
 
 Key argument groups:

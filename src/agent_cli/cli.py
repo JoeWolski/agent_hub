@@ -27,6 +27,10 @@ AGENT_PROVIDER_GEMINI = "gemini"
 DEFAULT_CODEX_APPROVAL_POLICY = "never"
 DEFAULT_CODEX_SANDBOX_MODE = "danger-full-access"
 DEFAULT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
+DEFAULT_GEMINI_APPROVAL_MODE = "yolo"
+MANAGED_GEMINI_CONTEXT_START = "<!-- agent_cli managed shared context: BEGIN -->"
+MANAGED_GEMINI_CONTEXT_END = "<!-- agent_cli managed shared context: END -->"
+GEMINI_CONTEXT_FILE_NAME = "GEMINI.md"
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
 GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
@@ -133,6 +137,73 @@ def _claude_default_runtime_flags(*, explicit_args: Iterable[str], shared_prompt
         flags.extend(["--append-system-prompt", shared_prompt_context])
 
     return flags
+
+
+def _gemini_default_runtime_flags(*, explicit_args: Iterable[str]) -> list[str]:
+    parsed_args = [str(arg) for arg in explicit_args]
+    flags: list[str] = []
+    if not _has_cli_option(parsed_args, long_option="--approval-mode") and not _has_cli_option(
+        parsed_args, long_option="--yolo"
+    ):
+        flags.extend(["--approval-mode", DEFAULT_GEMINI_APPROVAL_MODE])
+    return flags
+
+
+def _remove_managed_gemini_context_sections(value: str) -> str:
+    if not value:
+        return ""
+
+    managed_block = re.compile(
+        rf"{re.escape(MANAGED_GEMINI_CONTEXT_START)}[\s\S]*?{re.escape(MANAGED_GEMINI_CONTEXT_END)}\n?",
+    )
+    without_managed = managed_block.sub("", value)
+    cleaned_lines = [line.rstrip() for line in without_managed.splitlines()]
+    normalized = "\n".join(cleaned_lines).strip()
+    return normalized
+
+
+def _sync_gemini_shared_context_file(*, host_gemini_dir: Path, shared_prompt_context: str) -> None:
+    context_file = host_gemini_dir / GEMINI_CONTEXT_FILE_NAME
+    existing = ""
+    if context_file.exists():
+        try:
+            existing = context_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            click.echo(f"Warning: unable to read Gemini context file {context_file}: {exc}", err=True)
+            return
+
+    preserved_user_content = _remove_managed_gemini_context_sections(existing)
+    managed_context = str(shared_prompt_context or "").strip()
+
+    sections: list[str] = []
+    if preserved_user_content:
+        sections.append(preserved_user_content)
+    if managed_context:
+        sections.append(
+            "\n".join(
+                [
+                    MANAGED_GEMINI_CONTEXT_START,
+                    managed_context,
+                    MANAGED_GEMINI_CONTEXT_END,
+                ]
+            )
+        )
+
+    updated = ""
+    if sections:
+        updated = "\n\n".join(sections).rstrip() + "\n"
+
+    if existing == updated:
+        return
+
+    try:
+        if updated:
+            context_file.parent.mkdir(parents=True, exist_ok=True)
+            context_file.write_text(updated, encoding="utf-8")
+        elif context_file.exists():
+            context_file.unlink()
+    except OSError as exc:
+        click.echo(f"Warning: unable to update Gemini context file {context_file}: {exc}", err=True)
 
 
 def _resume_shell_command(*, no_alt_screen: bool, agent_command: str, codex_runtime_flags: Iterable[str] = ()) -> str:
@@ -661,8 +732,13 @@ def main(
         explicit_args=explicit_container_args,
     )
     shared_prompt_context = ""
-    if selected_agent_command == AGENT_PROVIDER_CLAUDE:
+    if selected_agent_command in {AGENT_PROVIDER_CLAUDE, AGENT_PROVIDER_GEMINI}:
         shared_prompt_context = _shared_prompt_context_from_config(config_path)
+    if selected_agent_command == AGENT_PROVIDER_GEMINI:
+        _sync_gemini_shared_context_file(
+            host_gemini_dir=host_gemini_dir,
+            shared_prompt_context=shared_prompt_context,
+        )
 
     command = [selected_agent_command]
     if selected_agent_command == DEFAULT_AGENT_COMMAND:
@@ -672,6 +748,12 @@ def main(
             _claude_default_runtime_flags(
                 explicit_args=explicit_container_args,
                 shared_prompt_context=shared_prompt_context,
+            )
+        )
+    elif selected_agent_command == AGENT_PROVIDER_GEMINI:
+        command.extend(
+            _gemini_default_runtime_flags(
+                explicit_args=explicit_container_args,
             )
         )
 
