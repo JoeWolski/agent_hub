@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+prompt_yes_no() {
+  local prompt="$1"
+  local default_yes="${2:-false}"
+  local reply=""
+
+  read -r -p "${prompt}" reply || true
+  reply="${reply,,}"
+
+  if [[ -z "${reply}" ]]; then
+    [[ "${default_yes}" == "true" ]]
+    return
+  fi
+
+  [[ "${reply}" == "y" || "${reply}" == "yes" ]]
+}
+
+ensure_dependencies() {
+  local missing=()
+  local blockers=()
+
+  if ! command -v uv >/dev/null 2>&1; then
+    missing+=("uv")
+    if ! command -v curl >/dev/null 2>&1; then
+      blockers+=("curl (required to install uv)")
+    fi
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    missing+=("docker")
+    if ! command -v sudo >/dev/null 2>&1; then
+      blockers+=("sudo (required to install docker.io via apt)")
+    fi
+  fi
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return
+  fi
+
+  echo "Missing dependencies: ${missing[*]}"
+  echo "agent_cli wrapper runs commands with: uv run agent_cli ..."
+
+  if [[ ${#blockers[@]} -gt 0 ]]; then
+    echo "Automatic install is unavailable due to missing tools:"
+    for item in "${blockers[@]}"; do
+      echo "  - ${item}"
+    done
+    echo "Install missing dependencies manually and retry."
+    exit 1
+  fi
+
+  if ! prompt_yes_no "Install missing dependencies now (${missing[*]})? [y/N] " "false"; then
+    echo "Cancelled. Install dependencies and retry."
+    exit 1
+  fi
+
+  if [[ " ${missing[*]} " == *" uv "* ]]; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="${HOME}/.local/bin:${PATH}"
+    if [[ -f "${HOME}/.local/bin/env" ]]; then
+      # shellcheck source=/dev/null
+      source "${HOME}/.local/bin/env"
+    fi
+  fi
+
+  if [[ " ${missing[*]} " == *" docker "* ]]; then
+    sudo apt-get update
+    sudo apt-get install -y docker.io
+  fi
+
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "uv installation did not add uv to PATH. Restart shell or export PATH and retry."
+    exit 1
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "docker installation did not provide docker CLI on PATH."
+    exit 1
+  fi
+}
+
+ensure_dependencies
+
+cd "${REPO_ROOT}"
+exec uv run agent_cli "$@"

@@ -16,6 +16,7 @@ DEFAULT_BASE_IMAGE = "nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04"
 DEFAULT_RUNTIME_IMAGE = "agent-ubuntu2204:latest"
 DEFAULT_DOCKERFILE = "docker/Dockerfile"
 DEFAULT_AGENT_COMMAND = "codex"
+DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 
 
 def _resume_shell_command(*, no_alt_screen: bool) -> str:
@@ -446,6 +447,8 @@ def main(
         container_project_path,
         "--volume",
         f"{project_path}:{container_project_path}",
+        "--volume",
+        f"{DOCKER_SOCKET_PATH}:{DOCKER_SOCKET_PATH}",
         "--volume",
         f"{host_codex_dir}:{container_home_path}/.codex",
         "--volume",
