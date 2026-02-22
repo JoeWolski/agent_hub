@@ -700,6 +700,8 @@ class HubStateTests(unittest.TestCase):
         self.assertIn(str(workspace / "docker" / "base"), cmd)
         self.assertIn("--credentials-file", cmd)
         self.assertIn(str(self.state.openai_credentials_file), cmd)
+        self.assertIn("--agent-command", cmd)
+        self.assertIn("codex", cmd)
         self.assertIn("--no-alt-screen", cmd)
         self.assertIn("--ro-mount", cmd)
         self.assertIn(f"{self.host_ro}:/ro_data", cmd)
@@ -724,6 +726,59 @@ class HubStateTests(unittest.TestCase):
             started_chat["artifact_publish_token_hash"],
             hub_server._hash_artifact_publish_token("artifact-token-test"),
         )
+
+    def test_start_chat_uses_claude_agent_command_when_selected(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=["--model", "sonnet"],
+            agent_type="claude",
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        class DummyProc:
+            pid = 4242
+
+        def fake_spawn(_: hub_server.HubState, _chat_id: str, cmd: list[str]) -> DummyProc:
+            captured["cmd"] = list(cmd)
+            return DummyProc()
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch(
+            "agent_hub.server._new_artifact_publish_token",
+            return_value="artifact-token-test",
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+            fake_spawn,
+        ):
+            self.state.start_chat(chat["id"])
+
+        cmd = captured["cmd"]
+        self.assertIn("--agent-command", cmd)
+        self.assertIn("claude", cmd)
+        self.assertIn("--model", cmd)
+        self.assertIn("sonnet", cmd)
+        started_chat = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(started_chat["agent_type"], "claude")
 
     def test_start_chat_passes_github_app_credentials_when_configured(self) -> None:
         self._connect_github_app()
@@ -1181,6 +1236,7 @@ class HubStateTests(unittest.TestCase):
             rw_mounts: list[str],
             env_vars: list[str],
             agent_args: list[str] | None = None,
+            agent_type: str | None = None,
         ) -> dict[str, str]:
             captured["project_id"] = project_id
             captured["profile"] = profile
@@ -1188,6 +1244,7 @@ class HubStateTests(unittest.TestCase):
             captured["rw_mounts"] = list(rw_mounts)
             captured["env_vars"] = list(env_vars)
             captured["agent_args"] = list(agent_args or [])
+            captured["agent_type"] = str(agent_type or "")
             return {"id": "chat-created"}
 
         def fake_start(_: hub_server.HubState, chat_id: str) -> dict[str, str]:
@@ -1205,7 +1262,38 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(captured["project_id"], project["id"])
         self.assertEqual(captured["profile"], "")
         self.assertEqual(captured["agent_args"], ["--model", "gpt-5.3-codex", "-c", 'model_reasoning_effort="high"'])
+        self.assertEqual(captured["agent_type"], hub_server.DEFAULT_CHAT_AGENT_TYPE)
         self.assertEqual(captured["started_chat_id"], "chat-created")
+        self.assertEqual(result["id"], "chat-created")
+
+    def test_create_and_start_chat_passes_agent_type(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        captured: dict[str, object] = {}
+
+        def fake_create(
+            _: hub_server.HubState,
+            project_id: str,
+            profile: str | None,
+            ro_mounts: list[str],
+            rw_mounts: list[str],
+            env_vars: list[str],
+            agent_args: list[str] | None = None,
+            agent_type: str | None = None,
+        ) -> dict[str, str]:
+            del project_id, profile, ro_mounts, rw_mounts, env_vars, agent_args
+            captured["agent_type"] = agent_type
+            return {"id": "chat-created"}
+
+        with patch.object(hub_server.HubState, "create_chat", fake_create), patch.object(
+            hub_server.HubState, "start_chat", return_value={"id": "chat-created", "status": "running"}
+        ):
+            result = self.state.create_and_start_chat(project["id"], agent_type="claude")
+
+        self.assertEqual(captured["agent_type"], "claude")
         self.assertEqual(result["id"], "chat-created")
 
     def test_start_chat_rejects_when_stored_snapshot_tag_is_stale(self) -> None:
@@ -2800,7 +2888,7 @@ class CliEnvVarTests(unittest.TestCase):
             assert commit_cmd is not None
             self.assertIn("--change", commit_cmd)
             self.assertIn('ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]', commit_cmd)
-            self.assertIn('CMD ["codex"]', commit_cmd)
+            self.assertIn('CMD ["bash"]', commit_cmd)
 
     def test_cached_snapshot_skips_runtime_build(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2880,6 +2968,105 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("codex", run_cmd)
             codex_index = run_cmd.index("codex")
             self.assertIn("--no-alt-screen", run_cmd[codex_index + 1 :])
+
+    def test_claude_agent_command_uses_claude_runtime_image(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-command",
+                        "claude",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            self.assertIn(image_cli.CLAUDE_RUNTIME_IMAGE, run_cmd)
+            image_index = run_cmd.index(image_cli.CLAUDE_RUNTIME_IMAGE)
+            self.assertEqual(run_cmd[image_index + 1], "claude")
+
+    def test_snapshot_reuses_shared_setup_image_and_builds_provider_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            snapshot_tag = "snapshot:test"
+            overlay_tag = image_cli._snapshot_runtime_image_for_provider(snapshot_tag, image_cli.AGENT_PROVIDER_CLAUDE)
+
+            def fake_image_exists(tag: str) -> bool:
+                if tag == snapshot_tag:
+                    return True
+                if tag == overlay_tag:
+                    return False
+                return True
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", side_effect=fake_image_exists
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-command",
+                        "claude",
+                        "--snapshot-image-tag",
+                        snapshot_tag,
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            build_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "build"]), None)
+            self.assertIsNotNone(build_cmd)
+            assert build_cmd is not None
+            self.assertIn(f"BASE_IMAGE={snapshot_tag}", build_cmd)
+            self.assertIn("AGENT_PROVIDER=claude", build_cmd)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            self.assertIn(overlay_tag, run_cmd)
 
     def test_resume_uses_shell_command_as_container_entry_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2968,7 +3155,39 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("codex --no-alt-screen resume --last", resume_script)
             self.assertIn("exec codex --no-alt-screen", resume_script)
 
-    def test_cli_mounts_only_codex_dir_for_container_home_persistence(self) -> None:
+    def test_resume_rejects_non_codex_agent_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", return_value=None
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-command",
+                        "claude",
+                        "--resume",
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("--resume is currently only supported when --agent-command is codex.", result.output)
+
+    def test_cli_mounts_codex_and_claude_dirs_for_container_home_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
@@ -3011,8 +3230,10 @@ class CliEnvVarTests(unittest.TestCase):
             container_home = f"/home/{image_cli._default_user()}"
             full_home_mount = f"{agent_home.resolve()}:{container_home}"
             codex_mount = f"{(agent_home / '.codex').resolve()}:{container_home}/.codex"
+            claude_mount = f"{(agent_home / '.claude').resolve()}:{container_home}/.claude"
             self.assertNotIn(full_home_mount, run_cmd)
             self.assertIn(codex_mount, run_cmd)
+            self.assertIn(claude_mount, run_cmd)
 
     def test_cli_mounts_git_credentials_and_sets_git_config_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

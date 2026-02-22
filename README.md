@@ -94,7 +94,7 @@ No manual artifact wiring is required for `agent_hub` chats:
 
 ## `agent_cli` (detailed)
 
-`agent_cli` is the runtime launcher. It builds images (if needed), mounts project/config/state paths, and starts the in-container `codex` process.
+`agent_cli` is the runtime launcher. It builds images (if needed), mounts project/config/state paths, and starts the selected in-container agent process (`codex` by default, `claude` when requested).
 
 Behavior highlights:
 
@@ -115,7 +115,14 @@ Key argument groups:
 - Runtime customization:
   `--ro-mount`, `--rw-mount`, `--env-var`
 - Session behavior:
-  `--resume`, `--no-alt-screen`, trailing `-- <agent args>`
+  `--agent-command`, `--resume`, `--no-alt-screen`, trailing `-- <agent args>`
+
+Runtime image layering notes:
+
+- Provider runtime images are separate (`codex` vs `claude`), so a single image does not bundle both CLIs.
+- Project setup snapshots are built once and reused.
+- When launching from a setup snapshot, `agent_cli` builds a lightweight provider-specific overlay image on top of that snapshot when needed.
+- This ordering keeps large project setup layers shared and avoids duplicating disk usage per provider.
 
 ## `agent_hub` (detailed)
 

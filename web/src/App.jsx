@@ -16,12 +16,40 @@ import {
 } from "react-icons/md";
 
 const THEME_STORAGE_KEY = "agent_hub_theme";
-const START_MODEL_OPTIONS = ["default", "gpt-5.3-codex", "gpt-5.3-codex-spark"];
+const DEFAULT_AGENT_TYPE = "codex";
+const AGENT_TYPE_OPTIONS = [
+  { value: "codex", label: "Codex" },
+  { value: "claude", label: "Claude" }
+];
+const START_MODEL_OPTIONS_BY_AGENT = {
+  codex: ["default", "gpt-5.3-codex", "gpt-5.3-codex-spark"],
+  claude: ["default", "sonnet", "opus", "haiku"]
+};
 const REASONING_MODE_OPTIONS = ["default", "minimal", "low", "medium", "high", "xhigh"];
 
-function normalizeStartModel(value) {
+function normalizeAgentType(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (AGENT_TYPE_OPTIONS.some((option) => option.value === normalized)) {
+    return normalized;
+  }
+  return DEFAULT_AGENT_TYPE;
+}
+
+function agentTypeLabel(agentType) {
+  const normalized = normalizeAgentType(agentType);
+  const matched = AGENT_TYPE_OPTIONS.find((option) => option.value === normalized);
+  return matched ? matched.label : "Codex";
+}
+
+function startModelOptionsForAgent(agentType) {
+  const resolvedAgentType = normalizeAgentType(agentType);
+  return START_MODEL_OPTIONS_BY_AGENT[resolvedAgentType] || START_MODEL_OPTIONS_BY_AGENT[DEFAULT_AGENT_TYPE];
+}
+
+function normalizeStartModel(agentType, value) {
+  const options = startModelOptionsForAgent(agentType);
   const normalized = String(value || "").trim();
-  if (START_MODEL_OPTIONS.includes(normalized)) {
+  if (options.includes(normalized)) {
     return normalized;
   }
   return "default";
@@ -35,17 +63,25 @@ function normalizeReasoningMode(value) {
   return "default";
 }
 
-function buildChatStartArgs(model, reasoningMode) {
+function normalizeChatStartSettings(value) {
+  const resolvedAgentType = normalizeAgentType(value?.agentType || value?.agent_type);
+  return {
+    agentType: resolvedAgentType,
+    model: normalizeStartModel(resolvedAgentType, value?.model),
+    reasoning: resolvedAgentType === "codex" ? normalizeReasoningMode(value?.reasoning) : "default"
+  };
+}
+
+function buildChatStartConfig(value) {
+  const normalized = normalizeChatStartSettings(value);
   const args = [];
-  const resolvedModel = normalizeStartModel(model);
-  const resolvedReasoningMode = normalizeReasoningMode(reasoningMode);
-  if (resolvedModel !== "default") {
-    args.push("--model", resolvedModel);
+  if (normalized.model !== "default") {
+    args.push("--model", normalized.model);
   }
-  if (resolvedReasoningMode !== "default") {
-    args.push("-c", `model_reasoning_effort="${resolvedReasoningMode}"`);
+  if (normalized.agentType === "codex" && normalized.reasoning !== "default") {
+    args.push("-c", `model_reasoning_effort="${normalized.reasoning}"`);
   }
-  return args;
+  return { agentType: normalized.agentType, agentArgs: args };
 }
 
 function normalizeThemePreference(value) {
@@ -1435,6 +1471,7 @@ function HubApp() {
         is_pending_start: true,
         project_id: session.project_id,
         project_name: session.project_name || "Unknown",
+        agent_type: normalizeAgentType(session.agent_type),
         workspace: "",
         container_workspace: "",
         ro_mounts: [],
@@ -1660,11 +1697,8 @@ function HubApp() {
     setChatStartSettingsByProject((prev) => {
       const next = {};
       for (const project of hubState.projects) {
-        const current = prev[project.id] || {};
-        next[project.id] = {
-          model: normalizeStartModel(current.model),
-          reasoning: normalizeReasoningMode(current.reasoning)
-        };
+        const current = prev[project.id] || { agentType: DEFAULT_AGENT_TYPE };
+        next[project.id] = normalizeChatStartSettings(current);
       }
       return next;
     });
@@ -1709,15 +1743,15 @@ function HubApp() {
 
   function updateProjectChatStartSettings(projectId, patch) {
     setChatStartSettingsByProject((prev) => {
-      const current = prev[projectId] || { model: "default", reasoning: "default" };
-      const nextModel = patch.model === undefined ? current.model : normalizeStartModel(patch.model);
-      const nextReasoning = patch.reasoning === undefined ? current.reasoning : normalizeReasoningMode(patch.reasoning);
+      const current = normalizeChatStartSettings(prev[projectId] || { agentType: DEFAULT_AGENT_TYPE });
+      const candidate = {
+        ...current,
+        ...patch
+      };
+      const normalized = normalizeChatStartSettings(candidate);
       return {
         ...prev,
-        [projectId]: {
-          model: nextModel,
-          reasoning: nextReasoning
-        }
+        [projectId]: normalized
       };
     });
   }
@@ -1770,13 +1804,14 @@ function HubApp() {
         createChatQueueRef.current.set(projectId, queue);
 
         const uiId = nextJob.uiId;
+        const agentType = normalizeAgentType(nextJob.agentType);
         const agentArgs = Array.isArray(nextJob.agentArgs)
           ? nextJob.agentArgs.map((arg) => String(arg)).filter((arg) => arg.trim())
           : [];
         try {
           const response = await fetchJson(`/api/projects/${projectId}/chats/start`, {
             method: "POST",
-            body: JSON.stringify({ agent_args: agentArgs })
+            body: JSON.stringify({ agent_type: agentType, agent_args: agentArgs })
           });
           const chatId = response?.chat?.id;
           if (!chatId) {
@@ -1897,11 +1932,10 @@ function HubApp() {
   async function handleCreateChat(projectId, startSettings = null) {
     const uiId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const project = projectsById.get(projectId);
-    const selectedStartSettings = startSettings || chatStartSettingsByProject[projectId] || {
-      model: "default",
-      reasoning: "default"
-    };
-    const agentArgs = buildChatStartArgs(selectedStartSettings.model, selectedStartSettings.reasoning);
+    const selectedStartSettings = normalizeChatStartSettings(
+      startSettings || chatStartSettingsByProject[projectId] || { agentType: DEFAULT_AGENT_TYPE }
+    );
+    const { agentType, agentArgs } = buildChatStartConfig(selectedStartSettings);
     const knownServerChatIds = (hubState.chats || [])
       .filter((chat) => String(chat.project_id || "") === String(projectId))
       .map((chat) => chat.id);
@@ -1909,6 +1943,7 @@ function HubApp() {
       ui_id: uiId,
       project_id: projectId,
       project_name: project?.name || "Unknown",
+      agent_type: agentType,
       server_chat_id: "",
       known_server_chat_ids: knownServerChatIds,
       seen_on_server: false
@@ -1919,7 +1954,7 @@ function HubApp() {
     setCollapsedProjectChats((prev) => ({ ...prev, [projectId]: false }));
 
     const queue = createChatQueueRef.current.get(projectId) || [];
-    queue.push({ uiId, agentArgs });
+    queue.push({ uiId, agentType, agentArgs });
     createChatQueueRef.current.set(projectId, queue);
     processCreateChatQueue(projectId).catch(() => {});
   }
@@ -2890,6 +2925,7 @@ function HubApp() {
                 <div className="meta">Title status: {titleStatus || "idle"}</div>
                 {chat.title_error ? <div className="meta build-error">Title generation error: {chat.title_error}</div> : null}
                 <div className="meta">Chat ID: {resolvedChatId || "starting..."}</div>
+                <div className="meta">Agent: {agentTypeLabel(chat.agent_type)}</div>
                 <div className="meta">Workspace: {chat.workspace}</div>
                 <div className="meta">Container folder: {chat.container_workspace || "not started yet"}</div>
                 {chat.setup_snapshot_image ? (
@@ -3303,10 +3339,11 @@ function HubApp() {
                 const canStartChat = buildStatus === "ready";
                 const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
                 const projectRowsCollapsed = Boolean(collapsedProjectChats[project.id]);
-                const projectStartSettings = chatStartSettingsByProject[project.id] || {
-                  model: "default",
-                  reasoning: "default"
-                };
+                const projectStartSettings = normalizeChatStartSettings(
+                  chatStartSettingsByProject[project.id] || { agentType: DEFAULT_AGENT_TYPE }
+                );
+                const projectModelOptions = startModelOptionsForAgent(projectStartSettings.agentType);
+                const projectSupportsReasoning = projectStartSettings.agentType === "codex";
                 return (
                   <article className="card project-chat-group" key={`group-${project.id}`}>
                     <div
@@ -3327,6 +3364,23 @@ function HubApp() {
                           <>
                             <select
                               className="project-start-select"
+                              aria-label={`Agent for ${project.name}`}
+                              value={projectStartSettings.agentType}
+                              onClick={(event) => event.stopPropagation()}
+                              onKeyDown={(event) => event.stopPropagation()}
+                              onChange={(event) => {
+                                event.stopPropagation();
+                                updateProjectChatStartSettings(project.id, { agentType: event.target.value });
+                              }}
+                            >
+                              {AGENT_TYPE_OPTIONS.map((option) => (
+                                <option key={`${project.id}-agent-${option.value}`} value={option.value}>
+                                  {option.label}
+                                </option>
+                              ))}
+                            </select>
+                            <select
+                              className="project-start-select"
                               aria-label={`Start model for ${project.name}`}
                               value={projectStartSettings.model}
                               onClick={(event) => event.stopPropagation()}
@@ -3336,27 +3390,31 @@ function HubApp() {
                                 updateProjectChatStartSettings(project.id, { model: event.target.value });
                               }}
                             >
-                              <option value="default">default</option>
-                              <option value="gpt-5.3-codex">gpt-5.3-codex</option>
-                              <option value="gpt-5.3-codex-spark">gpt-5.3-codex-spark</option>
-                            </select>
-                            <select
-                              className="project-start-select"
-                              aria-label={`Reasoning mode for ${project.name}`}
-                              value={projectStartSettings.reasoning}
-                              onClick={(event) => event.stopPropagation()}
-                              onKeyDown={(event) => event.stopPropagation()}
-                              onChange={(event) => {
-                                event.stopPropagation();
-                                updateProjectChatStartSettings(project.id, { reasoning: event.target.value });
-                              }}
-                            >
-                              {REASONING_MODE_OPTIONS.map((reasoningMode) => (
-                                <option key={`${project.id}-reasoning-${reasoningMode}`} value={reasoningMode}>
-                                  {reasoningMode}
+                              {projectModelOptions.map((modelOption) => (
+                                <option key={`${project.id}-model-${projectStartSettings.agentType}-${modelOption}`} value={modelOption}>
+                                  {modelOption}
                                 </option>
                               ))}
                             </select>
+                            {projectSupportsReasoning ? (
+                              <select
+                                className="project-start-select"
+                                aria-label={`Reasoning mode for ${project.name}`}
+                                value={projectStartSettings.reasoning}
+                                onClick={(event) => event.stopPropagation()}
+                                onKeyDown={(event) => event.stopPropagation()}
+                                onChange={(event) => {
+                                  event.stopPropagation();
+                                  updateProjectChatStartSettings(project.id, { reasoning: event.target.value });
+                                }}
+                              >
+                                {REASONING_MODE_OPTIONS.map((reasoningMode) => (
+                                  <option key={`${project.id}-reasoning-${reasoningMode}`} value={reasoningMode}>
+                                    {reasoningMode}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : null}
                           </>
                         ) : null}
                         <button

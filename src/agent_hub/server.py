@@ -71,7 +71,15 @@ TERMINAL_QUEUE_MAX = 256
 HUB_EVENT_QUEUE_MAX = 512
 OPENAI_ACCOUNT_LOGIN_LOG_MAX_CHARS = 16_000
 OPENAI_ACCOUNT_LOGIN_DEFAULT_CALLBACK_PORT = 1455
-DEFAULT_AGENT_IMAGE = "agent-ubuntu2204:latest"
+DEFAULT_AGENT_IMAGE = "agent-ubuntu2204-codex:latest"
+AGENT_TYPE_CODEX = "codex"
+AGENT_TYPE_CLAUDE = "claude"
+DEFAULT_CHAT_AGENT_TYPE = AGENT_TYPE_CODEX
+SUPPORTED_CHAT_AGENT_TYPES = {AGENT_TYPE_CODEX, AGENT_TYPE_CLAUDE}
+AGENT_COMMAND_BY_TYPE = {
+    AGENT_TYPE_CODEX: "codex",
+    AGENT_TYPE_CLAUDE: "claude",
+}
 DEFAULT_PTY_COLS = 160
 DEFAULT_PTY_ROWS = 48
 CHAT_PREVIEW_LOG_MAX_BYTES = 150_000
@@ -223,6 +231,16 @@ def _normalize_log_level(value: Any) -> str:
     if normalized in HUB_LOG_LEVEL_CHOICES:
         return normalized
     return "info"
+
+
+def _normalize_chat_agent_type(raw_value: Any, *, strict: bool = False) -> str:
+    value = str(raw_value or "").strip().lower()
+    if value in SUPPORTED_CHAT_AGENT_TYPES:
+        return value
+    if strict:
+        supported = ", ".join(sorted(SUPPORTED_CHAT_AGENT_TYPES))
+        raise HTTPException(status_code=400, detail=f"agent_type must be one of: {supported}.")
+    return DEFAULT_CHAT_AGENT_TYPE
 
 
 def _configure_hub_logging(level: str) -> None:
@@ -1786,7 +1804,7 @@ def _read_codex_auth(path: Path) -> tuple[bool, str]:
 
 
 def _snapshot_schema_version() -> int:
-    return 2
+    return 3
 
 
 def _docker_remove_images(prefixes: tuple[str, ...], explicit_tags: set[str]) -> None:
@@ -2094,6 +2112,7 @@ class HubState:
                 chat["agent_args"] = [str(arg) for arg in legacy_args]
             else:
                 chat["agent_args"] = []
+            chat["agent_type"] = _normalize_chat_agent_type(chat.get("agent_type"))
             prompts = chat.get("title_user_prompts")
             if isinstance(prompts, list):
                 normalized_prompts = [str(item) for item in prompts if str(item).strip()]
@@ -4046,6 +4065,7 @@ class HubState:
         rw_mounts: list[str],
         env_vars: list[str],
         agent_args: list[str] | None = None,
+        agent_type: str | None = None,
     ) -> dict[str, Any]:
         state = self.load()
         project = state["projects"].get(project_id)
@@ -4064,6 +4084,7 @@ class HubState:
             "rw_mounts": rw_mounts,
             "env_vars": env_vars,
             "agent_args": agent_args or [],
+            "agent_type": _normalize_chat_agent_type(agent_type),
             "status": "stopped",
             "pid": None,
             "workspace": str(workspace_path),
@@ -4085,7 +4106,12 @@ class HubState:
         self.save(state)
         return chat
 
-    def create_and_start_chat(self, project_id: str, agent_args: list[str] | None = None) -> dict[str, Any]:
+    def create_and_start_chat(
+        self,
+        project_id: str,
+        agent_args: list[str] | None = None,
+        agent_type: str | None = None,
+    ) -> dict[str, Any]:
         state = self.load()
         project = state["projects"].get(project_id)
         if project is None:
@@ -4101,6 +4127,7 @@ class HubState:
             rw_mounts=list(project.get("default_rw_mounts") or []),
             env_vars=list(project.get("default_env_vars") or []),
             agent_args=normalized_agent_args,
+            agent_type=_normalize_chat_agent_type(agent_type),
         )
         return self.start_chat(chat["id"])
 
@@ -4110,9 +4137,13 @@ class HubState:
         if chat is None:
             raise HTTPException(status_code=404, detail="Chat not found.")
 
-        for field in ["name", "profile", "ro_mounts", "rw_mounts", "env_vars", "agent_args"]:
-            if field in patch:
-                chat[field] = patch[field]
+        for field in ["name", "profile", "ro_mounts", "rw_mounts", "env_vars", "agent_args", "agent_type"]:
+            if field not in patch:
+                continue
+            if field == "agent_type":
+                chat[field] = _normalize_chat_agent_type(patch[field])
+                continue
+            chat[field] = patch[field]
 
         chat["updated_at"] = _iso_now()
         state["chats"][chat_id] = chat
@@ -4833,7 +4864,11 @@ class HubState:
             )
         return snapshot_tag
 
-    def _prepare_project_snapshot_for_project(self, project: dict[str, Any], log_path: Path | None = None) -> str:
+    def _prepare_project_snapshot_for_project(
+        self,
+        project: dict[str, Any],
+        log_path: Path | None = None,
+    ) -> str:
         workspace = self._ensure_project_clone(project)
         self._sync_checkout_to_remote(workspace, project)
         return self._ensure_project_setup_snapshot(
@@ -4868,6 +4903,7 @@ class HubState:
             chat_copy["ro_mounts"] = list(chat_copy.get("ro_mounts") or [])
             chat_copy["rw_mounts"] = list(chat_copy.get("rw_mounts") or [])
             chat_copy["env_vars"] = list(chat_copy.get("env_vars") or [])
+            chat_copy["agent_type"] = _normalize_chat_agent_type(chat_copy.get("agent_type"))
             chat_copy["setup_snapshot_image"] = str(chat_copy.get("setup_snapshot_image") or "")
             cleaned_artifacts = _normalize_chat_artifacts(chat_copy.get("artifacts"))
             if chat_id in state["chats"] and cleaned_artifacts != _normalize_chat_artifacts(state["chats"][chat_id].get("artifacts")):
@@ -5003,6 +5039,9 @@ class HubState:
             self._chat_input_buffers[chat_id] = ""
             self._chat_input_ansi_carry[chat_id] = ""
         artifact_publish_token = _new_artifact_publish_token()
+        agent_type = _normalize_chat_agent_type(chat.get("agent_type"))
+        agent_command = AGENT_COMMAND_BY_TYPE.get(agent_type, AGENT_COMMAND_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE])
+        chat["agent_type"] = agent_type
 
         cmd = [
             "uv",
@@ -5010,6 +5049,8 @@ class HubState:
             "--project",
             str(_repo_root()),
             "agent_cli",
+            "--agent-command",
+            agent_command,
             "--project",
             str(workspace),
             "--config-file",
@@ -6147,7 +6188,18 @@ def main(
             agent_args = []
         if not isinstance(agent_args, list):
             raise HTTPException(status_code=400, detail="agent_args must be an array.")
-        return {"chat": state.create_and_start_chat(project_id, agent_args=[str(arg) for arg in agent_args])}
+        agent_type = (
+            _normalize_chat_agent_type(payload.get("agent_type"), strict=True)
+            if "agent_type" in payload
+            else DEFAULT_CHAT_AGENT_TYPE
+        )
+        return {
+            "chat": state.create_and_start_chat(
+                project_id,
+                agent_args=[str(arg) for arg in agent_args],
+                agent_type=agent_type,
+            )
+        }
 
     @app.post("/api/chats")
     async def api_create_chat(request: Request) -> dict[str, Any]:
@@ -6170,6 +6222,11 @@ def main(
             agent_args = []
         if not isinstance(agent_args, list):
             raise HTTPException(status_code=400, detail="agent_args must be an array.")
+        agent_type = (
+            _normalize_chat_agent_type(payload.get("agent_type"), strict=True)
+            if "agent_type" in payload
+            else DEFAULT_CHAT_AGENT_TYPE
+        )
         return {
             "chat": state.create_chat(
                 project_id,
@@ -6178,6 +6235,7 @@ def main(
                 rw_mounts,
                 env_vars,
                 agent_args=[str(arg) for arg in agent_args],
+                agent_type=agent_type,
             )
         }
 
@@ -6207,6 +6265,8 @@ def main(
             if not isinstance(args, list):
                 raise HTTPException(status_code=400, detail="agent_args must be an array.")
             update["agent_args"] = [str(arg) for arg in args]
+        if "agent_type" in payload:
+            update["agent_type"] = _normalize_chat_agent_type(payload.get("agent_type"), strict=True)
         if not update:
             raise HTTPException(status_code=400, detail="No patch values provided.")
         return {"chat": state.update_chat(chat_id, update)}

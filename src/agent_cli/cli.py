@@ -13,17 +13,22 @@ import click
 
 
 DEFAULT_BASE_IMAGE = "nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04"
-DEFAULT_RUNTIME_IMAGE = "agent-ubuntu2204:latest"
+DEFAULT_SETUP_RUNTIME_IMAGE = "agent-ubuntu2204-setup:latest"
+DEFAULT_RUNTIME_IMAGE = "agent-ubuntu2204-codex:latest"
+CLAUDE_RUNTIME_IMAGE = "agent-ubuntu2204-claude:latest"
 DEFAULT_DOCKERFILE = "docker/Dockerfile"
 DEFAULT_AGENT_COMMAND = "codex"
+AGENT_PROVIDER_NONE = "none"
+AGENT_PROVIDER_CODEX = "codex"
+AGENT_PROVIDER_CLAUDE = "claude"
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 
 
-def _resume_shell_command(*, no_alt_screen: bool) -> str:
-    codex_command = DEFAULT_AGENT_COMMAND
-    if no_alt_screen:
-        codex_command = f"{codex_command} --no-alt-screen"
-    return f"if {codex_command} resume --last; then :; else exec {codex_command}; fi"
+def _resume_shell_command(*, no_alt_screen: bool, agent_command: str) -> str:
+    resolved_command = str(agent_command or DEFAULT_AGENT_COMMAND).strip() or DEFAULT_AGENT_COMMAND
+    if no_alt_screen and resolved_command == DEFAULT_AGENT_COMMAND:
+        resolved_command = f"{resolved_command} --no-alt-screen"
+    return f"if {resolved_command} resume --last; then :; else exec {resolved_command}; fi"
 
 
 def _repo_root() -> Path:
@@ -157,6 +162,61 @@ def _parse_env_var(spec: str, label: str) -> str:
     return f"{key}={value}"
 
 
+def _normalize_agent_command(raw_value: str | None) -> str:
+    value = str(raw_value or DEFAULT_AGENT_COMMAND).strip()
+    if not value:
+        return DEFAULT_AGENT_COMMAND
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+        raise click.ClickException(
+            f"Invalid --agent-command value: {raw_value!r} (allowed characters: letters, numbers, . _ -)"
+        )
+    return value
+
+
+def _agent_provider_for_command(agent_command: str) -> str:
+    command = str(agent_command or "").strip().lower()
+    if command == "codex":
+        return AGENT_PROVIDER_CODEX
+    if command == "claude":
+        return AGENT_PROVIDER_CLAUDE
+    return AGENT_PROVIDER_NONE
+
+
+def _default_runtime_image_for_provider(agent_provider: str) -> str:
+    if agent_provider == AGENT_PROVIDER_CLAUDE:
+        return CLAUDE_RUNTIME_IMAGE
+    if agent_provider == AGENT_PROVIDER_CODEX:
+        return DEFAULT_RUNTIME_IMAGE
+    return DEFAULT_SETUP_RUNTIME_IMAGE
+
+
+def _snapshot_runtime_image_for_provider(snapshot_tag: str, agent_provider: str) -> str:
+    return f"agent-runtime-{_sanitize_tag_component(agent_provider)}-{_short_hash(snapshot_tag)}"
+
+
+def _build_runtime_image(*, base_image: str, target_image: str, agent_provider: str) -> None:
+    click.echo(
+        f"Building runtime image '{target_image}' from {DEFAULT_DOCKERFILE} "
+        f"(base={base_image}, provider={agent_provider})"
+    )
+    _run(
+        [
+            "docker",
+            "build",
+            "-f",
+            str(_repo_root() / DEFAULT_DOCKERFILE),
+            "--build-arg",
+            f"BASE_IMAGE={base_image}",
+            "--build-arg",
+            f"AGENT_PROVIDER={agent_provider}",
+            "-t",
+            target_image,
+            str(_repo_root()),
+        ],
+        cwd=_repo_root(),
+    )
+
+
 def _read_openai_api_key(path: Path) -> str | None:
     if not path.exists():
         return None
@@ -242,6 +302,12 @@ def _resolve_base_image(
 
 @click.command(help="Launch the containerized agent environment")
 @click.option("--project", default=".", show_default=True)
+@click.option(
+    "--agent-command",
+    default=DEFAULT_AGENT_COMMAND,
+    show_default=True,
+    help="Agent executable launched inside the container (for example codex or claude)",
+)
 @click.option("--container-home", default=None, help="Container home path for mapped user")
 @click.option("--agent-home-path", default=None, help="Host path for persistent agent state")
 @click.option(
@@ -313,6 +379,7 @@ def _resolve_base_image(
 @click.argument("container_args", nargs=-1)
 def main(
     project: str,
+    agent_command: str,
     container_home: str | None,
     agent_home_path: str | None,
     config_file: str,
@@ -396,8 +463,11 @@ def main(
 
     host_agent_home = Path(agent_home_path or (Path.home() / ".agent-home" / user)).resolve()
     host_codex_dir = host_agent_home / ".codex"
+    host_claude_dir = host_agent_home / ".claude"
     host_codex_dir.mkdir(parents=True, exist_ok=True)
+    host_claude_dir.mkdir(parents=True, exist_ok=True)
     (host_agent_home / "projects").mkdir(parents=True, exist_ok=True)
+    selected_agent_command = _normalize_agent_command(agent_command)
 
     api_key = openai_api_key
     if not api_key:
@@ -406,13 +476,20 @@ def main(
     if not api_key:
         click.echo("OPENAI_API_KEY not set. Starting without API key.", err=True)
 
+    selected_agent_provider = _agent_provider_for_command(selected_agent_command)
     snapshot_tag = (snapshot_image_tag or "").strip()
     cached_snapshot_exists = bool(snapshot_tag) and _docker_image_exists(snapshot_tag)
-    should_build_runtime_image = not cached_snapshot_exists
     if cached_snapshot_exists:
         click.echo(f"Using cached setup snapshot image '{snapshot_tag}'")
 
-    if should_build_runtime_image:
+    selected_base_image = ""
+    selected_base_image_resolved = False
+
+    def ensure_selected_base_image() -> str:
+        nonlocal selected_base_image, selected_base_image_resolved
+        if selected_base_image_resolved:
+            return selected_base_image
+
         selected_base_image = base_image
         if base_docker_path or base_docker_context or base_dockerfile:
             _, resolved_context, resolved_dockerfile = _resolve_base_image(
@@ -435,21 +512,8 @@ def main(
             _run(["docker", "build", "-f", str(resolved_dockerfile), "-t", tag, str(resolved_context)])
             selected_base_image = tag
 
-        click.echo(f"Building runtime image '{DEFAULT_RUNTIME_IMAGE}' from {DEFAULT_DOCKERFILE}")
-        _run(
-            [
-                "docker",
-                "build",
-                "-f",
-                str(_repo_root() / DEFAULT_DOCKERFILE),
-                "--build-arg",
-                f"BASE_IMAGE={selected_base_image}",
-                "-t",
-                DEFAULT_RUNTIME_IMAGE,
-                str(_repo_root()),
-            ],
-            cwd=_repo_root(),
-        )
+        selected_base_image_resolved = True
+        return selected_base_image
 
     ro_mount_flags: list[str] = []
     rw_mount_flags: list[str] = []
@@ -466,13 +530,22 @@ def main(
     for entry in env_vars:
         parsed_env_vars.append(_parse_env_var(entry, "--env-var"))
 
-    command = [DEFAULT_AGENT_COMMAND]
-    if no_alt_screen:
+    command = [selected_agent_command]
+    if no_alt_screen and selected_agent_command == DEFAULT_AGENT_COMMAND:
         command.append("--no-alt-screen")
     if container_args:
         command.extend(container_args)
     elif resume:
-        command = ["bash", "-lc", _resume_shell_command(no_alt_screen=no_alt_screen)]
+        if selected_agent_command != DEFAULT_AGENT_COMMAND:
+            raise click.ClickException("--resume is currently only supported when --agent-command is codex.")
+        command = [
+            "bash",
+            "-lc",
+            _resume_shell_command(
+                no_alt_screen=no_alt_screen,
+                agent_command=selected_agent_command,
+            ),
+        ]
 
     run_args = [
         "--init",
@@ -486,6 +559,8 @@ def main(
         f"{DOCKER_SOCKET_PATH}:{DOCKER_SOCKET_PATH}",
         "--volume",
         f"{host_codex_dir}:{container_home_path}/.codex",
+        "--volume",
+        f"{host_claude_dir}:{container_home_path}/.claude",
         "--volume",
         f"{config_path}:{container_home_path}/.codex/config.toml:ro",
         "--env",
@@ -543,10 +618,15 @@ def main(
     for mount in ro_mount_flags + rw_mount_flags:
         run_args.extend(["--volume", mount])
 
-    runtime_image = DEFAULT_RUNTIME_IMAGE
+    runtime_image = _default_runtime_image_for_provider(selected_agent_provider)
     if snapshot_tag:
         should_build_snapshot = not cached_snapshot_exists
         if should_build_snapshot:
+            _build_runtime_image(
+                base_image=ensure_selected_base_image(),
+                target_image=DEFAULT_SETUP_RUNTIME_IMAGE,
+                agent_provider=AGENT_PROVIDER_NONE,
+            )
             script = (setup_script or "").strip() or ":"
             click.echo(f"Building setup snapshot image '{snapshot_tag}'")
             container_name = (
@@ -561,7 +641,7 @@ def main(
                 "--entrypoint",
                 "bash",
                 *run_args,
-                DEFAULT_RUNTIME_IMAGE,
+                DEFAULT_SETUP_RUNTIME_IMAGE,
                 "-lc",
                 (
                     "set -e\n"
@@ -581,7 +661,7 @@ def main(
                         "--change",
                         'ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]',
                         "--change",
-                        f'CMD ["{DEFAULT_AGENT_COMMAND}"]',
+                        'CMD ["bash"]',
                         container_name,
                         snapshot_tag,
                     ]
@@ -589,8 +669,26 @@ def main(
             finally:
                 _docker_rm_force(container_name)
         runtime_image = snapshot_tag
+        if not prepare_snapshot_only and selected_agent_provider in {AGENT_PROVIDER_CODEX, AGENT_PROVIDER_CLAUDE}:
+            provider_snapshot_runtime_image = _snapshot_runtime_image_for_provider(
+                snapshot_tag,
+                selected_agent_provider,
+            )
+            if not _docker_image_exists(provider_snapshot_runtime_image):
+                _build_runtime_image(
+                    base_image=snapshot_tag,
+                    target_image=provider_snapshot_runtime_image,
+                    agent_provider=selected_agent_provider,
+                )
+            runtime_image = provider_snapshot_runtime_image
     elif prepare_snapshot_only:
         raise click.ClickException("--prepare-snapshot-only requires --snapshot-image-tag")
+    else:
+        _build_runtime_image(
+            base_image=ensure_selected_base_image(),
+            target_image=runtime_image,
+            agent_provider=selected_agent_provider,
+        )
 
     if prepare_snapshot_only:
         return

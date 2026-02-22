@@ -1,5 +1,6 @@
 ARG BASE_IMAGE=nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
 FROM ${BASE_IMAGE}
+ARG AGENT_PROVIDER=codex
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -21,7 +22,12 @@ RUN apt-get update \
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get update \
  && apt-get install -y --no-install-recommends nodejs \
- && npm install -g @openai/codex \
+ && case "${AGENT_PROVIDER}" in \
+      codex) npm install -g @openai/codex ;; \
+      claude) npm install -g @anthropic-ai/claude-code ;; \
+      none) echo "Skipping agent CLI install for setup image." ;; \
+      *) echo "Unsupported AGENT_PROVIDER='${AGENT_PROVIDER}'" >&2; exit 1 ;; \
+    esac \
  && npm cache clean --force \
  && rm -rf /var/lib/apt/lists/*
 
