@@ -993,6 +993,57 @@ class HubStateTests(unittest.TestCase):
         started_chat = self.state.load()["chats"][chat["id"]]
         self.assertEqual(started_chat["agent_type"], "claude")
 
+    def test_start_chat_uses_gemini_agent_command_when_selected(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+            agent_type="gemini",
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        class DummyProc:
+            pid = 4242
+
+        def fake_spawn(_: hub_server.HubState, _chat_id: str, cmd: list[str]) -> DummyProc:
+            captured["cmd"] = list(cmd)
+            return DummyProc()
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch(
+            "agent_hub.server._new_artifact_publish_token",
+            return_value="artifact-token-test",
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+            fake_spawn,
+        ):
+            self.state.start_chat(chat["id"])
+
+        cmd = captured["cmd"]
+        self.assertIn("--agent-command", cmd)
+        self.assertIn("gemini", cmd)
+        started_chat = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(started_chat["agent_type"], "gemini")
+
     def test_start_chat_passes_github_app_credentials_when_configured(self) -> None:
         self._connect_github_app()
         project = self.state.add_project(
@@ -3695,6 +3746,48 @@ class CliEnvVarTests(unittest.TestCase):
             prompt_index = claude_args.index("--append-system-prompt")
             self.assertEqual(claude_args[prompt_index + 1], "manual system prompt")
 
+    def test_gemini_agent_command_uses_gemini_runtime_image(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-command",
+                        "gemini",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            self.assertIn(image_cli.GEMINI_RUNTIME_IMAGE, run_cmd)
+            image_index = run_cmd.index(image_cli.GEMINI_RUNTIME_IMAGE)
+            self.assertEqual(run_cmd[image_index + 1], "gemini")
+
     def test_codex_runtime_flags_respect_explicit_cli_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -3848,6 +3941,63 @@ class CliEnvVarTests(unittest.TestCase):
             assert run_cmd is not None
             self.assertIn(overlay_tag, run_cmd)
 
+    def test_snapshot_reuses_shared_setup_image_and_builds_gemini_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            snapshot_tag = "snapshot:test"
+            overlay_tag = image_cli._snapshot_runtime_image_for_provider(snapshot_tag, image_cli.AGENT_PROVIDER_GEMINI)
+
+            def fake_image_exists(tag: str) -> bool:
+                if tag == snapshot_tag:
+                    return True
+                if tag == overlay_tag:
+                    return False
+                return True
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", side_effect=fake_image_exists
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-command",
+                        "gemini",
+                        "--snapshot-image-tag",
+                        snapshot_tag,
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            build_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "build"]), None)
+            self.assertIsNotNone(build_cmd)
+            assert build_cmd is not None
+            self.assertIn(f"BASE_IMAGE={snapshot_tag}", build_cmd)
+            self.assertIn("AGENT_PROVIDER=gemini", build_cmd)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            self.assertIn(overlay_tag, run_cmd)
+
     def test_resume_uses_shell_command_as_container_entry_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -3973,7 +4123,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertNotEqual(result.exit_code, 0)
             self.assertIn("--resume is currently only supported when --agent-command is codex.", result.output)
 
-    def test_cli_mounts_codex_and_claude_dirs_for_container_home_persistence(self) -> None:
+    def test_cli_mounts_codex_claude_and_gemini_dirs_for_container_home_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
@@ -4019,11 +4169,13 @@ class CliEnvVarTests(unittest.TestCase):
             claude_mount = f"{(agent_home / '.claude').resolve()}:{container_home}/.claude"
             claude_json_mount = f"{(agent_home / '.claude.json').resolve()}:{container_home}/.claude.json"
             claude_config_mount = f"{(agent_home / '.config' / 'claude').resolve()}:{container_home}/.config/claude"
+            gemini_mount = f"{(agent_home / '.gemini').resolve()}:{container_home}/.gemini"
             self.assertNotIn(full_home_mount, run_cmd)
             self.assertIn(codex_mount, run_cmd)
             self.assertIn(claude_mount, run_cmd)
             self.assertIn(claude_json_mount, run_cmd)
             self.assertIn(claude_config_mount, run_cmd)
+            self.assertIn(gemini_mount, run_cmd)
 
     def test_cli_mounts_git_credentials_and_sets_git_config_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

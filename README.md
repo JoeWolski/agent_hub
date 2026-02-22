@@ -126,7 +126,7 @@ This includes Linux-first deploy scripts:
 
 ## `agent_cli` (detailed)
 
-`agent_cli` is the runtime launcher. It builds images (if needed), mounts project/config/state paths, and starts the selected in-container agent process (`codex` by default, `claude` when requested).
+`agent_cli` is the runtime launcher. It builds images (if needed), mounts project/config/state paths, and starts the selected in-container agent process (`codex` by default, `claude`/`gemini` when requested).
 
 Behavior highlights:
 
@@ -134,7 +134,7 @@ Behavior highlights:
 - Mounts Docker socket (`/var/run/docker.sock`) so runtime tools can access Docker when available.
 - Mounts config file to `~/.codex/config.toml` in the container (Codex runtime).
 - Derives shared prompt/context instructions from the same config and appends them to Claude sessions (`--append-system-prompt`).
-- Persists agent home state across runs with dedicated mounts for `~/.codex`, `~/.claude`, `~/.claude.json`, and `~/.config/claude`.
+- Persists agent home state across runs with dedicated mounts for `~/.codex`, `~/.claude`, `~/.claude.json`, `~/.config/claude`, and `~/.gemini`.
 - Can build and reuse snapshot images for deterministic setup.
 - Supports project-specific base image source from Docker tag, Dockerfile, or Docker context.
 - Applies permissive in-container defaults unless you explicitly override them with trailing agent args:
@@ -156,7 +156,7 @@ Key argument groups:
 
 Runtime image layering notes:
 
-- Provider runtime images are separate (`codex` vs `claude`), so a single image does not bundle both CLIs.
+- Provider runtime images are separate (`codex` vs `claude` vs `gemini`), so a single image does not bundle every CLI.
 - Project setup snapshots are built once and reused.
 - When launching from a setup snapshot, `agent_cli` builds a lightweight provider-specific overlay image on top of that snapshot when needed.
 - This ordering keeps large project setup layers shared and avoids duplicating disk usage per provider.

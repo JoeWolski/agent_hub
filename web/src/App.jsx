@@ -20,11 +20,13 @@ const THEME_STORAGE_KEY = "agent_hub_theme";
 const DEFAULT_AGENT_TYPE = "codex";
 const AGENT_TYPE_OPTIONS = [
   { value: "codex", label: "Codex" },
-  { value: "claude", label: "Claude" }
+  { value: "claude", label: "Claude" },
+  { value: "gemini", label: "Gemini CLI" }
 ];
 const START_MODEL_OPTIONS_BY_AGENT = {
   codex: ["default", "gpt-5.3-codex", "gpt-5.3-codex-spark"],
-  claude: ["default", "sonnet", "opus", "haiku"]
+  claude: ["default", "sonnet", "opus", "haiku"],
+  gemini: ["default"]
 };
 const REASONING_MODE_OPTIONS = ["default", "minimal", "low", "medium", "high", "xhigh"];
 

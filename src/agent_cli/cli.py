@@ -17,11 +17,13 @@ DEFAULT_BASE_IMAGE = "nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04"
 DEFAULT_SETUP_RUNTIME_IMAGE = "agent-ubuntu2204-setup:latest"
 DEFAULT_RUNTIME_IMAGE = "agent-ubuntu2204-codex:latest"
 CLAUDE_RUNTIME_IMAGE = "agent-ubuntu2204-claude:latest"
+GEMINI_RUNTIME_IMAGE = "agent-ubuntu2204-gemini:latest"
 DEFAULT_DOCKERFILE = "docker/agent_cli/Dockerfile"
 DEFAULT_AGENT_COMMAND = "codex"
 AGENT_PROVIDER_NONE = "none"
 AGENT_PROVIDER_CODEX = "codex"
 AGENT_PROVIDER_CLAUDE = "claude"
+AGENT_PROVIDER_GEMINI = "gemini"
 DEFAULT_CODEX_APPROVAL_POLICY = "never"
 DEFAULT_CODEX_SANDBOX_MODE = "danger-full-access"
 DEFAULT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
@@ -292,12 +294,16 @@ def _agent_provider_for_command(agent_command: str) -> str:
         return AGENT_PROVIDER_CODEX
     if command == "claude":
         return AGENT_PROVIDER_CLAUDE
+    if command == "gemini":
+        return AGENT_PROVIDER_GEMINI
     return AGENT_PROVIDER_NONE
 
 
 def _default_runtime_image_for_provider(agent_provider: str) -> str:
     if agent_provider == AGENT_PROVIDER_CLAUDE:
         return CLAUDE_RUNTIME_IMAGE
+    if agent_provider == AGENT_PROVIDER_GEMINI:
+        return GEMINI_RUNTIME_IMAGE
     if agent_provider == AGENT_PROVIDER_CODEX:
         return DEFAULT_RUNTIME_IMAGE
     return DEFAULT_SETUP_RUNTIME_IMAGE
@@ -419,7 +425,7 @@ def _resolve_base_image(
     "--agent-command",
     default=DEFAULT_AGENT_COMMAND,
     show_default=True,
-    help="Agent executable launched inside the container (for example codex or claude)",
+    help="Agent executable launched inside the container (for example codex, claude, or gemini)",
 )
 @click.option("--container-home", default=None, help="Container home path for mapped user")
 @click.option("--agent-home-path", default=None, help="Host path for persistent agent state")
@@ -579,10 +585,12 @@ def main(
     host_claude_dir = host_agent_home / ".claude"
     host_claude_json_file = host_agent_home / ".claude.json"
     host_claude_config_dir = host_agent_home / ".config" / "claude"
+    host_gemini_dir = host_agent_home / ".gemini"
     host_codex_dir.mkdir(parents=True, exist_ok=True)
     host_claude_dir.mkdir(parents=True, exist_ok=True)
     host_claude_json_file.touch(exist_ok=True)
     host_claude_config_dir.mkdir(parents=True, exist_ok=True)
+    host_gemini_dir.mkdir(parents=True, exist_ok=True)
     (host_agent_home / "projects").mkdir(parents=True, exist_ok=True)
     selected_agent_command = _normalize_agent_command(agent_command)
 
@@ -701,6 +709,8 @@ def main(
         "--volume",
         f"{host_claude_config_dir}:{container_home_path}/.config/claude",
         "--volume",
+        f"{host_gemini_dir}:{container_home_path}/.gemini",
+        "--volume",
         f"{config_path}:{container_home_path}/.codex/config.toml:ro",
         "--env",
         f"LOCAL_USER={user}",
@@ -814,7 +824,11 @@ def main(
             finally:
                 _docker_rm_force(container_name)
         runtime_image = snapshot_tag
-        if not prepare_snapshot_only and selected_agent_provider in {AGENT_PROVIDER_CODEX, AGENT_PROVIDER_CLAUDE}:
+        if not prepare_snapshot_only and selected_agent_provider in {
+            AGENT_PROVIDER_CODEX,
+            AGENT_PROVIDER_CLAUDE,
+            AGENT_PROVIDER_GEMINI,
+        }:
             provider_snapshot_runtime_image = _snapshot_runtime_image_for_provider(
                 snapshot_tag,
                 selected_agent_provider,

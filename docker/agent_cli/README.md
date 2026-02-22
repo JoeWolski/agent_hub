@@ -19,6 +19,12 @@ docker build \
   --build-arg AGENT_PROVIDER=claude \
   -t agent-ubuntu2204-claude:latest .
 
+# Gemini runtime
+docker build \
+  -f docker/agent_cli/Dockerfile \
+  --build-arg AGENT_PROVIDER=gemini \
+  -t agent-ubuntu2204-gemini:latest .
+
 # Setup-only runtime (no provider CLI install)
 docker build \
   -f docker/agent_cli/Dockerfile \
