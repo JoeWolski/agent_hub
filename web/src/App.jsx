@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import {
   MdArchive,
@@ -501,6 +502,33 @@ function hubEventsSocketUrl() {
   return `${protocol}://${window.location.host}/api/events`;
 }
 
+function openTerminalUrlInNewTab(event, rawUri) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+  const uri = String(rawUri || "").trim();
+  if (!uri) {
+    return;
+  }
+  let parsedUri;
+  try {
+    parsedUri = new URL(uri);
+  } catch {
+    return;
+  }
+  const protocol = parsedUri.protocol.toLowerCase();
+  if (protocol !== "http:" && protocol !== "https:") {
+    return;
+  }
+  const openedWindow = window.open(parsedUri.toString(), "_blank", "noopener,noreferrer");
+  if (openedWindow) {
+    try {
+      openedWindow.opener = null;
+    } catch {
+      // Ignore environments that reject opener mutation.
+    }
+  }
+}
+
 function ExpandIcon() {
   return (
     <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
@@ -598,6 +626,7 @@ function ChatTerminal({ chatId, running }) {
     });
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
+    terminal.loadAddon(new WebLinksAddon(openTerminalUrlInNewTab));
     terminal.open(hostRef.current);
     fitAddon.fit();
     terminal.focus();
