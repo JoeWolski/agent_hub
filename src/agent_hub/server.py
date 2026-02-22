@@ -3447,6 +3447,11 @@ class HubState:
         ]
         output: list[Path] = []
         seen: set[Path] = set()
+        for filename in ("AGENTS.md", "README.md", "README", "Makefile", "makefile"):
+            candidate = workspace / filename
+            if candidate.is_file() and candidate not in seen:
+                seen.add(candidate)
+                output.append(candidate)
         for root in preferred_roots:
             if not root.exists():
                 continue
@@ -3458,6 +3463,26 @@ class HubState:
                 seen.add(path)
                 output.append(path)
         return output
+
+    @staticmethod
+    def _make_target_context_weight(target: str, context: str) -> int:
+        score = 3
+        lowered_target = str(target or "").strip().lower()
+        lowered_context = str(context or "").strip().lower()
+        if not lowered_target:
+            return 0
+
+        if any(token in lowered_context for token in ("at a minimum", "minimum", "first", "before you can", "bootstrap")):
+            score += 6
+        if any(token in lowered_context for token in ("cross build", "cross-build", "host tools", "toolchain")):
+            score += 3
+        if any(token in lowered_context for token in ("run:", "steps:", "workflow", "pipeline", "ci")):
+            score += 2
+        if lowered_target in {"check", "test", "tests", "lint", "format", "clean"}:
+            score -= 3
+        if any(token in lowered_target for token in ("test", "lint", "format", "clean")):
+            score -= 2
+        return score
 
     def _infer_make_sh_target(self, workspace: Path) -> str:
         make_script = workspace / "make.sh"
@@ -3477,7 +3502,10 @@ class HubState:
                 target = str(match.group(1) or "").strip()
                 if not target or target.startswith("-"):
                     continue
-                counts[target] = counts.get(target, 0) + 1
+                context_start = max(0, match.start() - 120)
+                context_end = min(len(text), match.end() + 120)
+                context = text[context_start:context_end]
+                counts[target] = counts.get(target, 0) + self._make_target_context_weight(target, context)
 
         if counts:
             ranked = sorted(counts.items(), key=lambda item: (-item[1], len(item[0]), item[0]))
