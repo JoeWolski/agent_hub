@@ -29,3 +29,9 @@
 - Favor state-driven rendering over ad hoc DOM behavior.
 - Keep async flows cancellation-safe and shutdown-safe.
 - Validate changes with appropriate build/test checks before handoff.
+
+## Git safety
+
+- Never modify git history.
+- Never use `--force` with git commands.
+- Prefer forward-only commits and standard (non-force) pushes.
