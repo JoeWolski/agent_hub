@@ -22,6 +22,17 @@ Codex and Claude web apps are strong hosted experiences. Agent Hub is for cases 
 
 If you need strict runtime control and local data locality, this is a better fit than browser-only Codex/Claude workflows.
 
+## Hub Containers
+
+The existing `docker/Dockerfile` is the chat runtime image used by `agent_cli`.
+
+If you want to run the `agent_hub` server itself inside Docker, use the separate images in `docker/agent_hub/`:
+
+- `production`: container entrypoint runs `./bin/agent_hub`
+- `development`: adds demo/video tooling dependencies (`ffmpeg`, `xvfb`, `xdotool`, Playwright Firefox, etc.)
+
+Build/run instructions: `docker/agent_hub/README.md`
+
 ## Quickstart
 
 ### 1. `agent_cli` first (single session)

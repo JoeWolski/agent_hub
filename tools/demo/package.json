@@ -1,0 +1,16 @@
+{
+  "name": "agent-hub-demo-suite",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Two-phase frontend demo automation for Agent Hub",
+  "scripts": {
+    "plan": "node run_demo.mjs plan",
+    "validate": "node run_demo.mjs validate",
+    "record": "node run_demo.mjs record",
+    "all": "node run_demo.mjs all"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  }
+}
