@@ -2281,6 +2281,93 @@ class CliEnvVarTests(unittest.TestCase):
             codex_index = run_cmd.index("codex")
             self.assertIn("--no-alt-screen", run_cmd[codex_index + 1 :])
 
+    def test_resume_uses_shell_command_as_container_entry_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--resume",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            image_index = run_cmd.index(image_cli.DEFAULT_RUNTIME_IMAGE)
+            self.assertEqual(run_cmd[image_index + 1], "bash")
+            self.assertEqual(run_cmd[image_index + 2], "-lc")
+            resume_script = run_cmd[image_index + 3]
+            self.assertIn("codex resume --last", resume_script)
+            self.assertIn("exec codex", resume_script)
+
+    def test_resume_with_no_alt_screen_passes_flag_to_resume_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--resume",
+                        "--no-alt-screen",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            image_index = run_cmd.index(image_cli.DEFAULT_RUNTIME_IMAGE)
+            resume_script = run_cmd[image_index + 3]
+            self.assertIn("codex --no-alt-screen resume --last", resume_script)
+            self.assertIn("exec codex --no-alt-screen", resume_script)
+
     def test_cli_mounts_only_codex_dir_for_container_home_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

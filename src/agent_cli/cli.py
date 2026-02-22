@@ -16,7 +16,13 @@ DEFAULT_BASE_IMAGE = "nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04"
 DEFAULT_RUNTIME_IMAGE = "agent-ubuntu2204:latest"
 DEFAULT_DOCKERFILE = "docker/Dockerfile"
 DEFAULT_AGENT_COMMAND = "codex"
-RESUME_COMMAND = f"if {DEFAULT_AGENT_COMMAND} resume --last; then :; else exec {DEFAULT_AGENT_COMMAND}; fi"
+
+
+def _resume_shell_command(*, no_alt_screen: bool) -> str:
+    codex_command = DEFAULT_AGENT_COMMAND
+    if no_alt_screen:
+        codex_command = f"{codex_command} --no-alt-screen"
+    return f"if {codex_command} resume --last; then :; else exec {codex_command}; fi"
 
 
 def _repo_root() -> Path:
@@ -430,7 +436,7 @@ def main(
     if container_args:
         command.extend(container_args)
     elif resume:
-        command.extend(["bash", "-lc", RESUME_COMMAND])
+        command = ["bash", "-lc", _resume_shell_command(no_alt_screen=no_alt_screen)]
 
     run_args = [
         "--init",
