@@ -924,15 +924,10 @@ button:focus-visible {
   scrollbar-gutter: stable both-edges;
 }
 
-.chat-artifact-preview-group {
-  display: grid;
-  gap: 8px;
-}
-
 .chat-artifact-preview-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 8px;
   flex-wrap: wrap;
 }
