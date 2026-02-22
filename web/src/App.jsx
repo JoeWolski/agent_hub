@@ -2899,7 +2899,7 @@ function HubApp() {
                         )}
                       </div>
                     ) : (
-                      <div className="chat-artifact-list">
+                      <div className="chat-artifact-list chat-artifact-bubble-row">
                         {previewableCurrentArtifacts.map(({ artifact, index, artifactInfo }) =>
                           renderArtifactBubble(artifact, `current-preview-bubble-${index}`, artifactInfo)
                         )}
