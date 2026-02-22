@@ -1,14 +1,16 @@
 # syntax=docker/dockerfile:1.7
 
-ARG PYTHON_IMAGE=python:3.11-slim-bookworm
-FROM ${PYTHON_IMAGE}
+ARG UV_DISTROLESS_IMAGE=ghcr.io/astral-sh/uv:latest
+FROM ${UV_DISTROLESS_IMAGE} AS uv_distroless
+
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    PATH=/opt/agent_hub/.venv/bin:/root/.local/bin:${PATH}
+    PATH=/opt/agent_hub/.venv/bin:/usr/local/bin:${PATH}
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -20,19 +22,23 @@ RUN apt-get update \
     git \
     jq \
     openssh-client \
+    python-is-python3 \
+    python3 \
+    python3-pip \
+    python3-venv \
     tini \
     xauth \
     xdotool \
     xvfb \
  && rm -rf /var/lib/apt/lists/*
 
+COPY --from=uv_distroless /uv /uvx /usr/local/bin/
+
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get update \
  && apt-get install -y --no-install-recommends nodejs \
  && npm cache clean --force \
  && rm -rf /var/lib/apt/lists/*
-
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 RUN if ! command -v corepack >/dev/null 2>&1; then npm install -g corepack@0.31.0; fi \
  && corepack enable
