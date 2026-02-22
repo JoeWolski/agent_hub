@@ -24,8 +24,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && case "${AGENT_PROVIDER}" in \
       codex) npm install -g @openai/codex ;; \
-      claude) curl -fsSL https://claude.ai/install.sh | bash \
-              && cp -L /root/.local/bin/claude /usr/local/bin/claude ;; \
+      claude) install_home=/tmp/claude-install-home \
+              && rm -rf "${install_home}" \
+              && mkdir -p "${install_home}" \
+              && curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
+              && HOME="${install_home}" XDG_CONFIG_HOME="${install_home}/.config" bash /tmp/claude-install.sh \
+              && cp -L "${install_home}/.local/bin/claude" /usr/local/bin/claude \
+              && rm -f /tmp/claude-install.sh \
+              && rm -rf "${install_home}" ;; \
       gemini) npm install -g @google/gemini-cli ;; \
       none) echo "Skipping agent CLI install for setup image." ;; \
       *) echo "Unsupported AGENT_PROVIDER='${AGENT_PROVIDER}'" >&2; exit 1 ;; \
