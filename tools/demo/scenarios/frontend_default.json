@@ -1,0 +1,56 @@
+{
+  "id": "agent_hub_frontend_default",
+  "title": "Agent Hub Frontend Default Demo",
+  "description": "Create a project, launch two chats, type instruction, publish fake artifacts, and open video preview.",
+  "timing_ms": {
+    "after_page_load_ms": 900,
+    "after_add_project_click_ms": 500,
+    "after_build_ready_ms": 1000,
+    "after_first_chat_start_ms": 900,
+    "after_second_chat_start_ms": 1000,
+    "before_terminal_typing_ms": 700,
+    "typing_char_delay_ms": 24,
+    "after_instruction_submit_ms": 1300,
+    "after_artifacts_publish_ms": 1200,
+    "hold_video_preview_ms": 5000,
+    "mouse_move_duration_ms": 360
+  },
+  "steps": [
+    {
+      "action": "open_ui",
+      "label": "Open Agent Hub UI"
+    },
+    {
+      "action": "create_project",
+      "label": "Create project"
+    },
+    {
+      "action": "wait_project_ready",
+      "label": "Wait for project image to become ready"
+    },
+    {
+      "action": "start_first_chat",
+      "label": "Start first chat from project card"
+    },
+    {
+      "action": "start_second_chat",
+      "label": "Open Chats tab and start second chat"
+    },
+    {
+      "action": "focus_first_chat_terminal",
+      "label": "Focus first chat terminal"
+    },
+    {
+      "action": "type_instruction",
+      "label": "Type scripted instruction into terminal"
+    },
+    {
+      "action": "publish_fake_artifacts",
+      "label": "Publish fake image/view/video artifacts"
+    },
+    {
+      "action": "open_fake_video_preview",
+      "label": "Open fake video preview modal"
+    }
+  ]
+}
