@@ -1499,6 +1499,7 @@ button:focus-visible {
   margin: 0;
   padding: var(--space-2) 0 0;
   border-top: 0;
+  border-bottom: 0;
 }
 
 .chat-groups > .project-chat-group > .stack.compact {
