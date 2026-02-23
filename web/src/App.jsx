@@ -1521,7 +1521,7 @@ function HubApp() {
         id: session.ui_id,
         server_chat_id: serverId,
         name: "new-chat",
-        display_name: "New chat",
+        display_name: "New Chat",
         display_subtitle: "Creating workspace and starting worker…",
         status: "starting",
         is_running: false,
@@ -2791,6 +2791,12 @@ function HubApp() {
     }
   }
 
+  function openOpenAiLoginHelper() {
+    setOpenAiCardExpansionInitialized(true);
+    setOpenAiCardExpanded(true);
+    setActiveTab("settings");
+  }
+
   function renderChatCard(chat) {
     const resolvedChatId = resolveServerChatId(chat);
     const chatHasServer = hasServerChat(chat);
@@ -3567,6 +3573,14 @@ function HubApp() {
           </section>
         ) : activeTab === "chats" ? (
           <section className="panel chats-panel">
+            {!openAiOverallConnected ? (
+              <div className="meta chats-openai-helper">
+                Need account auth for Codex in Docker or remote sessions?{" "}
+                <button type="button" className="inline-link-button" onClick={openOpenAiLoginHelper}>
+                  OpenAI account login helper
+                </button>
+              </div>
+            ) : null}
             <div className="stack chat-groups">
               {hubState.projects.length === 0 ? <div className="empty">No projects yet.</div> : null}
               {hubState.projects.map((project) => {
