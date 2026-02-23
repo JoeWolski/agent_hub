@@ -2025,6 +2025,7 @@ function HubApp() {
     }));
     return [...pendingRows, ...(hubState.projects || [])];
   }, [hubState.projects, pendingAutoConfigProjects]);
+  const createProjectManualMode = shouldShowManualProjectConfigInputs(createProjectConfigMode);
 
   function updateCreateForm(patch) {
     setCreateForm((prev) => ({ ...prev, ...patch }));
@@ -3528,31 +3529,38 @@ function HubApp() {
                     placeholder="git@github.com:org/repo.git or https://..."
                   />
                   <div className="create-project-config-mode">
-                    <div className="label create-project-config-mode-label">Config mode</div>
-                    <div className="create-project-config-mode-toggle" role="group" aria-label="Project config mode">
-                      <button
-                        type="button"
-                        className={`create-project-config-mode-button ${
-                          !shouldShowManualProjectConfigInputs(createProjectConfigMode) ? "active" : ""
-                        }`}
-                        aria-pressed={!shouldShowManualProjectConfigInputs(createProjectConfigMode)}
-                        onClick={() => setCreateProjectConfigMode("auto")}
-                      >
-                        Auto
-                      </button>
-                      <button
-                        type="button"
-                        className={`create-project-config-mode-button ${
-                          shouldShowManualProjectConfigInputs(createProjectConfigMode) ? "active" : ""
-                        }`}
-                        aria-pressed={shouldShowManualProjectConfigInputs(createProjectConfigMode)}
-                        onClick={() => setCreateProjectConfigMode("manual")}
-                      >
-                        Manual
-                      </button>
+                    <div className="create-project-config-mode-inline">
+                      <span className="create-project-config-mode-title" id="create-project-config-mode-label">
+                        Config mode
+                      </span>
+                      <div className="create-project-config-mode-control">
+                        <span
+                          className={`create-project-config-mode-option ${!createProjectManualMode ? "active" : ""}`}
+                          aria-hidden="true"
+                        >
+                          Auto
+                        </span>
+                        <button
+                          type="button"
+                          className={`create-project-config-switch ${createProjectManualMode ? "manual" : "auto"}`}
+                          role="switch"
+                          aria-checked={createProjectManualMode}
+                          aria-labelledby="create-project-config-mode-label"
+                          onClick={() => setCreateProjectConfigMode(createProjectManualMode ? "auto" : "manual")}
+                        >
+                          <span className="create-project-config-switch-track" aria-hidden="true" />
+                          <span className="create-project-config-switch-thumb" aria-hidden="true" />
+                        </button>
+                        <span
+                          className={`create-project-config-mode-option ${createProjectManualMode ? "active" : ""}`}
+                          aria-hidden="true"
+                        >
+                          Manual
+                        </span>
+                      </div>
                     </div>
                   </div>
-                  {shouldShowManualProjectConfigInputs(createProjectConfigMode) ? (
+                  {createProjectManualMode ? (
                     <>
                       <div className="row two">
                         <input
@@ -3596,11 +3604,7 @@ function HubApp() {
                       <div className="label">Default environment variables for new chats</div>
                       <EnvVarEditor rows={createForm.defaultEnvVars} onChange={(rows) => updateCreateForm({ defaultEnvVars: rows })} />
                     </>
-                  ) : (
-                    <div className="meta">
-                      Auto mode uses repository analysis to infer setup script, image mode, mounts, and environment defaults.
-                    </div>
-                  )}
+                  ) : null}
 
                   <button type="submit" className="btn-primary create-project-submit-button">
                     Add project

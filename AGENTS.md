@@ -8,6 +8,8 @@
 ## Design practices
 
 - Prefer responsive, optimistic UI behavior.
+- When users request images of UI/UX elements, capture screenshots from the real running application and real backend flow. Do not provide mockups or mocked-backend renderings unless the user explicitly asks for a mock.
+- Any PR that includes UI/UX behavior or layout changes must include image evidence for all changed states against the real backend. Do not consider a UI/UX PR complete until this evidence is attached to the PR.
 - Show immediate feedback on user actions; do not wait for long async operations before updating UI state.
 - Keep layout geometry stable during state transitions to avoid cursor-jump behavior.
 - Keep action controls spatially consistent; toggled states should not move controls unexpectedly.
@@ -35,6 +37,28 @@
 - Keep async flows cancellation-safe and shutdown-safe.
 - Validate changes with appropriate build/test checks before handoff.
 - When updating, fixing, or adding features for a specific agent, verify the changes do not break or degrade behavior for any other supported agent.
+
+## UI Evidence Workflow
+
+- Never commit screenshot files to the repository. Keep UI evidence files untracked and attach them to the PR.
+- For UI/UX PRs, capture every state changed by the PR (for example: default, toggled, loading, success, error, empty, and responsive/mobile variants when relevant).
+- Prefer JPG/JPEG for PR UI evidence uploads to reduce file size and improve review loading speed. Use PNG only when PNG is required (for example transparency or lossless detail checks).
+- In the development Docker image, use Playwright Firefox for UI evidence capture (`firefox` browser type). This is the browser runtime expected to be available in-container by default.
+- Prefer Playwright scripts that explicitly launch Firefox (`const { firefox } = await import("playwright");`) when generating PR screenshots from the real app.
+- If browser/runtime availability changes in `docker/development/Dockerfile` (or any image layer it depends on), update this `UI Evidence Workflow` section in the same PR so the documented screenshot browser instructions remain accurate.
+- Treat any change that can alter rendered UI output (for example CSS, spacing/alignment, typography, colors, component structure, visibility conditions, state labels/text, or responsive behavior) as requiring refreshed UI evidence.
+- After each commit or force-push that includes any UI-rendering change, regenerate and replace PR UI images before handoff, even if the visual change seems small.
+- Whenever a PR is updated, explicitly re-check whether existing UI/UX demo images are still accurate for the latest commit. If anything changed visually, regenerate and replace the images in the PR.
+- UI/UX images in the PR body must always reflect the most up-to-date UI state for the current PR head commit. Remove or replace stale images immediately.
+- Use this exact workflow so image generation is deterministic and does not require rediscovery:
+- 1. Install browser tooling: `cd tools/demo && npm ci`
+- 2. Start real app server in one terminal: `UV_PROJECT_ENVIRONMENT=.venv-local uv run agent_hub --host 127.0.0.1 --port 8876 --data-dir /tmp/agent-hub-ui-evidence --frontend-build`
+- 3. Capture screenshots in another terminal using Playwright against `http://127.0.0.1:8876` (real backend) and save to `.agent-artifacts/` (or `/tmp/agent-hub-ui-evidence/`). Prefer `type: "jpeg"`/`.jpg` outputs unless PNG is explicitly needed.
+- 4. For PR body image rendering on `github.com`, use publicly reachable image URLs. Do not use local-only links such as `/api/chats/.../artifacts/...` in PR markdown.
+- 5. Programmatic upload path for public URLs (CLI-safe): `curl -fsS -F "file=@<image-path>" https://tmpfiles.org/api/v1/upload` and use the returned URL converted from `https://tmpfiles.org/<id>/<name>` to `https://tmpfiles.org/dl/<id>/<name>`.
+- 6. Update the PR body with a `## UI/UX Demo` section containing Markdown image links (`![alt](https://...)`) using `gh api repos/<owner>/<repo>/pulls/<pr-number> -X PATCH --raw-field body=\"$(cat <body-file>)\"`.
+- 7. If using GitHub web manually, drag/drop uploads in the PR editor are allowed, but the resulting images still must appear in the PR body.
+- In the PR Validation section, list the exact commands used for server start, screenshot capture, public URL upload, and PR body update, with pass/fail status.
 
 ## Git safety
 
