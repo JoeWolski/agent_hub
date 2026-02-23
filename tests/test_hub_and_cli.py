@@ -5545,6 +5545,40 @@ class DockerEntrypointTests(unittest.TestCase):
                 self.assertEqual(os.environ.get("GH_TOKEN"), "ghp_enterprise_token")
                 self.assertEqual(os.environ.get("GH_HOST"), "github.enterprise.local")
 
+    def test_ensure_claude_native_command_path_creates_home_symlink(self) -> None:
+        module = self._load_entrypoint_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home_path = tmp_path / "home"
+            source_path = tmp_path / "bin" / "claude"
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            source_path.chmod(0o755)
+
+            module._ensure_claude_native_command_path(
+                command=["claude", "--help"],
+                home=str(home_path),
+                source_path=source_path,
+            )
+
+            target_path = home_path / ".local" / "bin" / "claude"
+            self.assertTrue(target_path.is_symlink())
+            self.assertEqual(target_path.resolve(), source_path.resolve())
+
+    def test_ensure_claude_native_command_path_fails_when_source_missing(self) -> None:
+        module = self._load_entrypoint_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home_path = tmp_path / "home"
+            missing_source = tmp_path / "missing" / "claude"
+
+            with self.assertRaisesRegex(RuntimeError, "source command is missing or not executable"):
+                module._ensure_claude_native_command_path(
+                    command=["claude"],
+                    home=str(home_path),
+                    source_path=missing_source,
+                )
+
     def test_entrypoint_main_execs_default_codex_command(self) -> None:
         module = self._load_entrypoint_module()
         with patch.dict(
@@ -5592,6 +5626,33 @@ class DockerEntrypointTests(unittest.TestCase):
 
         self.assertEqual(observed_home, "/tmp/entrypoint-local-home")
         execvp.assert_called_once_with("bash", ["bash", "-lc", "echo ok"])
+
+    def test_entrypoint_main_bootstraps_claude_native_command_path(self) -> None:
+        module = self._load_entrypoint_module()
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": "/tmp/entrypoint-home",
+                "LOCAL_UMASK": "0022",
+            },
+            clear=False,
+        ), patch.object(module.sys, "argv", ["docker-entrypoint.py", "claude", "--help"]), patch.object(
+            module, "_ensure_claude_native_command_path", return_value=None
+        ) as ensure_claude_native_path, patch.object(
+            module, "_prepare_git_credentials", return_value=None
+        ), patch.object(
+            module, "_configure_git_identity", return_value=None
+        ), patch.object(
+            module.os, "execvp", side_effect=SystemExit(0)
+        ) as execvp:
+            with self.assertRaises(SystemExit):
+                module._entrypoint_main()
+
+        ensure_claude_native_path.assert_called_once_with(
+            command=["claude", "--help"],
+            home="/tmp/entrypoint-home",
+        )
+        execvp.assert_called_once_with("claude", ["claude", "--help"])
 
 
 if __name__ == "__main__":
