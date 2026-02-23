@@ -36,6 +36,7 @@
 - Favor state-driven rendering over ad hoc DOM behavior.
 - Keep async flows cancellation-safe and shutdown-safe.
 - Validate changes with appropriate build/test checks before handoff.
+- All pull requests must pass all unit tests. Failing or timing-out unit tests are not acceptable; the root cause must be understood, presented to the user, and fixed.
 - Time every new individual test in isolation.
 - If any new individual test takes longer than 1 second, fix it before merge.
 - Long or hanging unit tests are not acceptable.
