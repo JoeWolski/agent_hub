@@ -1,5 +1,10 @@
 # AGENTS.md
 
+## Core instructions
+
+- In this repository, "core instructions" refers to `SYSTEM_PROMPT.md`.
+- Treat `SYSTEM_PROMPT.md` as the authoritative shared system prompt source across all agents.
+
 ## Design practices
 
 - Prefer responsive, optimistic UI behavior.

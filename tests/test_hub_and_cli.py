@@ -1296,6 +1296,9 @@ class HubStateTests(unittest.TestCase):
             f"AGENT_HUB_ARTIFACTS_URL=http://172.17.0.4:8765/hub/api/chats/{chat['id']}/artifacts/publish",
             captured["cmd"],
         )
+        self.assertIn("--system-prompt-file", captured["cmd"])
+        system_prompt_index = captured["cmd"].index("--system-prompt-file")
+        self.assertEqual(captured["cmd"][system_prompt_index + 1], str(self.state.system_prompt_file))
 
     def test_hub_state_rejects_invalid_artifact_publish_base_url(self) -> None:
         with self.assertRaises(ValueError):
@@ -1782,6 +1785,9 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(cmd[container_name_index + 1], "repo")
         self.assertIn("--agent-home-path", cmd)
         self.assertIn(str(self.state.host_agent_home), cmd)
+        self.assertIn("--system-prompt-file", cmd)
+        prompt_index = cmd.index("--system-prompt-file")
+        self.assertEqual(cmd[prompt_index + 1], str(self.state.system_prompt_file))
         self.assertIn("--credentials-file", cmd)
         self.assertIn(str(self.state.openai_credentials_file), cmd)
         self.assertIn("--git-credential-file", cmd)
@@ -3686,20 +3692,23 @@ class CliEnvVarTests(unittest.TestCase):
 
             self.assertIn("not a file", str(ctx.exception))
 
-    def test_default_config_uses_developer_instructions_for_file_artifacts(self) -> None:
+    def test_default_system_prompt_file_contains_core_file_artifact_instructions(self) -> None:
         config_path = ROOT / "config" / "agent.config.toml"
+        system_prompt_path = ROOT / "SYSTEM_PROMPT.md"
         content = config_path.read_text(encoding="utf-8")
+        prompt_content = system_prompt_path.read_text(encoding="utf-8")
 
-        self.assertIn("\ndeveloper_instructions = \"\"\"\n", content)
+        self.assertNotIn("\ndeveloper_instructions = \"\"\"\n", content)
         self.assertNotIn("\ninstructions = \"\"\"\n", content)
-        self.assertIn("hub_artifact publish <path> [<path> ...]", content)
-        self.assertIn("If the user asks for a file", content)
+        self.assertIn("SYSTEM_PROMPT.md", content)
+        self.assertIn("hub_artifact publish <path> [<path> ...]", prompt_content)
+        self.assertIn("If the user asks for a file", prompt_content)
         self.assertIn(
             "Do not introduce fallback implementation paths unless the user explicitly requests fallback behavior",
-            content,
+            prompt_content,
         )
-        self.assertIn("When a requested implementation fails, fail fast with a hard error.", content)
-        self.assertIn("Do not swallow, mask, or ignore errors with permissive operators", content)
+        self.assertIn("When a requested implementation fails, fail fast with a hard error.", prompt_content)
+        self.assertIn("Do not swallow, mask, or ignore errors with permissive operators", prompt_content)
 
     def test_parse_env_var_valid(self) -> None:
         self.assertEqual(image_cli._parse_env_var("FOO=bar", "--env-var"), "FOO=bar")
@@ -3951,11 +3960,66 @@ class CliEnvVarTests(unittest.TestCase):
             assert run_cmd is not None
             self.assertIn("codex", run_cmd)
             codex_index = run_cmd.index("codex")
-            self.assertIn("--ask-for-approval", run_cmd[codex_index + 1 :])
-            self.assertIn("never", run_cmd[codex_index + 1 :])
-            self.assertIn("--sandbox", run_cmd[codex_index + 1 :])
-            self.assertIn("danger-full-access", run_cmd[codex_index + 1 :])
-            self.assertIn("--no-alt-screen", run_cmd[codex_index + 1 :])
+            codex_args = run_cmd[codex_index + 1 :]
+            self.assertIn("--ask-for-approval", codex_args)
+            self.assertIn("never", codex_args)
+            self.assertIn("--sandbox", codex_args)
+            self.assertIn("danger-full-access", codex_args)
+            self.assertIn("--config", codex_args)
+            config_index = codex_args.index("--config")
+            self.assertGreater(len(codex_args), config_index + 1)
+            self.assertTrue(codex_args[config_index + 1].startswith("developer_instructions="))
+            self.assertIn("--no-alt-screen", codex_args)
+
+    def test_codex_runtime_does_not_duplicate_explicit_developer_instructions_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--",
+                        "--config",
+                        "developer_instructions='manual prompt override'",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            codex_index = run_cmd.index("codex")
+            codex_args = run_cmd[codex_index + 1 :]
+            assignments = [
+                codex_args[index + 1]
+                for index, arg in enumerate(codex_args[:-1])
+                if arg in {"--config", "-c"}
+            ]
+            developer_assignments = [item for item in assignments if item.startswith("developer_instructions=")]
+            self.assertEqual(len(developer_assignments), 1)
+            self.assertEqual(developer_assignments[0], "developer_instructions='manual prompt override'")
 
     def test_claude_agent_command_uses_claude_runtime_image(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4001,19 +4065,23 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("--permission-mode", run_cmd[image_index + 2 :])
             self.assertIn("bypassPermissions", run_cmd[image_index + 2 :])
 
-    def test_claude_runtime_appends_shared_prompt_context_from_config(self) -> None:
+    def test_claude_runtime_appends_shared_prompt_context_from_system_prompt_file_and_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
+            system_prompt = tmp_path / "SYSTEM_PROMPT.md"
             config.write_text(
                 "model = 'test'\n"
                 "project_doc_auto_load = true\n"
                 "project_doc_fallback_filenames = ['AGENTS.md', 'README.md']\n"
                 "project_doc_auto_load_extra_filenames = ['docs/agent-setup.md']\n"
-                "project_doc_max_bytes = 4096\n"
-                "developer_instructions = '''Always run deterministic integration tests before final output.'''\n",
+                "project_doc_max_bytes = 4096\n",
+                encoding="utf-8",
+            )
+            system_prompt.write_text(
+                "Always run deterministic integration tests before final output.\n",
                 encoding="utf-8",
             )
 
@@ -4038,6 +4106,8 @@ class CliEnvVarTests(unittest.TestCase):
                         str(project),
                         "--config-file",
                         str(config),
+                        "--system-prompt-file",
+                        str(system_prompt),
                         "--agent-command",
                         "claude",
                     ],
@@ -4065,13 +4135,14 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
+            system_prompt = tmp_path / "SYSTEM_PROMPT.md"
             config.write_text(
                 "model = 'test'\n"
                 "project_doc_auto_load = true\n"
-                "project_doc_fallback_filenames = ['AGENTS.md']\n"
-                "developer_instructions = '''Shared instructions from config.'''\n",
+                "project_doc_fallback_filenames = ['AGENTS.md']\n",
                 encoding="utf-8",
             )
+            system_prompt.write_text("Shared instructions from system prompt file.\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -4094,6 +4165,8 @@ class CliEnvVarTests(unittest.TestCase):
                         str(project),
                         "--config-file",
                         str(config),
+                        "--system-prompt-file",
+                        str(system_prompt),
                         "--agent-command",
                         "claude",
                         "--",
@@ -4204,13 +4277,14 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("default", gemini_args)
             self.assertNotIn("yolo", gemini_args)
 
-    def test_gemini_runtime_syncs_shared_prompt_context_from_config(self) -> None:
+    def test_gemini_runtime_syncs_shared_prompt_context_from_system_prompt_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             agent_home = tmp_path / "agent-home"
             gemini_context_file = agent_home / ".gemini" / "GEMINI.md"
+            system_prompt = tmp_path / "SYSTEM_PROMPT.md"
             gemini_context_file.parent.mkdir(parents=True, exist_ok=True)
             gemini_context_file.write_text(
                 "\n".join(
@@ -4231,8 +4305,11 @@ class CliEnvVarTests(unittest.TestCase):
                 "project_doc_auto_load = true\n"
                 "project_doc_fallback_filenames = ['AGENTS.md', 'README.md']\n"
                 "project_doc_auto_load_extra_filenames = ['docs/agent-setup.md']\n"
-                "project_doc_max_bytes = 4096\n"
-                "developer_instructions = '''Always run deterministic integration tests before final output.'''\n",
+                "project_doc_max_bytes = 4096\n",
+                encoding="utf-8",
+            )
+            system_prompt.write_text(
+                "Always run deterministic integration tests before final output.\n",
                 encoding="utf-8",
             )
 
@@ -4257,6 +4334,8 @@ class CliEnvVarTests(unittest.TestCase):
                         str(project),
                         "--config-file",
                         str(config),
+                        "--system-prompt-file",
+                        str(system_prompt),
                         "--agent-home-path",
                         str(agent_home),
                         "--agent-command",
@@ -4527,8 +4606,10 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertEqual(run_cmd[image_index + 1], "bash")
             self.assertEqual(run_cmd[image_index + 2], "-lc")
             resume_script = run_cmd[image_index + 3]
-            self.assertIn("codex --ask-for-approval never --sandbox danger-full-access resume --last", resume_script)
-            self.assertIn("exec codex --ask-for-approval never --sandbox danger-full-access", resume_script)
+            self.assertIn("codex --ask-for-approval never --sandbox danger-full-access --config", resume_script)
+            self.assertIn("developer_instructions=", resume_script)
+            self.assertIn("resume --last", resume_script)
+            self.assertIn("exec codex --ask-for-approval never --sandbox danger-full-access --config", resume_script)
 
     def test_resume_with_no_alt_screen_passes_flag_to_resume_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4570,14 +4651,10 @@ class CliEnvVarTests(unittest.TestCase):
             assert run_cmd is not None
             image_index = run_cmd.index(image_cli.DEFAULT_RUNTIME_IMAGE)
             resume_script = run_cmd[image_index + 3]
-            self.assertIn(
-                "codex --ask-for-approval never --sandbox danger-full-access --no-alt-screen resume --last",
-                resume_script,
-            )
-            self.assertIn(
-                "exec codex --ask-for-approval never --sandbox danger-full-access --no-alt-screen",
-                resume_script,
-            )
+            self.assertIn("codex --ask-for-approval never --sandbox danger-full-access --config", resume_script)
+            self.assertIn("--no-alt-screen resume --last", resume_script)
+            self.assertIn("developer_instructions=", resume_script)
+            self.assertIn("exec codex --ask-for-approval never --sandbox danger-full-access --config", resume_script)
 
     def test_resume_rejects_non_codex_agent_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

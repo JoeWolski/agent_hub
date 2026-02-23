@@ -58,6 +58,7 @@ GITHUB_APP_WEB_BASE_URL_ENV = "AGENT_HUB_GITHUB_WEB_BASE_URL"
 GITHUB_APP_API_BASE_URL_ENV = "AGENT_HUB_GITHUB_API_BASE_URL"
 GITHUB_APP_DEFAULT_WEB_BASE_URL = "https://github.com"
 GITHUB_APP_DEFAULT_API_BASE_URL = "https://api.github.com"
+SYSTEM_PROMPT_FILE_NAME = "SYSTEM_PROMPT.md"
 GITHUB_APP_JWT_LIFETIME_SECONDS = 9 * 60
 GITHUB_APP_TOKEN_REFRESH_SKEW_SECONDS = 120
 GITHUB_APP_API_TIMEOUT_SECONDS = 8.0
@@ -400,6 +401,18 @@ def _default_config_file() -> Path:
         return fallback
 
     return config_file
+
+
+def _default_system_prompt_file() -> Path:
+    system_prompt_file = _repo_root() / SYSTEM_PROMPT_FILE_NAME
+    if system_prompt_file.exists():
+        return system_prompt_file
+
+    fallback = Path.cwd() / SYSTEM_PROMPT_FILE_NAME
+    if fallback.exists():
+        return fallback
+
+    return system_prompt_file
 
 
 def _frontend_dist_dir() -> Path:
@@ -2514,6 +2527,7 @@ class HubState:
         self,
         data_dir: Path,
         config_file: Path,
+        system_prompt_file: Path | None = None,
         hub_host: str = DEFAULT_HOST,
         hub_port: int = DEFAULT_PORT,
         artifact_publish_base_url: str | None = None,
@@ -2529,6 +2543,7 @@ class HubState:
 
         self.data_dir = data_dir
         self.config_file = config_file
+        self.system_prompt_file = Path(system_prompt_file or _default_system_prompt_file())
         self.hub_host = str(hub_host or DEFAULT_HOST)
         self.hub_port = int(hub_port or DEFAULT_PORT)
         self.artifact_publish_base_url = _resolve_artifact_publish_base_url(
@@ -6443,6 +6458,8 @@ class HubState:
             str(self.host_agent_home),
             "--config-file",
             str(self.config_file),
+            "--system-prompt-file",
+            str(self.system_prompt_file),
             "--no-alt-screen",
         ]
         repo_url = str(project.get("repo_url") or "")
@@ -6683,6 +6700,8 @@ class HubState:
             str(self.host_agent_home),
             "--config-file",
             str(self.config_file),
+            "--system-prompt-file",
+            str(self.system_prompt_file),
             "--no-alt-screen",
         ]
         repo_url = str(project.get("repo_url") or "")
@@ -7435,6 +7454,13 @@ def _html_page() -> str:
 @click.command(help="Run the local agent hub.")
 @click.option("--data-dir", default=str(_default_data_dir()), show_default=True, type=click.Path(file_okay=False, path_type=Path), help="Directory for hub state and chat workspaces.")
 @click.option("--config-file", default=str(_default_config_file()), show_default=True, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Agent config file to pass into every chat.")
+@click.option(
+    "--system-prompt-file",
+    default=str(_default_system_prompt_file()),
+    show_default=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Core system prompt markdown file to apply across all chat agents.",
+)
 @click.option("--host", default=DEFAULT_HOST, show_default=True)
 @click.option("--port", default=DEFAULT_PORT, show_default=True, type=int)
 @click.option(
@@ -7456,6 +7482,7 @@ def _html_page() -> str:
 def main(
     data_dir: Path,
     config_file: Path,
+    system_prompt_file: Path,
     host: str,
     port: int,
     artifact_publish_base_url: str,
@@ -7469,6 +7496,8 @@ def main(
     LOGGER.info("Starting Agent Hub host=%s port=%s log_level=%s reload=%s", host, port, normalized_log_level, reload)
     if _default_config_file() and not Path(config_file).exists():
         raise click.ClickException(f"Missing config file: {config_file}")
+    if _default_system_prompt_file() and not Path(system_prompt_file).exists():
+        raise click.ClickException(f"Missing system prompt file: {system_prompt_file}")
     if frontend_build:
         _ensure_frontend_built(data_dir)
 
@@ -7476,6 +7505,7 @@ def main(
         state = HubState(
             data_dir=data_dir,
             config_file=config_file,
+            system_prompt_file=system_prompt_file,
             hub_host=host,
             hub_port=port,
             artifact_publish_base_url=artifact_publish_base_url,
