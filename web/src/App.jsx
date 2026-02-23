@@ -2,7 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
+import { Actions, Layout, Model } from "flexlayout-react";
 import { isChatStarting, reconcilePendingChatStarts, reconcilePendingSessions } from "./chatPendingState";
+import {
+  chatLayoutEngineOptions,
+  CHAT_LAYOUT_ENGINE_CLASSIC,
+  CHAT_LAYOUT_ENGINE_FLEXLAYOUT,
+  DEFAULT_CHAT_LAYOUT_ENGINE,
+  normalizeChatLayoutEngine
+} from "./chatLayoutEngines";
 import {
   isAutoCreateProjectConfigMode,
   normalizeCreateProjectConfigMode,
@@ -27,7 +35,10 @@ const THEME_STORAGE_KEY = "agent_hub_theme";
 const CREATE_PROJECT_CONFIG_MODE_STORAGE_KEY = "agent_hub_project_config_mode";
 const DEFAULT_BASE_IMAGE_TAG = "ubuntu:24.04";
 const DEFAULT_AGENT_TYPE = "codex";
-const DEFAULT_HUB_SETTINGS = { defaultAgentType: DEFAULT_AGENT_TYPE };
+const DEFAULT_HUB_SETTINGS = {
+  defaultAgentType: DEFAULT_AGENT_TYPE,
+  chatLayoutEngine: DEFAULT_CHAT_LAYOUT_ENGINE
+};
 const DEFAULT_AGENT_CAPABILITIES = {
   version: 1,
   updatedAt: "",
@@ -68,7 +79,10 @@ function normalizeHubStatePayload(rawPayload) {
     chats: Array.isArray(rawPayload?.chats) ? rawPayload.chats : [],
     settings: rawPayload?.settings && typeof rawPayload.settings === "object"
       ? rawPayload.settings
-      : { default_agent_type: DEFAULT_HUB_SETTINGS.defaultAgentType }
+      : {
+        default_agent_type: DEFAULT_HUB_SETTINGS.defaultAgentType,
+        chat_layout_engine: DEFAULT_HUB_SETTINGS.chatLayoutEngine
+      }
   };
 }
 
@@ -106,7 +120,8 @@ function normalizeAgentType(value, capabilities = DEFAULT_AGENT_CAPABILITIES) {
 
 function normalizeHubSettings(rawSettings, capabilities = DEFAULT_AGENT_CAPABILITIES) {
   return {
-    defaultAgentType: normalizeAgentType(rawSettings?.defaultAgentType || rawSettings?.default_agent_type, capabilities)
+    defaultAgentType: normalizeAgentType(rawSettings?.defaultAgentType || rawSettings?.default_agent_type, capabilities),
+    chatLayoutEngine: normalizeChatLayoutEngine(rawSettings?.chatLayoutEngine || rawSettings?.chat_layout_engine)
   };
 }
 
@@ -237,6 +252,17 @@ function normalizeThemePreference(value) {
     return normalized;
   }
   return "system";
+}
+
+function resolveEffectiveTheme(preference) {
+  const normalized = normalizeThemePreference(preference);
+  if (normalized === "light" || normalized === "dark") {
+    return normalized;
+  }
+  if (typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+    return "dark";
+  }
+  return "light";
 }
 
 function loadThemePreference() {
@@ -1495,6 +1521,8 @@ function HubApp() {
   const [pendingContainerRefreshes, setPendingContainerRefreshes] = useState({});
   const [themePreference, setThemePreference] = useState(() => loadThemePreference());
   const [defaultAgentSettingSaving, setDefaultAgentSettingSaving] = useState(false);
+  const [chatLayoutEngineSettingSaving, setChatLayoutEngineSettingSaving] = useState(false);
+  const [chatFlexLayoutActiveTabId, setChatFlexLayoutActiveTabId] = useState("");
   const [openAiProviderStatus, setOpenAiProviderStatus] = useState(() =>
     normalizeOpenAiProviderStatus(null)
   );
@@ -2173,6 +2201,7 @@ function HubApp() {
     }
     return [{ value: DEFAULT_HUB_SETTINGS.defaultAgentType, label: "Codex" }];
   }, [agentCapabilities]);
+  const settingsChatLayoutEngineOptions = useMemo(() => chatLayoutEngineOptions(), []);
   const createProjectManualMode = shouldShowManualProjectConfigInputs(createProjectConfigMode);
 
   function updateCreateForm(patch) {
@@ -2204,9 +2233,25 @@ function HubApp() {
     });
   }
 
+  async function persistHubSettingsPatch(serverPatch, optimisticSettingsPatch) {
+    const payload = await fetchJson("/api/settings", {
+      method: "PATCH",
+      body: JSON.stringify(serverPatch)
+    });
+    setHubState((prev) => ({
+      ...prev,
+      settings: payload?.settings && typeof payload.settings === "object"
+        ? payload.settings
+        : { ...(prev.settings || {}), ...optimisticSettingsPatch }
+    }));
+  }
+
   async function handleUpdateDefaultAgentSetting(rawAgentType) {
     const previousDefaultAgentType = hubSettings.defaultAgentType;
     const nextDefaultAgentType = normalizeAgentType(rawAgentType, agentCapabilities);
+    if (nextDefaultAgentType === previousDefaultAgentType) {
+      return;
+    }
     setHubState((prev) => ({
       ...prev,
       settings: { ...(prev.settings || {}), default_agent_type: nextDefaultAgentType }
@@ -2236,22 +2281,40 @@ function HubApp() {
     });
     setDefaultAgentSettingSaving(true);
     try {
-      const payload = await fetchJson("/api/settings", {
-        method: "PATCH",
-        body: JSON.stringify({ default_agent_type: nextDefaultAgentType })
-      });
-      setHubState((prev) => ({
-        ...prev,
-        settings: payload?.settings && typeof payload.settings === "object"
-          ? payload.settings
-          : { ...(prev.settings || {}), default_agent_type: nextDefaultAgentType }
-      }));
+      await persistHubSettingsPatch(
+        { default_agent_type: nextDefaultAgentType },
+        { default_agent_type: nextDefaultAgentType }
+      );
       setError("");
     } catch (err) {
       setError(err.message || String(err));
       refreshState().catch(() => {});
     } finally {
       setDefaultAgentSettingSaving(false);
+    }
+  }
+
+  async function handleUpdateChatLayoutEngineSetting(rawLayoutEngine) {
+    const nextLayoutEngine = normalizeChatLayoutEngine(rawLayoutEngine);
+    if (nextLayoutEngine === hubSettings.chatLayoutEngine) {
+      return;
+    }
+    setHubState((prev) => ({
+      ...prev,
+      settings: { ...(prev.settings || {}), chat_layout_engine: nextLayoutEngine }
+    }));
+    setChatLayoutEngineSettingSaving(true);
+    try {
+      await persistHubSettingsPatch(
+        { chat_layout_engine: nextLayoutEngine },
+        { chat_layout_engine: nextLayoutEngine }
+      );
+      setError("");
+    } catch (err) {
+      setError(err.message || String(err));
+      refreshState().catch(() => {});
+    } finally {
+      setChatLayoutEngineSettingSaving(false);
     }
   }
 
@@ -2970,6 +3033,62 @@ function HubApp() {
     }
     return { byProject, orphanChats };
   }, [orderedProjects, orderedVisibleChats]);
+  const chatFlexLayoutTabs = useMemo(() => {
+    const tabs = orderedProjects.map((project) => ({
+      id: `project-${project.id}`,
+      name: project.name,
+      component: "project-chat-group",
+      config: { project_id: project.id }
+    }));
+    if (chatsByProject.orphanChats.length > 0) {
+      tabs.push({
+        id: "orphan-chats",
+        name: "Unknown project",
+        component: "orphan-chat-group",
+        config: {}
+      });
+    }
+    return tabs;
+  }, [orderedProjects, chatsByProject.orphanChats.length]);
+  const chatFlexLayoutModel = useMemo(() => {
+    if (chatFlexLayoutTabs.length === 0) {
+      return null;
+    }
+    const selectedIndex = chatFlexLayoutTabs.findIndex((tab) => tab.id === chatFlexLayoutActiveTabId);
+    return Model.fromJson({
+      global: {
+        tabEnableClose: false,
+        tabSetEnableDeleteWhenEmpty: false,
+        tabSetEnableDrag: false,
+        tabSetEnableDrop: false,
+        tabSetEnableMaximize: false
+      },
+      borders: [],
+      layout: {
+        type: "row",
+        weight: 100,
+        children: [
+          {
+            type: "tabset",
+            id: "chat-layout-main-tabset",
+            weight: 100,
+            selected: selectedIndex >= 0 ? selectedIndex : 0,
+            children: chatFlexLayoutTabs.map((tab) => ({
+              type: "tab",
+              id: tab.id,
+              name: tab.name,
+              component: tab.component,
+              config: tab.config
+            }))
+          }
+        ]
+      }
+    });
+  }, [chatFlexLayoutTabs, chatFlexLayoutActiveTabId]);
+  const chatFlexLayoutThemeClass = useMemo(
+    () => `flexlayout__theme_${resolveEffectiveTheme(themePreference)}`,
+    [themePreference]
+  );
 
   const openAiAccountLoginUrl = String(openAiAccountSession?.loginUrl || "").trim();
   const openAiAccountSessionMethod = String(openAiAccountSession?.method || "");
@@ -3139,6 +3258,20 @@ function HubApp() {
       // Ignore storage failures and keep in-memory preference.
     }
   }, [themePreference]);
+
+  useEffect(() => {
+    if (chatFlexLayoutTabs.length === 0) {
+      setChatFlexLayoutActiveTabId("");
+      return;
+    }
+    const tabIds = new Set(chatFlexLayoutTabs.map((tab) => tab.id));
+    setChatFlexLayoutActiveTabId((current) => {
+      if (current && tabIds.has(current)) {
+        return current;
+      }
+      return chatFlexLayoutTabs[0].id;
+    });
+  }, [chatFlexLayoutTabs]);
 
   useEffect(() => {
     if (!fullscreenChatId) {
@@ -3733,6 +3866,221 @@ function HubApp() {
     );
   }
 
+  function renderProjectChatGroup(project, keyPrefix = "group") {
+    const projectChats = chatsByProject.byProject.get(project.id) || [];
+    const buildStatus = String(project.build_status || "pending");
+    const canStartChat = buildStatus === "ready";
+    const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
+    const projectRowsCollapsed = Boolean(collapsedProjectChats[project.id]);
+    const projectStartSettings = normalizeChatStartSettings(
+      chatStartSettingsByProject[project.id] || { agentType: hubSettings.defaultAgentType },
+      agentCapabilities
+    );
+    const projectAgentOptions = agentTypeOptions(agentCapabilities);
+    const projectModelOptions = startModelOptionsForAgent(projectStartSettings.agentType, agentCapabilities);
+    const projectReasoningOptions = reasoningModeOptionsForAgent(projectStartSettings.agentType, agentCapabilities);
+    const projectSupportsReasoning = projectReasoningOptions.length > 1;
+
+    return (
+      <article className="card project-chat-group" key={`${keyPrefix}-${project.id}`}>
+        <div
+          className="project-head project-chat-head project-chat-row"
+          role="button"
+          tabIndex={0}
+          onClick={() => toggleProjectChatRows(project.id, projectChats, projectRowsCollapsed)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              toggleProjectChatRows(project.id, projectChats, projectRowsCollapsed);
+            }
+          }}
+        >
+          <h3>{project.name}</h3>
+          <div className="actions project-head-actions">
+            {canStartChat ? (
+              <>
+                <select
+                  className="project-start-select"
+                  aria-label={`Agent for ${project.name}`}
+                  value={projectStartSettings.agentType}
+                  onClick={(event) => event.stopPropagation()}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  onChange={(event) => {
+                    event.stopPropagation();
+                    updateProjectChatStartSettings(project.id, { agentType: event.target.value });
+                  }}
+                >
+                  {projectAgentOptions.map((option) => (
+                    <option key={`${project.id}-agent-${option.value}`} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  className="project-start-select"
+                  aria-label={`Start model for ${project.name}`}
+                  value={projectStartSettings.model}
+                  onClick={(event) => event.stopPropagation()}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  onChange={(event) => {
+                    event.stopPropagation();
+                    updateProjectChatStartSettings(project.id, { model: event.target.value });
+                  }}
+                >
+                  {projectModelOptions.map((modelOption) => (
+                    <option key={`${project.id}-model-${projectStartSettings.agentType}-${modelOption}`} value={modelOption}>
+                      {modelOption}
+                    </option>
+                  ))}
+                </select>
+                {projectSupportsReasoning ? (
+                  <select
+                    className="project-start-select"
+                    aria-label={`Reasoning mode for ${project.name}`}
+                    value={projectStartSettings.reasoning}
+                    onClick={(event) => event.stopPropagation()}
+                    onKeyDown={(event) => event.stopPropagation()}
+                    onChange={(event) => {
+                      event.stopPropagation();
+                      updateProjectChatStartSettings(project.id, { reasoning: event.target.value });
+                    }}
+                  >
+                    {projectReasoningOptions.map((reasoningMode) => (
+                      <option key={`${project.id}-reasoning-${reasoningMode}`} value={reasoningMode}>
+                        {reasoningMode}
+                      </option>
+                    ))}
+                  </select>
+                ) : null}
+              </>
+            ) : null}
+            <button
+              type="button"
+              className="btn-primary project-group-action"
+              disabled={!canStartChat && isBuilding}
+              onClick={(event) => {
+                event.stopPropagation();
+                if (canStartChat) {
+                  handleCreateChat(project.id, projectStartSettings);
+                } else {
+                  handleBuildProject(project.id);
+                }
+              }}
+            >
+              {canStartChat
+                ? "New chat"
+                : isBuilding
+                  ? <SpinnerLabel text="Building image..." />
+                  : "Build image"}
+            </button>
+          </div>
+        </div>
+
+        {projectRowsCollapsed ? (
+          <div className="meta">Chats hidden ({projectChats.length})</div>
+        ) : (
+          <div className="stack compact">
+            {projectChats.length === 0 ? <div className="empty">No chats yet for this project.</div> : null}
+            {projectChats.map((chat) => renderChatCard(chat))}
+          </div>
+        )}
+      </article>
+    );
+  }
+
+  function renderOrphanChatGroup(keyPrefix = "group-orphan") {
+    return (
+      <article className="card project-chat-group" key={keyPrefix}>
+        <div
+          className="project-head project-chat-row"
+          role="button"
+          tabIndex={0}
+          onClick={() =>
+            toggleProjectChatRows("__orphan__", chatsByProject.orphanChats, Boolean(collapsedProjectChats.__orphan__))
+          }
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              toggleProjectChatRows("__orphan__", chatsByProject.orphanChats, Boolean(collapsedProjectChats.__orphan__));
+            }
+          }}
+        >
+          <h3>Unknown project</h3>
+        </div>
+        {collapsedProjectChats.__orphan__ ? (
+          <div className="meta">Chats hidden ({chatsByProject.orphanChats.length})</div>
+        ) : (
+          <div className="stack compact">
+            {chatsByProject.orphanChats.map((chat) => renderChatCard(chat))}
+          </div>
+        )}
+      </article>
+    );
+  }
+
+  function renderClassicChatsLayout() {
+    return (
+      <div className="stack chat-groups">
+        {orderedProjects.length === 0 ? <div className="empty">No projects yet.</div> : null}
+        {orderedProjects.map((project) => renderProjectChatGroup(project))}
+        {chatsByProject.orphanChats.length > 0 ? renderOrphanChatGroup() : null}
+      </div>
+    );
+  }
+
+  function renderChatFlexLayoutTab(node) {
+    const component = String(node.getComponent() || "");
+    if (component === "project-chat-group") {
+      const projectId = String(node.getConfig()?.project_id || "");
+      const project = projectsById.get(projectId);
+      if (!project) {
+        return <div className="empty">Project no longer exists.</div>;
+      }
+      return <div className="chat-layout-flex-tab">{renderProjectChatGroup(project, `flex-${project.id}`)}</div>;
+    }
+    if (component === "orphan-chat-group") {
+      return <div className="chat-layout-flex-tab">{renderOrphanChatGroup("flex-group-orphan")}</div>;
+    }
+    return <div className="empty">Unsupported chat layout tab.</div>;
+  }
+
+  function handleChatFlexLayoutAction(action) {
+    if (String(action?.type || "") === Actions.SELECT_TAB) {
+      const selectedTabId = String(action?.data?.tabNode || "");
+      if (selectedTabId) {
+        setChatFlexLayoutActiveTabId(selectedTabId);
+      }
+    }
+    return action;
+  }
+
+  function renderFlexLayoutChatsLayout() {
+    if (!chatFlexLayoutModel || chatFlexLayoutTabs.length === 0) {
+      return <div className="empty">No projects yet.</div>;
+    }
+    return (
+      <div className={`chat-layout-flex-shell ${chatFlexLayoutThemeClass}`.trim()}>
+        <Layout
+          model={chatFlexLayoutModel}
+          factory={renderChatFlexLayoutTab}
+          onAction={handleChatFlexLayoutAction}
+        />
+      </div>
+    );
+  }
+
+  function renderChatsLayoutEngine() {
+    const renderByEngine = {
+      [CHAT_LAYOUT_ENGINE_CLASSIC]: renderClassicChatsLayout,
+      [CHAT_LAYOUT_ENGINE_FLEXLAYOUT]: renderFlexLayoutChatsLayout
+    };
+    const renderer = renderByEngine[hubSettings.chatLayoutEngine];
+    if (!renderer) {
+      throw new Error(`Unsupported chat layout engine: ${hubSettings.chatLayoutEngine}`);
+    }
+    return renderer();
+  }
+
   return (
     <div className="app-root">
       <header className="app-header">
@@ -4113,156 +4461,7 @@ function HubApp() {
           </section>
         ) : activeTab === "chats" ? (
           <section className="panel chats-panel">
-            <div className="stack chat-groups">
-              {orderedProjects.length === 0 ? <div className="empty">No projects yet.</div> : null}
-              {orderedProjects.map((project) => {
-                const projectChats = chatsByProject.byProject.get(project.id) || [];
-                const buildStatus = String(project.build_status || "pending");
-                const canStartChat = buildStatus === "ready";
-                const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
-                const projectRowsCollapsed = Boolean(collapsedProjectChats[project.id]);
-                const projectStartSettings = normalizeChatStartSettings(
-                  chatStartSettingsByProject[project.id] || { agentType: hubSettings.defaultAgentType },
-                  agentCapabilities
-                );
-                const projectAgentOptions = agentTypeOptions(agentCapabilities);
-                const projectModelOptions = startModelOptionsForAgent(projectStartSettings.agentType, agentCapabilities);
-                const projectReasoningOptions = reasoningModeOptionsForAgent(projectStartSettings.agentType, agentCapabilities);
-                const projectSupportsReasoning = projectReasoningOptions.length > 1;
-                return (
-                  <article className="card project-chat-group" key={`group-${project.id}`}>
-                    <div
-                      className="project-head project-chat-head project-chat-row"
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => toggleProjectChatRows(project.id, projectChats, projectRowsCollapsed)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault();
-                          toggleProjectChatRows(project.id, projectChats, projectRowsCollapsed);
-                        }
-                      }}
-                    >
-                      <h3>{project.name}</h3>
-                      <div className="actions project-head-actions">
-                        {canStartChat ? (
-                          <>
-                            <select
-                              className="project-start-select"
-                              aria-label={`Agent for ${project.name}`}
-                              value={projectStartSettings.agentType}
-                              onClick={(event) => event.stopPropagation()}
-                              onKeyDown={(event) => event.stopPropagation()}
-                              onChange={(event) => {
-                                event.stopPropagation();
-                                updateProjectChatStartSettings(project.id, { agentType: event.target.value });
-                              }}
-                            >
-                              {projectAgentOptions.map((option) => (
-                                <option key={`${project.id}-agent-${option.value}`} value={option.value}>
-                                  {option.label}
-                                </option>
-                              ))}
-                            </select>
-                            <select
-                              className="project-start-select"
-                              aria-label={`Start model for ${project.name}`}
-                              value={projectStartSettings.model}
-                              onClick={(event) => event.stopPropagation()}
-                              onKeyDown={(event) => event.stopPropagation()}
-                              onChange={(event) => {
-                                event.stopPropagation();
-                                updateProjectChatStartSettings(project.id, { model: event.target.value });
-                              }}
-                            >
-                              {projectModelOptions.map((modelOption) => (
-                                <option key={`${project.id}-model-${projectStartSettings.agentType}-${modelOption}`} value={modelOption}>
-                                  {modelOption}
-                                </option>
-                              ))}
-                            </select>
-                            {projectSupportsReasoning ? (
-                              <select
-                                className="project-start-select"
-                                aria-label={`Reasoning mode for ${project.name}`}
-                                value={projectStartSettings.reasoning}
-                                onClick={(event) => event.stopPropagation()}
-                                onKeyDown={(event) => event.stopPropagation()}
-                                onChange={(event) => {
-                                  event.stopPropagation();
-                                  updateProjectChatStartSettings(project.id, { reasoning: event.target.value });
-                                }}
-                              >
-                                {projectReasoningOptions.map((reasoningMode) => (
-                                  <option key={`${project.id}-reasoning-${reasoningMode}`} value={reasoningMode}>
-                                    {reasoningMode}
-                                  </option>
-                                ))}
-                              </select>
-                            ) : null}
-                          </>
-                        ) : null}
-                        <button
-                          type="button"
-                          className="btn-primary project-group-action"
-                          disabled={!canStartChat && isBuilding}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            if (canStartChat) {
-                              handleCreateChat(project.id, projectStartSettings);
-                            } else {
-                              handleBuildProject(project.id);
-                            }
-                          }}
-                        >
-                          {canStartChat
-                            ? "New chat"
-                            : isBuilding
-                              ? <SpinnerLabel text="Building image..." />
-                              : "Build image"}
-                        </button>
-                      </div>
-                    </div>
-
-                    {projectRowsCollapsed ? (
-                      <div className="meta">Chats hidden ({projectChats.length})</div>
-                    ) : (
-                      <div className="stack compact">
-                        {projectChats.length === 0 ? <div className="empty">No chats yet for this project.</div> : null}
-                        {projectChats.map((chat) => renderChatCard(chat))}
-                      </div>
-                    )}
-                  </article>
-                );
-              })}
-              {chatsByProject.orphanChats.length > 0 ? (
-                <article className="card project-chat-group" key="group-orphan">
-                  <div
-                    className="project-head project-chat-row"
-                    role="button"
-                    tabIndex={0}
-                    onClick={() =>
-                      toggleProjectChatRows("__orphan__", chatsByProject.orphanChats, Boolean(collapsedProjectChats.__orphan__))
-                    }
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        toggleProjectChatRows("__orphan__", chatsByProject.orphanChats, Boolean(collapsedProjectChats.__orphan__));
-                      }
-                    }}
-                  >
-                    <h3>Unknown project</h3>
-                  </div>
-                  {collapsedProjectChats.__orphan__ ? (
-                    <div className="meta">Chats hidden ({chatsByProject.orphanChats.length})</div>
-                  ) : (
-                    <div className="stack compact">
-                      {chatsByProject.orphanChats.map((chat) => renderChatCard(chat))}
-                    </div>
-                  )}
-                </article>
-              ) : null}
-            </div>
+            {renderChatsLayoutEngine()}
           </section>
         ) : (
           <section className="panel settings-panel">
@@ -4294,11 +4493,31 @@ function HubApp() {
                   ))}
                 </select>
               </label>
+              <label className="theme-control" htmlFor="chat-layout-engine-select">
+                <span>Chats layout engine</span>
+                <select
+                  id="chat-layout-engine-select"
+                  value={hubSettings.chatLayoutEngine}
+                  onChange={(event) => handleUpdateChatLayoutEngineSetting(event.target.value)}
+                  disabled={chatLayoutEngineSettingSaving}
+                >
+                  {settingsChatLayoutEngineOptions.map((option) => (
+                    <option key={`settings-chat-layout-engine-${option.value}`} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
             </div>
             <p className="meta settings-default-agent-note">
               {defaultAgentSettingSaving
                 ? "Saving default agent..."
                 : "New chat controls start with this agent by default. You can still override per chat before launch."}
+            </p>
+            <p className="meta settings-chat-layout-note">
+              {chatLayoutEngineSettingSaving
+                ? "Saving chats layout engine..."
+                : "Classic keeps project groups in a vertical stack. FlexLayout groups chats into dockable tabs."}
             </p>
             <div className="settings-provider-list">
             <article className="card auth-provider-card">

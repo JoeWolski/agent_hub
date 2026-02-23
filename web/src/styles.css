@@ -401,6 +401,10 @@ code {
   margin: 0 0 var(--space-2);
 }
 
+.settings-chat-layout-note {
+  margin: 0 0 var(--space-2);
+}
+
 .auth-provider-card {
   border: 0;
   border-radius: 0;
@@ -1661,6 +1665,99 @@ button:focus-visible {
   border-bottom: 0;
 }
 
+.chat-layout-flex-shell {
+  position: relative;
+  width: 100%;
+  height: clamp(460px, 74vh, 940px);
+  min-height: 460px;
+  overflow: hidden;
+  background: transparent;
+}
+
+.chat-layout-flex-shell .flexlayout__layout {
+  --font-family: Inter, "Soehne", "Segoe UI", "Helvetica Neue", Arial, ui-sans-serif, system-ui, sans-serif;
+  --font-size: 0.9rem;
+  --color-text: var(--text-primary);
+  --color-background: var(--bg-primary);
+  --color-base: var(--bg-primary);
+  --color-1: var(--bg-surface);
+  --color-2: var(--bg-surface-muted);
+  --color-3: var(--bg-muted);
+  --color-4: var(--border);
+  --color-5: var(--border-strong);
+  --color-6: var(--border-strong);
+  --color-overflow: var(--text-subtle);
+  --color-icon: var(--text-secondary);
+  --color-tabset-background: transparent;
+  --color-tabset-background-selected: transparent;
+  --color-tabset-background-maximized: transparent;
+  --color-tabset-divider-line: var(--border);
+  --color-tabset-header-background: transparent;
+  --color-tabset-header: var(--text-secondary);
+  --color-tab-content: transparent;
+  --color-tab-selected: var(--text-primary);
+  --color-tab-selected-background: var(--bg-muted);
+  --color-tab-unselected: var(--text-secondary);
+  --color-tab-unselected-background: transparent;
+  --color-toolbar-button-hover: var(--bg-muted);
+  inset: 0;
+}
+
+.chat-layout-flex-shell .flexlayout__tabset_tabbar_outer_top {
+  padding: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.chat-layout-flex-shell .flexlayout__tabset_tabbar_inner_tab_container {
+  gap: 2px;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.chat-layout-flex-shell .flexlayout__tab_button {
+  min-height: 36px;
+  padding: 8px 14px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.chat-layout-flex-shell .flexlayout__tab_button:hover {
+  color: var(--text-primary);
+  background: var(--bg-muted);
+}
+
+.chat-layout-flex-shell .flexlayout__tab_button--selected {
+  color: var(--text-primary);
+  font-weight: 500;
+  background: var(--bg-primary);
+  border-color: var(--border);
+  border-bottom-color: var(--bg-primary);
+}
+
+.chat-layout-flex-shell .flexlayout__tab_button--unselected {
+  color: var(--text-secondary);
+}
+
+.chat-layout-flex-shell .flexlayout__tabset_content {
+  background: transparent;
+}
+
+.chat-layout-flex-tab {
+  height: 100%;
+  overflow: auto;
+  padding: var(--space-2) 0 var(--space-3);
+}
+
+.chat-layout-flex-tab > .project-chat-group {
+  margin: 0;
+  padding-left: var(--space-2);
+  padding-right: var(--space-2);
+}
+
 .connection-summary {
   display: inline-flex;
   align-items: center;
@@ -2072,6 +2169,11 @@ button:focus-visible {
 
   .chat-card-popped .chat-terminal-shell {
     min-height: 280px;
+  }
+
+  .chat-layout-flex-shell {
+    min-height: 400px;
+    height: clamp(400px, 64vh, 720px);
   }
 
   .artifact-preview-overlay {

@@ -865,6 +865,11 @@ fd-slicer@~1.1.0:
   dependencies:
     pend "~1.2.0"
 
+flexlayout-react@^0.8.18:
+  version "0.8.18"
+  resolved "https://registry.yarnpkg.com/flexlayout-react/-/flexlayout-react-0.8.18.tgz#4628144d5e74bee69f3d0427a3ff086e09c9f647"
+  integrity sha512-xxifwxfS0NigaPHkunKZ39CafGzm7L+UDEcfuNatiOKhDQaIujmMwQrE1/B7uxbHNN3P19yoX/DJmtMo/sIiZA==
+
 fs-extra@^9.0.0:
   version "9.1.0"
   resolved "https://registry.yarnpkg.com/fs-extra/-/fs-extra-9.1.0.tgz#5954460c764a8da2094ba3554bf839e6b9a7c86d"

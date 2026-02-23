@@ -86,6 +86,10 @@ AGENT_TYPE_CLAUDE = "claude"
 AGENT_TYPE_GEMINI = "gemini"
 DEFAULT_CHAT_AGENT_TYPE = AGENT_TYPE_CODEX
 SUPPORTED_CHAT_AGENT_TYPES = {AGENT_TYPE_CODEX, AGENT_TYPE_CLAUDE, AGENT_TYPE_GEMINI}
+CHAT_LAYOUT_ENGINE_CLASSIC = "classic"
+CHAT_LAYOUT_ENGINE_FLEXLAYOUT = "flexlayout"
+DEFAULT_CHAT_LAYOUT_ENGINE = CHAT_LAYOUT_ENGINE_CLASSIC
+SUPPORTED_CHAT_LAYOUT_ENGINES = {CHAT_LAYOUT_ENGINE_CLASSIC, CHAT_LAYOUT_ENGINE_FLEXLAYOUT}
 AGENT_COMMAND_BY_TYPE = {
     AGENT_TYPE_CODEX: "codex",
     AGENT_TYPE_CLAUDE: "claude",
@@ -531,6 +535,16 @@ def _has_cli_option(args: list[str], *, long_option: str, short_option: str | No
     return any(_cli_arg_matches_option(str(arg), long_option=long_option, short_option=short_option) for arg in args)
 
 
+def _normalize_chat_layout_engine(raw_value: Any, *, strict: bool = False) -> str:
+    value = str(raw_value or "").strip().lower()
+    if value in SUPPORTED_CHAT_LAYOUT_ENGINES:
+        return value
+    if strict:
+        supported = ", ".join(sorted(SUPPORTED_CHAT_LAYOUT_ENGINES))
+        raise HTTPException(status_code=400, detail=f"chat_layout_engine must be one of: {supported}.")
+    return DEFAULT_CHAT_LAYOUT_ENGINE
+
+
 def _normalize_chat_status(raw_value: Any, *, strict: bool = False) -> str:
     value = str(raw_value or "").strip().lower()
     if value in SUPPORTED_CHAT_STATUSES:
@@ -876,7 +890,10 @@ def _new_state() -> dict[str, Any]:
         "version": 1,
         "projects": {},
         "chats": {},
-        "settings": {"default_agent_type": DEFAULT_CHAT_AGENT_TYPE},
+        "settings": {
+            "default_agent_type": DEFAULT_CHAT_AGENT_TYPE,
+            "chat_layout_engine": DEFAULT_CHAT_LAYOUT_ENGINE,
+        },
     }
 
 
@@ -884,7 +901,12 @@ def _normalize_hub_settings_payload(raw_settings: Any) -> dict[str, Any]:
     if not isinstance(raw_settings, dict):
         raw_settings = {}
     return {
-        "default_agent_type": _normalize_chat_agent_type(raw_settings.get("default_agent_type")),
+        "default_agent_type": _normalize_chat_agent_type(
+            raw_settings.get("default_agent_type") or raw_settings.get("defaultAgentType")
+        ),
+        "chat_layout_engine": _normalize_chat_layout_engine(
+            raw_settings.get("chat_layout_engine") or raw_settings.get("chatLayoutEngine")
+        ),
     }
 
 
@@ -3408,11 +3430,22 @@ class HubState:
     def update_settings(self, update: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(update, dict):
             raise HTTPException(status_code=400, detail="Invalid settings payload.")
-        if "default_agent_type" not in update:
+        has_default_agent_type = "default_agent_type" in update or "defaultAgentType" in update
+        has_chat_layout_engine = "chat_layout_engine" in update or "chatLayoutEngine" in update
+        if not has_default_agent_type and not has_chat_layout_engine:
             raise HTTPException(status_code=400, detail="No settings values provided.")
         state = self.load()
         settings = _normalize_hub_settings_payload(state.get("settings"))
-        settings["default_agent_type"] = _normalize_chat_agent_type(update.get("default_agent_type"), strict=True)
+        if has_default_agent_type:
+            settings["default_agent_type"] = _normalize_chat_agent_type(
+                update.get("default_agent_type", update.get("defaultAgentType")),
+                strict=True,
+            )
+        if has_chat_layout_engine:
+            settings["chat_layout_engine"] = _normalize_chat_layout_engine(
+                update.get("chat_layout_engine", update.get("chatLayoutEngine")),
+                strict=True,
+            )
         state["settings"] = settings
         self.save(state, reason="settings_updated")
         return settings

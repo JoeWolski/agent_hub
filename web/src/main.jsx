@@ -1,6 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import "../node_modules/@xterm/xterm/css/xterm.css";
+import "flexlayout-react/style/combined.css";
 import App from "./App";
 import "./styles.css";
 
