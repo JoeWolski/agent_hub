@@ -605,8 +605,8 @@ class HubStateTests(unittest.TestCase):
         )
         auto_config_prompt = hub_server._render_prompt_template(
             hub_server.PROMPT_AUTO_CONFIGURE_PROJECT_FILE,
-            ccache_mount="/tmp/ccache:/home/user/.ccache",
-            sccache_mount="/tmp/sccache:/home/user/.cache/sccache",
+            ccache_mount="/tmp/ccache:/workspace/.ccache",
+            sccache_mount="/tmp/sccache:/workspace/.cache/sccache",
             repo_url="https://github.com/acme/demo.git",
             branch="main",
         )
@@ -687,7 +687,7 @@ class HubStateTests(unittest.TestCase):
                 continue
             self.assertIn("--group-add", cmd)
             self.assertIn(token, cmd)
-        container_home = f"/home/{self.state.local_user}"
+        container_home = hub_server.DEFAULT_CONTAINER_HOME
         self.assertNotIn(f"{self.state.host_agent_home}:{container_home}", cmd)
         self.assertIn(f"{self.state.host_codex_dir}:{container_home}/.codex", cmd)
         self.assertIn("session", payload)
@@ -2768,8 +2768,8 @@ class HubStateTests(unittest.TestCase):
             )
 
         self.assertEqual(recommendation["setup_script"].splitlines()[0], "apt-get update")
-        expected_mount = f"{fake_home / '.ccache'}:/home/{self.state.local_user}/.ccache"
-        unexpected_mount = f"{fake_home / '.cache' / 'sccache'}:/home/{self.state.local_user}/.cache/sccache"
+        expected_mount = f"{fake_home / '.ccache'}:{hub_server.DEFAULT_CONTAINER_HOME}/.ccache"
+        unexpected_mount = f"{fake_home / '.cache' / 'sccache'}:{hub_server.DEFAULT_CONTAINER_HOME}/.cache/sccache"
         self.assertIn(expected_mount, recommendation["default_rw_mounts"])
         self.assertNotIn(unexpected_mount, recommendation["default_rw_mounts"])
         self.assertTrue((fake_home / ".ccache").exists())
@@ -2795,8 +2795,8 @@ class HubStateTests(unittest.TestCase):
                     "setup_script": "",
                     "default_ro_mounts": [],
                     "default_rw_mounts": [
-                        f"{ccache_host}:/home/{self.state.local_user}/.ccache",
-                        f"{sccache_host}:/home/{self.state.local_user}/.cache/sccache",
+                        f"{ccache_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.ccache",
+                        f"{sccache_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.cache/sccache",
                     ],
                     "default_env_vars": [],
                     "notes": "",
@@ -2827,8 +2827,8 @@ class HubStateTests(unittest.TestCase):
                     "setup_script": "",
                     "default_ro_mounts": [],
                     "default_rw_mounts": [
-                        f"{ccache_host}:/home/{self.state.local_user}/.ccache",
-                        f"{sccache_host}:/home/{self.state.local_user}/.cache/sccache",
+                        f"{ccache_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.ccache",
+                        f"{sccache_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.cache/sccache",
                     ],
                     "default_env_vars": [],
                     "notes": "",
@@ -2837,11 +2837,11 @@ class HubStateTests(unittest.TestCase):
             )
 
         self.assertIn(
-            f"{ccache_host}:/home/{self.state.local_user}/.ccache",
+            f"{ccache_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.ccache",
             recommendation["default_rw_mounts"],
         )
         self.assertNotIn(
-            f"{sccache_host}:/home/{self.state.local_user}/.cache/sccache",
+            f"{sccache_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.cache/sccache",
             recommendation["default_rw_mounts"],
         )
 
@@ -3524,6 +3524,7 @@ class CliEnvVarTests(unittest.TestCase):
             assert commit_cmd is not None
             self.assertIn("--change", commit_cmd)
             self.assertIn("USER root", commit_cmd)
+            self.assertIn("WORKDIR /workspace", commit_cmd)
             self.assertIn('ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]', commit_cmd)
             self.assertIn('CMD ["bash"]', commit_cmd)
 
@@ -4304,7 +4305,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
 
-            container_home = f"/home/{image_cli._default_user()}"
+            container_home = image_cli.DEFAULT_CONTAINER_HOME
             full_home_mount = f"{agent_home.resolve()}:{container_home}"
             codex_mount = f"{(agent_home / '.codex').resolve()}:{container_home}/.codex"
             claude_mount = f"{(agent_home / '.claude').resolve()}:{container_home}/.claude"

@@ -70,6 +70,7 @@ GITHUB_PERSONAL_ACCESS_TOKEN_ID_MAX_CHARS = 120
 GITHUB_OWNER_SCOPE_MAX_ITEMS = 64
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
+DEFAULT_CONTAINER_HOME = "/workspace"
 ARTIFACT_PUBLISH_BASE_URL_ENV = "AGENT_HUB_ARTIFACT_BASE_URL"
 DEFAULT_ARTIFACT_PUBLISH_HOST = "host.docker.internal"
 TERMINAL_QUEUE_MAX = 256
@@ -1952,15 +1953,6 @@ def _chat_subtitle_from_log(log_path: Path) -> str:
     return ""
 
 
-def _default_user() -> str:
-    try:
-        return os.getlogin()
-    except OSError:
-        import pwd
-
-        return pwd.getpwuid(os.getuid()).pw_name
-
-
 def _default_supplementary_gids() -> str:
     gids = sorted({gid for gid in os.getgroups() if gid != os.getgid()})
     return ",".join(str(gid) for gid in gids)
@@ -2231,8 +2223,8 @@ class HubState:
         hub_port: int = DEFAULT_PORT,
         artifact_publish_base_url: str | None = None,
     ):
-        self.local_user = _default_user()
         self.local_uid = os.getuid()
+        self.local_user = f"uid-{self.local_uid}"
         self.local_gid = os.getgid()
         self.local_supp_gids = _normalize_csv(_default_supplementary_gids())
         self.local_umask = "0022"
@@ -3505,7 +3497,7 @@ class HubState:
         return deduped
 
     def _auto_config_prompt(self, repo_url: str, branch: str) -> str:
-        container_home = f"/home/{self.local_user}"
+        container_home = DEFAULT_CONTAINER_HOME
         ccache_mount = f"{Path.home().resolve() / '.ccache'}:{container_home}/.ccache"
         sccache_mount = f"{Path.home().resolve() / '.cache' / 'sccache'}:{container_home}/.cache/sccache"
         return _render_prompt_template(
@@ -3752,7 +3744,7 @@ class HubState:
             filtered.append(entry)
             existing.add(entry)
 
-        container_home = f"/home/{self.local_user}"
+        container_home = DEFAULT_CONTAINER_HOME
         cache_specs = [
             ("ccache", Path.home().resolve() / ".ccache", f"{container_home}/.ccache"),
             ("sccache", Path.home().resolve() / ".cache" / "sccache", f"{container_home}/.cache/sccache"),
@@ -4494,7 +4486,7 @@ class HubState:
         }
 
     def _openai_login_container_cmd(self, container_name: str, method: str) -> list[str]:
-        container_home = f"/home/{self.local_user}"
+        container_home = DEFAULT_CONTAINER_HOME
         cmd = [
             "docker",
             "run",
@@ -6093,7 +6085,7 @@ class HubState:
                         state["chats"][chat_id]["status"] = "stopped"
                         should_save = True
             chat_copy["is_running"] = running
-            chat_copy["container_workspace"] = f"/home/{_default_user()}/projects/{Path(str(chat_copy['workspace'])).name}"
+            chat_copy["container_workspace"] = DEFAULT_CONTAINER_HOME
             chat_copy["project_name"] = project_map.get(chat_copy["project_id"], {}).get("name", "Unknown")
             subtitle = _chat_subtitle_from_log(self.chat_log(chat_id))
             cached_title = _truncate_title(str(chat_copy.get("title_cached") or ""), CHAT_TITLE_MAX_CHARS)
@@ -6215,7 +6207,7 @@ class HubState:
         chat["status"] = "running"
         chat["pid"] = proc.pid
         chat["setup_snapshot_image"] = snapshot_tag or ""
-        chat["container_workspace"] = f"/home/{_default_user()}/projects/{workspace.name}"
+        chat["container_workspace"] = DEFAULT_CONTAINER_HOME
         chat["artifact_publish_token_hash"] = _hash_artifact_publish_token(artifact_publish_token)
         chat["artifact_publish_token_issued_at"] = _iso_now()
         chat["last_started_at"] = _iso_now()
