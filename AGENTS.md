@@ -50,6 +50,7 @@
 - After each commit or force-push that includes any UI-rendering change, regenerate and replace PR UI images before handoff, even if the visual change seems small.
 - Whenever a PR is updated, explicitly re-check whether existing UI/UX demo images are still accurate for the latest commit. If anything changed visually, regenerate and replace the images in the PR.
 - UI/UX images in the PR body must always reflect the most up-to-date UI state for the current PR head commit. Remove or replace stale images immediately.
+- Before presenting UI/UX evidence to the user or adding it to the PR body, inspect every image to confirm it shows the intended UI state and not an unrelated error, auth issue, setup failure, or transient warning state.
 - Use this exact workflow so image generation is deterministic and does not require rediscovery:
 - 1. Install browser tooling: `cd tools/demo && npm ci`
 - 2. Mirror auth/config context from the active server before launching the evidence server (so screenshots reflect real connected state and do not show unrelated credential/setup errors):
