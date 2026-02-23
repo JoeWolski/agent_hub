@@ -685,6 +685,32 @@ button:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.chats-openai-helper {
+  margin-top: 0;
+}
+
+.inline-link-button {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  line-height: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.inline-link-button:hover {
+  color: var(--accent-hover);
+}
+
+.inline-link-button:focus-visible {
+  outline: none;
+  border-radius: 4px;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
 .build-error {
   color: var(--danger);
   white-space: pre-wrap;

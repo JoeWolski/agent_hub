@@ -591,17 +591,17 @@ class HubStateTests(unittest.TestCase):
     def test_prompt_templates_are_loadable(self) -> None:
         system_prompt = hub_server._render_prompt_template(
             hub_server.PROMPT_CHAT_TITLE_OPENAI_SYSTEM_FILE,
-            max_chars=72,
+            max_chars=hub_server.CHAT_TITLE_MAX_CHARS,
         )
         user_prompt = hub_server._render_prompt_template(
             hub_server.PROMPT_CHAT_TITLE_OPENAI_USER_FILE,
             prompt_lines="1. test prompt",
-            max_chars=72,
+            max_chars=hub_server.CHAT_TITLE_MAX_CHARS,
         )
         codex_prompt = hub_server._render_prompt_template(
             hub_server.PROMPT_CHAT_TITLE_CODEX_REQUEST_FILE,
             prompt_lines="1. test prompt",
-            max_chars=72,
+            max_chars=hub_server.CHAT_TITLE_MAX_CHARS,
         )
         auto_config_prompt = hub_server._render_prompt_template(
             hub_server.PROMPT_AUTO_CONFIGURE_PROJECT_FILE,
@@ -610,7 +610,7 @@ class HubStateTests(unittest.TestCase):
             repo_url="https://github.com/acme/demo.git",
             branch="main",
         )
-        self.assertIn("Maximum length: 72 characters.", system_prompt)
+        self.assertIn(f"Maximum length: {hub_server.CHAT_TITLE_MAX_CHARS} characters.", system_prompt)
         self.assertIn("1. test prompt", user_prompt)
         self.assertIn("1. test prompt", codex_prompt)
         self.assertIn("Repository URL: https://github.com/acme/demo.git", auto_config_prompt)
@@ -2011,6 +2011,7 @@ class HubStateTests(unittest.TestCase):
             payload = self.state.state_payload()
         self.assertEqual(len(payload["chats"]), 1)
         self.assertEqual(payload["chats"][0]["id"], chat["id"])
+        self.assertEqual(payload["chats"][0]["display_name"], "New Chat")
         self.assertEqual(payload["chats"][0]["status"], "stopped")
         self.assertIn(chat["id"], self.state.load()["chats"])
 
@@ -3098,7 +3099,7 @@ class HubStateTests(unittest.TestCase):
 
         self.assertEqual(generate_title.call_count, 0)
         chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
-        self.assertEqual(chat_payload["display_name"], chat["name"])
+        self.assertEqual(chat_payload["display_name"], "New Chat")
 
     def test_state_payload_reschedules_pending_chat_title_generation(self) -> None:
         project = self.state.add_project(
@@ -3145,7 +3146,28 @@ class HubStateTests(unittest.TestCase):
 
         payload = self.state.state_payload()
         chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
-        self.assertEqual(chat_payload["display_name"], chat["name"])
+        self.assertEqual(chat_payload["display_name"], "New Chat")
+
+    def test_state_payload_rewrites_legacy_generated_chat_name(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["name"] = "chat-deadbeef"
+        self.state.save(state_data)
+
+        payload = self.state.state_payload()
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(chat_payload["display_name"], "New Chat")
 
     def test_shutdown_stops_running_chats_and_persists_state(self) -> None:
         project = self.state.add_project(
