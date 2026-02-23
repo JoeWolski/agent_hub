@@ -23,15 +23,15 @@ class WebChatLayoutEngineTests(unittest.TestCase):
 
             assert.equal(CHAT_LAYOUT_ENGINE_CLASSIC, "classic");
             assert.equal(CHAT_LAYOUT_ENGINE_FLEXLAYOUT, "flexlayout");
-            assert.equal(DEFAULT_CHAT_LAYOUT_ENGINE, CHAT_LAYOUT_ENGINE_CLASSIC);
+            assert.equal(DEFAULT_CHAT_LAYOUT_ENGINE, CHAT_LAYOUT_ENGINE_FLEXLAYOUT);
 
             assert.equal(normalizeChatLayoutEngine("classic"), "classic");
             assert.equal(normalizeChatLayoutEngine("Classic"), "classic");
             assert.equal(normalizeChatLayoutEngine("flexlayout"), "flexlayout");
             assert.equal(normalizeChatLayoutEngine("FLEXLAYOUT"), "flexlayout");
-            assert.equal(normalizeChatLayoutEngine(""), "classic");
-            assert.equal(normalizeChatLayoutEngine(undefined), "classic");
-            assert.equal(normalizeChatLayoutEngine("unknown-engine"), "classic");
+            assert.equal(normalizeChatLayoutEngine(""), "flexlayout");
+            assert.equal(normalizeChatLayoutEngine(undefined), "flexlayout");
+            assert.equal(normalizeChatLayoutEngine("unknown-engine"), "flexlayout");
 
             const options = chatLayoutEngineOptions();
             assert.equal(options.length, 2);
