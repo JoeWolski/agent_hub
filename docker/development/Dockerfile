@@ -8,7 +8,6 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
-    UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PATH=/opt/agent_hub/.venv/bin:/usr/local/bin:${PATH}
 
@@ -58,7 +57,7 @@ RUN chmod +x \
       /opt/agent_hub/bin/agent_cli \
       /opt/agent_hub/bin/agent_hub \
       /opt/agent_hub/docker/agent_cli/hub_artifact \
- && uv sync --frozen --no-dev \
+ && UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv uv sync --frozen --no-dev \
  && cd /opt/agent_hub/web \
  && corepack yarn install --frozen-lockfile \
  && cd /opt/agent_hub/tools/demo \

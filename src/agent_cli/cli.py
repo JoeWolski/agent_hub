@@ -1122,6 +1122,8 @@ def main(
         "NVIDIA_DRIVER_CAPABILITIES=all",
         "--env",
         f"CONTAINER_PROJECT_PATH={container_project_path}",
+        "--env",
+        f"UV_PROJECT_ENVIRONMENT={container_project_path}/.venv",
     ]
 
     for supplemental_gid in supplemental_group_ids:

@@ -25,6 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 DOCKER_ENTRYPOINT = ROOT / "docker" / "agent_cli" / "docker-entrypoint.py"
 AGENT_CLI_DOCKERFILE = ROOT / "docker" / "agent_cli" / "Dockerfile"
+AGENT_HUB_DOCKERFILE = ROOT / "docker" / "agent_hub" / "Dockerfile"
+DEVELOPMENT_DOCKERFILE = ROOT / "docker" / "development" / "Dockerfile"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -3774,6 +3776,20 @@ class CliEnvVarTests(unittest.TestCase):
             content.index("RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash -"),
         )
 
+    def test_agent_hub_dockerfile_uses_build_only_uv_project_environment(self) -> None:
+        content = AGENT_HUB_DOCKERFILE.read_text(encoding="utf-8")
+        exported_lines = [line.strip() for line in content.splitlines() if line.strip().startswith("UV_PROJECT_ENVIRONMENT=")]
+
+        self.assertEqual(exported_lines, [])
+        self.assertIn("UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv uv sync --frozen --no-dev", content)
+
+    def test_development_dockerfile_uses_build_only_uv_project_environment(self) -> None:
+        content = DEVELOPMENT_DOCKERFILE.read_text(encoding="utf-8")
+        exported_lines = [line.strip() for line in content.splitlines() if line.strip().startswith("UV_PROJECT_ENVIRONMENT=")]
+
+        self.assertEqual(exported_lines, [])
+        self.assertIn("UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv uv sync --frozen --no-dev", content)
+
     def test_ensure_claude_json_file_initializes_missing_file_with_valid_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             claude_json_file = Path(tmp) / ".claude.json"
@@ -5054,6 +5070,15 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn(expected_container_project, run_cmd)
             self.assertIn(f"{project.resolve()}:{expected_container_project}", run_cmd)
             self.assertIn("CONTAINER_PROJECT_PATH=/workspace/demo-project", run_cmd)
+            env_values = [
+                run_cmd[index + 1]
+                for index, part in enumerate(run_cmd[:-1])
+                if part == "--env"
+            ]
+            self.assertIn(
+                f"UV_PROJECT_ENVIRONMENT={expected_container_project}/.venv",
+                env_values,
+            )
 
     def test_cli_rejects_mount_targets_inside_project_mount_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
