@@ -15,7 +15,6 @@ FROM ${PYTHON_IMAGE} AS production
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
-    UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv \
     PATH=/opt/agent_hub/.venv/bin:/root/.local/bin:${PATH}
 
 RUN apt-get update \
@@ -41,7 +40,7 @@ COPY docker/agent_hub/run-agent-hub.sh /usr/local/bin/run-agent-hub.sh
 COPY --from=frontend-builder /opt/agent_hub/web/dist ./web/dist
 
 RUN chmod +x /opt/agent_hub/bin/agent_hub /usr/local/bin/run-agent-hub.sh \
- && uv sync --frozen --no-dev
+ && UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv uv sync --frozen --no-dev
 
 EXPOSE 8765
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/run-agent-hub.sh"]
