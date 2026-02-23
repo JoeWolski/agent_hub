@@ -1594,10 +1594,6 @@ button:focus-visible {
   border-color: var(--border-strong);
 }
 
-.settings-auth-log {
-  max-height: 240px;
-}
-
 .settings-auth-note {
   margin-top: 4px;
 }

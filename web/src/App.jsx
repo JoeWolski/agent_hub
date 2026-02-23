@@ -4167,18 +4167,8 @@ function HubApp() {
                       </button>
                     </div>
                   ) : null}
-                  {openAiAccountSession ? (
-                    <div className="stack compact">
-                      <div className="meta">
-                        Account login status: {openAiAccountSession.status || "starting"}
-                      </div>
-                      {openAiAccountSession.error ? (
-                        <div className="meta build-error">{openAiAccountSession.error}</div>
-                      ) : null}
-                      {openAiAccountSession.logTail ? (
-                        <pre className="log-box settings-auth-log">{openAiAccountSession.logTail}</pre>
-                      ) : null}
-                    </div>
+                  {openAiAccountSession?.error ? (
+                    <div className="meta build-error">{openAiAccountSession.error}</div>
                   ) : null}
 
                   <div className="settings-auth-block">
@@ -4234,10 +4224,6 @@ function HubApp() {
                     ) : null}
                     {openAiAccountSessionMethod === "browser_callback" ? (
                       <div className="stack compact">
-                        <p className="meta">
-                          Local callback URL:{" "}
-                          <code>{openAiAccountSession?.localCallbackUrl || "http://localhost:1455/auth/callback"}</code>
-                        </p>
                         <form className="stack compact" onSubmit={handleForwardOpenAiAccountCallback}>
                           <div className="settings-auth-input-row">
                             <input
