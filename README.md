@@ -47,6 +47,7 @@ uv run agent_cli --project /path/to/repo
 Important flags for a fast start:
 
 - `--project`: host project directory to mount into the container.
+- `--system-prompt-file`: markdown file containing shared core instructions for all agents.
 - `--resume`: attempt `codex resume --last` before falling back to a fresh session.
 - `--base`: Dockerfile path or directory to build a custom base image.
 - `--setup-script` + `--snapshot-image-tag`: build/reuse a deterministic prepared image.
@@ -75,6 +76,7 @@ Important flags for quickstart:
 
 - `--data-dir`: where hub state, chat workspaces, and secrets are stored.
 - `--config-file`: config passed into every chat runtime.
+- `--system-prompt-file`: markdown file containing shared core system instructions for all agents.
 - `--port` / `--host`: bind address for the hub API/UI.
 - `--artifact-publish-base-url`: callback base URL reachable from chat containers.
 - `--clean-start`: clear chat artifacts and cached setup images before serving.
@@ -83,10 +85,10 @@ No manual artifact wiring is required for `agent_hub` chats:
 
 - `agent_hub` injects `AGENT_HUB_ARTIFACTS_URL` and `AGENT_HUB_ARTIFACT_TOKEN` into each chat runtime.
 - `agent_hub` passes its config file into each runtime as `~/.codex/config.toml` for Codex.
-- `agent_cli` derives shared prompt/context instructions from that same config and passes them to Claude via `--append-system-prompt`.
-- `agent_cli` also syncs the same shared prompt/context instructions into Gemini's global `~/.gemini/GEMINI.md` via a managed section.
-- The default `config/agent.config.toml` already includes developer instructions telling the agent to publish requested deliverable files with `hub_artifact publish <path> [<path> ...]`.
-- Those config-driven developer instructions are applied automatically in hub-launched chats, so you do not need to manually paste extra prompt boilerplate.
+- `agent_cli` loads shared core instructions from `SYSTEM_PROMPT.md`.
+- `agent_cli` injects those instructions into Codex via CLI config override, appends them to Claude via `--append-system-prompt`, and syncs them into Gemini's managed `~/.gemini/GEMINI.md` section.
+- `agent_cli` appends project-doc bootstrap hints (from `config/agent.config.toml`) to the same shared prompt context for all providers.
+- The default `SYSTEM_PROMPT.md` already includes instructions telling the agent to publish requested deliverable files with `hub_artifact publish <path> [<path> ...]`.
 
 ## Chat Agent Prompt Context (Major Files)
 
@@ -94,15 +96,16 @@ For day-to-day prompt/setup changes, these are the main files that assemble most
 These paths are resolved from each chat's checked-out target project workspace, not from the Agent Hub repository itself (unless Agent Hub is the target project).
 
 1. `config/agent.config.toml`
-   - Single source for shared chat prompt/context settings across Codex, Claude, and Gemini.
+   - Shared runtime and project-doc bootstrap settings.
    - Passed into Codex chats as `~/.codex/config.toml`.
-   - Used to derive Claude `--append-system-prompt` defaults (`developer_instructions` and project-doc bootstrap hints).
-   - Synced into Gemini's global `~/.gemini/GEMINI.md` as a managed section.
-   - Main place for `developer_instructions` and project-doc auto-load settings.
-2. `AGENTS.md` (in the checked-out project repo)
+   - Used to derive project-doc bootstrap hints appended to all providers' shared prompt context.
+2. `SYSTEM_PROMPT.md`
+   - Source of shared core system instructions across Codex, Claude, and Gemini.
+   - Injected by `agent_cli` for each provider (Codex CLI config override, Claude append-system-prompt, Gemini managed context sync).
+3. `AGENTS.md` (in the checked-out project repo)
    - Primary repo-specific instruction file loaded by the agent.
 
-If you run with a custom `--config-file`, that file replaces the default `config/agent.config.toml` source for chat setup/context.
+If you run with a custom `--config-file` or `--system-prompt-file`, those files replace the defaults for chat setup/context.
 
 ## Requirements
 
@@ -136,8 +139,9 @@ Behavior highlights:
 - Runs container processes as the invoking host UID/GID (`docker run --user`) and forwards supplemental groups (`--group-add`) for deterministic mounted-volume permissions.
 - Mounts Docker socket (`/var/run/docker.sock`) so runtime tools can access Docker when available.
 - Mounts config file to `~/.codex/config.toml` in the container (Codex runtime).
-- Derives shared prompt/context instructions from the same config and appends them to Claude sessions (`--append-system-prompt`).
-- Derives shared prompt/context instructions from the same config and syncs them to Gemini `~/.gemini/GEMINI.md` (managed section that preserves user-owned content).
+- Loads shared core system instructions from `SYSTEM_PROMPT.md`.
+- Injects shared prompt/context into Codex (`--config developer_instructions=...`), Claude (`--append-system-prompt`), and Gemini (`~/.gemini/GEMINI.md` managed section).
+- Derives project-doc bootstrap hints from config and appends them to that same shared prompt context.
 - Persists agent home state across runs with dedicated mounts for `~/.codex`, `~/.claude`, `~/.claude.json`, `~/.config/claude`, and `~/.gemini`.
 - Can build and reuse snapshot images for deterministic setup.
 - Supports project-specific base image source from Docker tag, Dockerfile, or Docker context.
@@ -150,7 +154,7 @@ Behavior highlights:
 Key argument groups:
 
 - Project and config:
-  `--project`, `--config-file`, `--agent-home-path`, `--container-home`
+  `--project`, `--config-file`, `--system-prompt-file`, `--agent-home-path`, `--container-home`
 - Base image selection:
   `--base`, `--base-docker-context`, `--base-dockerfile`, `--base-image`, `--base-image-tag`
 - Deterministic setup:
@@ -184,6 +188,7 @@ Common startup flags:
 
 - `--data-dir`: persistent state root.
 - `--config-file`: config forwarded to chat runtimes.
+- `--system-prompt-file`: shared core system prompt file forwarded to chat runtimes.
 - `--frontend-build/--no-frontend-build`: control automatic frontend build.
 - `--artifact-publish-base-url`: override callback URL for container reachability.
 - `--log-level`: hub logging verbosity.

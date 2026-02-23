@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -35,6 +37,7 @@ DEFAULT_GEMINI_APPROVAL_MODE = "yolo"
 MANAGED_GEMINI_CONTEXT_START = "<!-- agent_cli managed shared context: BEGIN -->"
 MANAGED_GEMINI_CONTEXT_END = "<!-- agent_cli managed shared context: END -->"
 GEMINI_CONTEXT_FILE_NAME = "GEMINI.md"
+SYSTEM_PROMPT_FILE_NAME = "SYSTEM_PROMPT.md"
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
 GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
@@ -52,7 +55,33 @@ def _has_cli_option(args: Iterable[str], *, long_option: str, short_option: str 
     return any(_cli_arg_matches_option(arg, long_option=long_option, short_option=short_option) for arg in args)
 
 
-def _codex_default_runtime_flags(*, no_alt_screen: bool, explicit_args: Iterable[str]) -> list[str]:
+def _has_codex_config_override(args: Iterable[str], *, key: str) -> bool:
+    parsed_args = [str(arg) for arg in args]
+    for index, arg in enumerate(parsed_args):
+        if not _cli_arg_matches_option(arg, long_option="--config", short_option="-c"):
+            continue
+        if arg in {"--config", "-c"}:
+            if index + 1 >= len(parsed_args):
+                continue
+            config_assignment = parsed_args[index + 1]
+        else:
+            _, _, config_assignment = arg.partition("=")
+        config_key, _, _ = config_assignment.partition("=")
+        if config_key.strip() == key:
+            return True
+    return False
+
+
+def _toml_basic_string_literal(value: str) -> str:
+    return json.dumps(str(value or ""))
+
+
+def _codex_default_runtime_flags(
+    *,
+    no_alt_screen: bool,
+    explicit_args: Iterable[str],
+    shared_prompt_context: str,
+) -> list[str]:
     parsed_args = [str(arg) for arg in explicit_args]
     flags: list[str] = []
     bypass_all = _has_cli_option(
@@ -64,6 +93,14 @@ def _codex_default_runtime_flags(*, no_alt_screen: bool, explicit_args: Iterable
             flags.extend(["--ask-for-approval", DEFAULT_CODEX_APPROVAL_POLICY])
         if not _has_cli_option(parsed_args, long_option="--sandbox", short_option="-s"):
             flags.extend(["--sandbox", DEFAULT_CODEX_SANDBOX_MODE])
+
+    if shared_prompt_context and not _has_codex_config_override(parsed_args, key="developer_instructions"):
+        flags.extend(
+            [
+                "--config",
+                f"developer_instructions={_toml_basic_string_literal(shared_prompt_context)}",
+            ]
+        )
 
     if no_alt_screen:
         flags.append("--no-alt-screen")
@@ -84,11 +121,22 @@ def _normalize_string_list(raw_value: object) -> list[str]:
     return cleaned
 
 
-def _shared_prompt_context_from_config(config_path: Path) -> str:
+def _read_system_prompt(system_prompt_path: Path) -> str:
+    try:
+        return system_prompt_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        raise click.ClickException(f"Unable to read system prompt file {system_prompt_path}: {exc}") from exc
+
+
+def _shared_prompt_context_from_config(config_path: Path, *, core_system_prompt: str) -> str:
+    sections: list[str] = []
+    if core_system_prompt:
+        sections.append(core_system_prompt)
+
     try:
         raw = config_path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
-        return ""
+        return "\n\n".join(section for section in sections if section)
 
     try:
         parsed = tomllib.loads(raw)
@@ -97,20 +145,15 @@ def _shared_prompt_context_from_config(config_path: Path) -> str:
             f"Warning: unable to parse shared prompt context from {config_path}: {exc}",
             err=True,
         )
-        return ""
+        return "\n\n".join(section for section in sections if section)
 
     if not isinstance(parsed, dict):
-        return ""
+        return "\n\n".join(section for section in sections if section)
 
-    developer_instructions = str(parsed.get("developer_instructions") or "").strip()
     project_doc_auto_load = parsed.get("project_doc_auto_load") is True
     doc_fallback_files = _normalize_string_list(parsed.get("project_doc_fallback_filenames"))
     doc_extra_files = _normalize_string_list(parsed.get("project_doc_auto_load_extra_filenames"))
     project_doc_max_bytes = parsed.get("project_doc_max_bytes")
-
-    sections: list[str] = []
-    if developer_instructions:
-        sections.append(developer_instructions)
 
     project_doc_files = _normalize_string_list(doc_fallback_files + doc_extra_files)
     if project_doc_auto_load and project_doc_files:
@@ -217,7 +260,7 @@ def _resume_shell_command(*, no_alt_screen: bool, agent_command: str, codex_runt
         command_parts.extend(str(flag) for flag in codex_runtime_flags)
     elif no_alt_screen:
         command_parts.append("--no-alt-screen")
-    resolved = " ".join(command_parts)
+    resolved = " ".join(shlex.quote(part) for part in command_parts)
     return f"if {resolved} resume --last; then :; else exec {resolved}; fi"
 
 
@@ -238,6 +281,18 @@ def _default_config_file() -> Path:
         return fallback
 
     return config_file
+
+
+def _default_system_prompt_file() -> Path:
+    prompt_file = _repo_root() / SYSTEM_PROMPT_FILE_NAME
+    if prompt_file.exists():
+        return prompt_file
+
+    fallback = Path.cwd() / SYSTEM_PROMPT_FILE_NAME
+    if fallback.exists():
+        return fallback
+
+    return prompt_file
 
 
 def _default_credentials_file() -> Path:
@@ -742,6 +797,12 @@ def _resolve_base_image(
     show_default=True,
     help="Host agent config file mounted into container",
 )
+@click.option(
+    "--system-prompt-file",
+    default=str(_default_system_prompt_file()),
+    show_default=True,
+    help="Core system prompt markdown file used across Codex, Claude, and Gemini sessions.",
+)
 @click.option("--openai-api-key", default=None, show_default=False, help="API key to pass into container")
 @click.option(
     "--credentials-file",
@@ -810,6 +871,7 @@ def main(
     container_project_name: str | None,
     agent_home_path: str | None,
     config_file: str,
+    system_prompt_file: str,
     openai_api_key: str | None,
     credentials_file: str,
     git_credential_file: str | None,
@@ -853,6 +915,17 @@ def main(
             raise click.ClickException(f"Agent config file does not exist: {config_path}")
     if not config_path.is_file():
         raise click.ClickException(f"Agent config file does not exist: {config_path}")
+
+    system_prompt_path = _to_absolute(system_prompt_file, cwd)
+    if not system_prompt_path.is_file():
+        fallback = _default_system_prompt_file()
+        if fallback.is_file():
+            system_prompt_path = fallback
+        else:
+            raise click.ClickException(f"System prompt file does not exist: {system_prompt_path}")
+    if not system_prompt_path.is_file():
+        raise click.ClickException(f"System prompt file does not exist: {system_prompt_path}")
+    core_system_prompt = _read_system_prompt(system_prompt_path)
 
     git_credential_path: Path | None = None
     git_credential_host_value = ""
@@ -976,13 +1049,15 @@ def main(
         parsed_env_vars.append(_parse_env_var(entry, "--env-var"))
 
     explicit_container_args = [str(arg) for arg in container_args]
+    shared_prompt_context = _shared_prompt_context_from_config(
+        config_path,
+        core_system_prompt=core_system_prompt,
+    )
     codex_runtime_flags = _codex_default_runtime_flags(
         no_alt_screen=no_alt_screen,
         explicit_args=explicit_container_args,
+        shared_prompt_context=shared_prompt_context,
     )
-    shared_prompt_context = ""
-    if selected_agent_command in {AGENT_PROVIDER_CLAUDE, AGENT_PROVIDER_GEMINI}:
-        shared_prompt_context = _shared_prompt_context_from_config(config_path)
     if selected_agent_command == AGENT_PROVIDER_GEMINI:
         _sync_gemini_shared_context_file(
             host_gemini_dir=host_gemini_dir,
