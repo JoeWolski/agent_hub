@@ -5317,7 +5317,7 @@ class HubState:
         try:
             shutil.rmtree(path)
             return
-        except PermissionError as exc:
+        except PermissionError:
             try:
                 _docker_fix_path_ownership(path, self.local_uid, self.local_gid)
             except Exception as repair_exc:  # pragma: no cover - exercised in tests via patched helper
