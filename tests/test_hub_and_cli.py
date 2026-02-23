@@ -173,6 +173,83 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(loaded["setup_snapshot_image"], self.state._project_setup_snapshot_tag(project))
         self.assertEqual(loaded["build_status"], "ready")
 
+    def test_agent_capabilities_cache_loads_on_startup(self) -> None:
+        cache_payload = {
+            "version": 1,
+            "updated_at": "2026-01-02T03:04:05Z",
+            "discovery_in_progress": True,
+            "discovery_started_at": "2026-01-02T03:00:00Z",
+            "discovery_finished_at": "",
+            "agents": [
+                {
+                    "agent_type": "codex",
+                    "label": "Codex",
+                    "models": ["default", "gpt-6-codex"],
+                    "reasoning_modes": ["default", "low", "high"],
+                    "updated_at": "2026-01-02T03:04:05Z",
+                    "last_error": "",
+                },
+                {
+                    "agent_type": "claude",
+                    "label": "Claude",
+                    "models": ["default", "sonnet-4"],
+                    "reasoning_modes": ["default"],
+                    "updated_at": "2026-01-02T03:04:05Z",
+                    "last_error": "",
+                },
+                {
+                    "agent_type": "gemini",
+                    "label": "Gemini CLI",
+                    "models": ["default", "gemini-2.5-pro"],
+                    "reasoning_modes": ["default"],
+                    "updated_at": "2026-01-02T03:04:05Z",
+                    "last_error": "",
+                },
+            ],
+        }
+        cache_file = self.state.data_dir / hub_server.AGENT_CAPABILITIES_CACHE_FILE_NAME
+        cache_file.write_text(json.dumps(cache_payload, indent=2), encoding="utf-8")
+
+        reloaded = hub_server.HubState(self.state.data_dir, self.config_file)
+        payload = reloaded.agent_capabilities_payload()
+        self.assertFalse(payload["discovery_in_progress"])
+        codex = next(agent for agent in payload["agents"] if agent["agent_type"] == "codex")
+        self.assertEqual(codex["models"], ["default", "gpt-6-codex"])
+        self.assertEqual(codex["reasoning_modes"], ["default", "low", "high"])
+
+    def test_agent_capabilities_discovery_updates_cached_modes(self) -> None:
+        def fake_probe(cmd: list[str], _timeout: float) -> tuple[int, str]:
+            if cmd[:3] == ["codex", "models", "--json"]:
+                return 0, json.dumps({"models": [{"id": "gpt-6-codex"}]})
+            if cmd[:2] == ["codex", "models"]:
+                return 0, "Supported reasoning modes: low medium high"
+            if cmd[:3] == ["claude", "models", "--json"]:
+                return 0, json.dumps({"models": ["sonnet-4", "opus-4"]})
+            if cmd[:3] == ["gemini", "models", "--json"]:
+                return 0, json.dumps({"models": [{"name": "gemini-2.5-pro"}]})
+            return 127, ""
+
+        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe):
+            started_payload = self.state.start_agent_capabilities_discovery()
+            self.assertTrue(started_payload["discovery_in_progress"])
+            worker = self.state._agent_capabilities_discovery_thread
+            self.assertIsNotNone(worker)
+            assert worker is not None
+            worker.join(timeout=3.0)
+            self.assertFalse(worker.is_alive())
+
+        payload = self.state.agent_capabilities_payload()
+        self.assertFalse(payload["discovery_in_progress"])
+        self.assertTrue(payload["discovery_finished_at"])
+        codex = next(agent for agent in payload["agents"] if agent["agent_type"] == "codex")
+        claude = next(agent for agent in payload["agents"] if agent["agent_type"] == "claude")
+        gemini = next(agent for agent in payload["agents"] if agent["agent_type"] == "gemini")
+        self.assertEqual(codex["models"], ["default", "gpt-6-codex"])
+        self.assertEqual(codex["reasoning_modes"], ["default", "low", "medium", "high"])
+        self.assertEqual(claude["models"], ["default", "sonnet-4", "opus-4"])
+        self.assertEqual(gemini["models"], ["default", "gemini-2.5-pro"])
+        self.assertTrue((self.state.data_dir / hub_server.AGENT_CAPABILITIES_CACHE_FILE_NAME).exists())
+
     def test_openai_credentials_round_trip_status(self) -> None:
         initial = self.state.openai_auth_status()
         self.assertFalse(initial["connected"])
@@ -5023,6 +5100,52 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             agent_args=["--model", "gpt-5.3-codex"],
             agent_type="codex",
         )
+
+    def test_agent_capabilities_routes_return_cached_and_discovery_payloads(self) -> None:
+        app = self._build_app()
+        cached_payload = {
+            "version": 1,
+            "updated_at": "2026-01-02T03:04:05Z",
+            "discovery_in_progress": False,
+            "discovery_started_at": "",
+            "discovery_finished_at": "2026-01-02T03:04:05Z",
+            "agents": [
+                {
+                    "agent_type": "codex",
+                    "label": "Codex",
+                    "models": ["default", "gpt-6-codex"],
+                    "reasoning_modes": ["default", "low", "medium", "high"],
+                    "updated_at": "2026-01-02T03:04:05Z",
+                    "last_error": "",
+                }
+            ],
+        }
+        discovery_payload = {
+            **cached_payload,
+            "discovery_in_progress": True,
+            "discovery_started_at": "2026-01-02T03:10:00Z",
+            "discovery_finished_at": "",
+        }
+
+        with patch.object(
+            hub_server.HubState,
+            "agent_capabilities_payload",
+            return_value=cached_payload,
+        ) as read_capabilities, patch.object(
+            hub_server.HubState,
+            "start_agent_capabilities_discovery",
+            return_value=discovery_payload,
+        ) as start_discovery:
+            with TestClient(app) as client:
+                get_response = client.get("/api/agent-capabilities")
+                post_response = client.post("/api/agent-capabilities/discover")
+
+        self.assertEqual(get_response.status_code, 200, msg=get_response.text)
+        self.assertEqual(get_response.json(), cached_payload)
+        self.assertEqual(post_response.status_code, 200, msg=post_response.text)
+        self.assertEqual(post_response.json(), discovery_payload)
+        read_capabilities.assert_called_once_with()
+        start_discovery.assert_called_once_with()
 
 
 class DockerEntrypointTests(unittest.TestCase):
