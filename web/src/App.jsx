@@ -2328,7 +2328,7 @@ function HubApp() {
             : session
         )
       );
-      setPendingChatStarts((prev) => ({ ...prev, [chatId]: true }));
+      setPendingChatStarts((prev) => ({ ...prev, [chatId]: Date.now() }));
       setError("");
       refreshState().catch(() => {});
     } catch (err) {
@@ -2361,7 +2361,7 @@ function HubApp() {
   }
 
   async function handleStartChat(chatId) {
-    setPendingChatStarts((prev) => ({ ...prev, [chatId]: true }));
+    setPendingChatStarts((prev) => ({ ...prev, [chatId]: Date.now() }));
     setOpenChats((prev) => ({ ...prev, [chatId]: true }));
     try {
       await fetchJson(`/api/chats/${chatId}/start`, { method: "POST" });

@@ -1,4 +1,5 @@
 export const PENDING_SESSION_STALE_MS = 30_000;
+export const PENDING_CHAT_START_STALE_MS = 30_000;
 
 function safeTimestampMs(value) {
   const parsed = Number(value);
@@ -6,6 +7,23 @@ function safeTimestampMs(value) {
     return 0;
   }
   return parsed;
+}
+
+function pendingStartTimestampMs(value, fallbackNowMs = 0) {
+  const directTimestamp = safeTimestampMs(value);
+  if (directTimestamp > 0) {
+    return directTimestamp;
+  }
+  if (value && typeof value === "object") {
+    const fromObject = safeTimestampMs(value.started_at_ms);
+    if (fromObject > 0) {
+      return fromObject;
+    }
+  }
+  if (value === true) {
+    return safeTimestampMs(fallbackNowMs);
+  }
+  return 0;
 }
 
 export function isChatStarting(status, isRunning, isPendingStart) {
@@ -58,24 +76,33 @@ export function reconcilePendingSessions(previousSessions, serverChatsById, nowM
   return next;
 }
 
-export function reconcilePendingChatStarts(previousPendingChatStarts, serverChatsById) {
+export function reconcilePendingChatStarts(previousPendingChatStarts, serverChatsById, nowMs = Date.now()) {
   const pending = previousPendingChatStarts && typeof previousPendingChatStarts === "object"
     ? previousPendingChatStarts
     : {};
   const serverMap = serverChatsById instanceof Map ? serverChatsById : new Map();
+  const currentTimeMs = safeTimestampMs(nowMs) || Date.now();
   const next = {};
-  for (const [chatId, isPending] of Object.entries(pending)) {
-    if (!isPending) {
+  for (const [chatId, pendingValue] of Object.entries(pending)) {
+    const startTimestampMs = pendingStartTimestampMs(pendingValue, currentTimeMs);
+    if (startTimestampMs <= 0) {
       continue;
     }
+
+    const isStale = currentTimeMs - startTimestampMs >= PENDING_CHAT_START_STALE_MS;
+    if (isStale) {
+      continue;
+    }
+
     const serverChat = serverMap.get(chatId);
     if (!serverChat) {
+      next[chatId] = startTimestampMs;
       continue;
     }
+
     const isRunning = Boolean(serverChat.is_running);
-    const status = String(serverChat.status || "").toLowerCase();
-    if (!isRunning && status === "starting") {
-      next[chatId] = true;
+    if (!isRunning) {
+      next[chatId] = startTimestampMs;
     }
   }
   return next;

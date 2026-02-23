@@ -15,6 +15,7 @@ class WebPendingStateTests(unittest.TestCase):
             import assert from "node:assert/strict";
             import {
               isChatStarting,
+              PENDING_CHAT_START_STALE_MS,
               PENDING_SESSION_STALE_MS,
               reconcilePendingSessions,
               reconcilePendingChatStarts
@@ -70,23 +71,45 @@ class WebPendingStateTests(unittest.TestCase):
             );
             assert.equal(seenThenMissing.length, 0, "session should be removed once chat disappears after being seen");
 
-            const keepOnlyStarting = reconcilePendingChatStarts(
+            const keepPendingWithinGrace = reconcilePendingChatStarts(
               {
-                "chat-starting": true,
-                "chat-stopped": true,
-                "chat-running": true,
+                "chat-starting": baseTimeMs,
+                "chat-stopped": baseTimeMs,
+                "chat-running": baseTimeMs,
+                "chat-missing": baseTimeMs,
                 "chat-falsey": false
               },
               new Map([
                 ["chat-starting", { status: "starting", is_running: false }],
                 ["chat-stopped", { status: "stopped", is_running: false }],
                 ["chat-running", { status: "running", is_running: true }]
-              ])
+              ]),
+              baseTimeMs + 5_000
             );
             assert.deepEqual(
-              keepOnlyStarting,
-              { "chat-starting": true },
-              "pending start should only remain for chats still in starting state"
+              keepPendingWithinGrace,
+              {
+                "chat-starting": baseTimeMs,
+                "chat-stopped": baseTimeMs,
+                "chat-missing": baseTimeMs
+              },
+              "pending start should stay during grace while chat startup is still in-flight"
+            );
+
+            const dropAfterGrace = reconcilePendingChatStarts(
+              {
+                "chat-stopped": baseTimeMs,
+                "chat-missing": baseTimeMs
+              },
+              new Map([
+                ["chat-stopped", { status: "stopped", is_running: false }]
+              ]),
+              baseTimeMs + PENDING_CHAT_START_STALE_MS + 1
+            );
+            assert.deepEqual(
+              dropAfterGrace,
+              {},
+              "pending start should expire after grace timeout"
             );
 
             assert.equal(
