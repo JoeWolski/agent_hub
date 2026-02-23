@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
-import { Actions, Layout, Model } from "flexlayout-react";
+import { Layout, Model } from "flexlayout-react";
 import { isChatStarting, reconcilePendingChatStarts, reconcilePendingSessions } from "./chatPendingState";
 import {
   chatLayoutEngineOptions,
@@ -33,6 +33,8 @@ import {
 
 const THEME_STORAGE_KEY = "agent_hub_theme";
 const CREATE_PROJECT_CONFIG_MODE_STORAGE_KEY = "agent_hub_project_config_mode";
+const CHAT_FLEX_OUTER_LAYOUT_STORAGE_KEY = "agent_hub_chat_flexlayout_outer_layout_v1";
+const CHAT_FLEX_PROJECT_LAYOUT_STORAGE_KEY = "agent_hub_chat_flexlayout_project_layout_v1";
 const DEFAULT_BASE_IMAGE_TAG = "ubuntu:24.04";
 const DEFAULT_AGENT_TYPE = "codex";
 const DEFAULT_HUB_SETTINGS = {
@@ -285,6 +287,426 @@ function loadCreateProjectConfigMode() {
   } catch {
     return "auto";
   }
+}
+
+function readLocalStorageJson(storageKey, fallbackValue) {
+  if (typeof window === "undefined") {
+    return fallbackValue;
+  }
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) {
+      return fallbackValue;
+    }
+    return JSON.parse(raw);
+  } catch {
+    return fallbackValue;
+  }
+}
+
+function writeLocalStorageJson(storageKey, value) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.setItem(storageKey, JSON.stringify(value));
+  } catch {
+    // Ignore storage write failures and continue with in-memory state.
+  }
+}
+
+function cloneJson(value, fallbackValue) {
+  const source = value === null || value === undefined ? fallbackValue : value;
+  try {
+    const cloned = JSON.parse(JSON.stringify(source));
+    if (cloned === null || cloned === undefined) {
+      return fallbackValue;
+    }
+    return cloned;
+  } catch {
+    return fallbackValue;
+  }
+}
+
+function normalizeLayoutRowNode(node) {
+  if (!node || typeof node !== "object" || !Array.isArray(node.children)) {
+    return { type: "row", weight: 100, children: [] };
+  }
+  if (!String(node.type || "").trim()) {
+    node.type = "row";
+  }
+  return node;
+}
+
+function isLayoutTabsetNode(node) {
+  return Boolean(node && typeof node === "object" && String(node.type || "") === "tabset" && Array.isArray(node.children));
+}
+
+function visitLayoutNodes(node, visitor) {
+  if (!node || typeof node !== "object") {
+    return;
+  }
+  visitor(node);
+  if (!Array.isArray(node.children)) {
+    return;
+  }
+  for (const child of node.children) {
+    visitLayoutNodes(child, visitor);
+  }
+}
+
+function collectTabsetNodes(layoutNode) {
+  const tabsets = [];
+  visitLayoutNodes(layoutNode, (node) => {
+    if (isLayoutTabsetNode(node)) {
+      tabsets.push(node);
+    }
+  });
+  return tabsets;
+}
+
+function firstTabsetNode(layoutNode) {
+  return collectTabsetNodes(layoutNode)[0] || null;
+}
+
+function activeTabsetNode(layoutNode) {
+  const tabsets = collectTabsetNodes(layoutNode);
+  return tabsets.find((tabset) => Boolean(tabset.active)) || null;
+}
+
+function normalizeTabsetSelectedIndex(tabset) {
+  if (!isLayoutTabsetNode(tabset)) {
+    return;
+  }
+  const childCount = tabset.children.length;
+  if (childCount <= 0) {
+    tabset.selected = 0;
+    return;
+  }
+  const selected = Number(tabset.selected);
+  if (Number.isInteger(selected) && selected >= 0 && selected < childCount) {
+    return;
+  }
+  tabset.selected = 0;
+}
+
+function outerProjectTabId(projectId) {
+  return `project-${String(projectId || "").trim()}`;
+}
+
+function chatPaneTabId(chatId) {
+  return `chat-${String(chatId || "").trim()}`;
+}
+
+function projectIdFromOuterTab(tabNodeJson) {
+  const configuredProjectId = String(tabNodeJson?.config?.project_id || "").trim();
+  if (configuredProjectId) {
+    return configuredProjectId;
+  }
+  const id = String(tabNodeJson?.id || "").trim();
+  if (id.startsWith("project-")) {
+    return id.slice("project-".length);
+  }
+  return "";
+}
+
+function chatIdFromProjectPaneTab(tabNodeJson) {
+  const configuredChatId = String(tabNodeJson?.config?.chat_id || "").trim();
+  if (configuredChatId) {
+    return configuredChatId;
+  }
+  const id = String(tabNodeJson?.id || "").trim();
+  if (id.startsWith("chat-")) {
+    return id.slice("chat-".length);
+  }
+  return "";
+}
+
+function buildOuterProjectTabNode(project) {
+  return {
+    type: "tab",
+    id: outerProjectTabId(project.id),
+    name: String(project.name || "Project"),
+    component: "project-chat-group",
+    config: { project_id: project.id }
+  };
+}
+
+function buildOuterOrphanTabNode() {
+  return {
+    type: "tab",
+    id: "orphan-chats",
+    name: "Unknown project",
+    component: "orphan-chat-group",
+    config: {}
+  };
+}
+
+function buildProjectChatPaneTabNode(chat) {
+  return {
+    type: "tab",
+    id: chatPaneTabId(chat.id),
+    name: String(chat.display_name || chat.name || "Chat"),
+    component: "project-chat-pane",
+    config: { chat_id: chat.id }
+  };
+}
+
+function buildDefaultOuterFlexLayoutJson(projects, includeOrphanChats = false) {
+  const children = projects.map((project) => buildOuterProjectTabNode(project));
+  if (includeOrphanChats) {
+    children.push(buildOuterOrphanTabNode());
+  }
+  return {
+    global: {
+      tabEnableClose: false,
+      tabSetEnableDeleteWhenEmpty: false,
+      tabSetEnableMaximize: false
+    },
+    borders: [],
+    layout: {
+      type: "row",
+      weight: 100,
+      children: [
+        {
+          type: "tabset",
+          id: "chat-layout-main-tabset",
+          weight: 100,
+          selected: 0,
+          active: true,
+          children
+        }
+      ]
+    }
+  };
+}
+
+function buildDefaultProjectChatsFlexLayoutJson(chats, projectId) {
+  return {
+    global: {
+      tabEnableClose: false,
+      tabSetEnableDeleteWhenEmpty: false,
+      tabSetEnableMaximize: false
+    },
+    borders: [],
+    layout: {
+      type: "row",
+      weight: 100,
+      children: [
+        {
+          type: "tabset",
+          id: `project-${projectId}-chat-tabset-main`,
+          weight: 100,
+          selected: 0,
+          active: true,
+          children: chats.map((chat) => buildProjectChatPaneTabNode(chat))
+        }
+      ]
+    }
+  };
+}
+
+function normalizeSingleActiveTabset(tabsets, preferredTabset = null) {
+  let active = preferredTabset && tabsets.includes(preferredTabset) ? preferredTabset : null;
+  if (!active) {
+    active = tabsets.find((tabset) => Boolean(tabset.active)) || tabsets[0] || null;
+  }
+  for (const tabset of tabsets) {
+    if (active && tabset === active) {
+      tabset.active = true;
+      continue;
+    }
+    delete tabset.active;
+  }
+  return active;
+}
+
+function reconcileOuterFlexLayoutJson(existingLayoutJson, projects, includeOrphanChats = false) {
+  if (projects.length === 0 && !includeOrphanChats) {
+    return null;
+  }
+  const layoutJson = cloneJson(
+    existingLayoutJson,
+    buildDefaultOuterFlexLayoutJson(projects, includeOrphanChats)
+  );
+  layoutJson.global = {
+    ...(layoutJson.global || {}),
+    tabEnableClose: false,
+    tabSetEnableDeleteWhenEmpty: false,
+    tabSetEnableMaximize: false
+  };
+  layoutJson.borders = [];
+  layoutJson.layout = normalizeLayoutRowNode(layoutJson.layout);
+
+  let tabsets = collectTabsetNodes(layoutJson.layout);
+  if (tabsets.length === 0) {
+    layoutJson.layout.children = [
+      {
+        type: "tabset",
+        id: "chat-layout-main-tabset",
+        weight: 100,
+        selected: 0,
+        active: true,
+        children: []
+      }
+    ];
+    tabsets = collectTabsetNodes(layoutJson.layout);
+  }
+
+  const projectsById = new Map(projects.map((project) => [String(project.id || ""), project]));
+  const seenProjectIds = new Set();
+  let orphanTabSeen = false;
+
+  for (const tabset of tabsets) {
+    const nextChildren = [];
+    for (const child of tabset.children || []) {
+      if (!child || typeof child !== "object" || String(child.type || "") !== "tab") {
+        nextChildren.push(child);
+        continue;
+      }
+      const component = String(child.component || "");
+      if (component === "project-chat-group") {
+        const projectId = projectIdFromOuterTab(child);
+        if (!projectId || !projectsById.has(projectId) || seenProjectIds.has(projectId)) {
+          continue;
+        }
+        seenProjectIds.add(projectId);
+        const project = projectsById.get(projectId);
+        nextChildren.push({
+          ...child,
+          id: outerProjectTabId(projectId),
+          name: String(project.name || child.name || "Project"),
+          component: "project-chat-group",
+          config: { ...(child.config || {}), project_id: projectId }
+        });
+        continue;
+      }
+      if (component === "orphan-chat-group" || String(child.id || "") === "orphan-chats") {
+        if (!includeOrphanChats || orphanTabSeen) {
+          continue;
+        }
+        orphanTabSeen = true;
+        nextChildren.push({
+          ...child,
+          id: "orphan-chats",
+          name: "Unknown project",
+          component: "orphan-chat-group",
+          config: {}
+        });
+        continue;
+      }
+      nextChildren.push(child);
+    }
+    tabset.children = nextChildren;
+    normalizeTabsetSelectedIndex(tabset);
+  }
+
+  const selectedOuterProjectTabset = activeTabsetNode(layoutJson.layout) || firstTabsetNode(layoutJson.layout);
+  const targetTabset = selectedOuterProjectTabset || tabsets[0];
+
+  for (const project of projects) {
+    const projectId = String(project.id || "");
+    if (!projectId || seenProjectIds.has(projectId)) {
+      continue;
+    }
+    targetTabset.children.push(buildOuterProjectTabNode(project));
+    seenProjectIds.add(projectId);
+  }
+  if (includeOrphanChats && !orphanTabSeen) {
+    targetTabset.children.push(buildOuterOrphanTabNode());
+  }
+
+  tabsets = collectTabsetNodes(layoutJson.layout);
+  const active = normalizeSingleActiveTabset(tabsets, targetTabset);
+  for (const tabset of tabsets) {
+    normalizeTabsetSelectedIndex(tabset);
+  }
+  if (!active) {
+    return buildDefaultOuterFlexLayoutJson(projects, includeOrphanChats);
+  }
+  return layoutJson;
+}
+
+function reconcileProjectChatsFlexLayoutJson(existingLayoutJson, chats, projectId) {
+  if (chats.length === 0) {
+    return null;
+  }
+  const layoutJson = cloneJson(
+    existingLayoutJson,
+    buildDefaultProjectChatsFlexLayoutJson(chats, projectId)
+  );
+  layoutJson.global = {
+    ...(layoutJson.global || {}),
+    tabEnableClose: false,
+    tabSetEnableDeleteWhenEmpty: false,
+    tabSetEnableMaximize: false
+  };
+  layoutJson.borders = [];
+  layoutJson.layout = normalizeLayoutRowNode(layoutJson.layout);
+
+  let tabsets = collectTabsetNodes(layoutJson.layout);
+  if (tabsets.length === 0) {
+    layoutJson.layout.children = [
+      {
+        type: "tabset",
+        id: `project-${projectId}-chat-tabset-main`,
+        weight: 100,
+        selected: 0,
+        active: true,
+        children: []
+      }
+    ];
+    tabsets = collectTabsetNodes(layoutJson.layout);
+  }
+
+  const chatsById = new Map(chats.map((chat) => [String(chat.id || ""), chat]));
+  const seenChatIds = new Set();
+
+  for (const tabset of tabsets) {
+    const nextChildren = [];
+    for (const child of tabset.children || []) {
+      if (!child || typeof child !== "object" || String(child.type || "") !== "tab") {
+        nextChildren.push(child);
+        continue;
+      }
+      const component = String(child.component || "");
+      if (component !== "project-chat-pane") {
+        continue;
+      }
+      const chatId = chatIdFromProjectPaneTab(child);
+      if (!chatId || !chatsById.has(chatId) || seenChatIds.has(chatId)) {
+        continue;
+      }
+      const chat = chatsById.get(chatId);
+      seenChatIds.add(chatId);
+      nextChildren.push({
+        ...child,
+        id: chatPaneTabId(chatId),
+        name: String(chat.display_name || chat.name || child.name || "Chat"),
+        component: "project-chat-pane",
+        config: { ...(child.config || {}), chat_id: chatId }
+      });
+    }
+    tabset.children = nextChildren;
+    normalizeTabsetSelectedIndex(tabset);
+  }
+
+  const targetTabset = activeTabsetNode(layoutJson.layout) || firstTabsetNode(layoutJson.layout) || tabsets[0];
+  for (const chat of chats) {
+    const chatId = String(chat.id || "");
+    if (!chatId || seenChatIds.has(chatId)) {
+      continue;
+    }
+    targetTabset.children.push(buildProjectChatPaneTabNode(chat));
+    seenChatIds.add(chatId);
+  }
+
+  tabsets = collectTabsetNodes(layoutJson.layout);
+  normalizeSingleActiveTabset(tabsets, targetTabset);
+  for (const tabset of tabsets) {
+    normalizeTabsetSelectedIndex(tabset);
+  }
+  return layoutJson;
 }
 
 function applyThemePreference(preference) {
@@ -846,11 +1268,21 @@ function DownloadArrowIcon() {
   );
 }
 
-function ChatTerminal({ chatId, running }) {
+function ChatTerminal({
+  chatId,
+  running,
+  title = "",
+  titleStateLabel = "",
+  titleStateClassName = "",
+  statusOverride = "",
+  toolbarActions = null,
+  overlay = null
+}) {
   const shellRef = useRef(null);
   const hostRef = useRef(null);
   const [status, setStatus] = useState(running ? "connecting" : "offline");
-  const statusText = String(status || "unknown");
+  const statusText = String(status || "unknown").toLowerCase();
+  const displayStatus = String(statusOverride || statusText || "unknown").toLowerCase();
 
   useEffect(() => {
     if (!running) {
@@ -1034,14 +1466,32 @@ function ChatTerminal({ chatId, running }) {
   return (
     <div className="terminal-shell chat-terminal-shell" ref={shellRef}>
       <div className="terminal-toolbar">
-        <span
-          className={`terminal-health-dot ${statusText}`}
-          role="img"
-          aria-label={`Terminal health: ${statusText}`}
-          title={statusText}
-        />
+        <div className="terminal-toolbar-main">
+          <span
+            className={`terminal-health-dot ${displayStatus}`}
+            role="img"
+            aria-label={`Terminal health: ${displayStatus}`}
+            title={displayStatus}
+          />
+          {title ? (
+            <span className="terminal-title" title={title}>
+              {title}
+            </span>
+          ) : null}
+          {titleStateLabel ? (
+            <span className={`chat-title-state ${titleStateClassName}`.trim()}>
+              {titleStateLabel}
+            </span>
+          ) : null}
+        </div>
+        {toolbarActions ? (
+          <div className="terminal-toolbar-actions">
+            {toolbarActions}
+          </div>
+        ) : null}
       </div>
       <div className="terminal-view" ref={hostRef} />
+      {overlay ? <div className="terminal-overlay">{overlay}</div> : null}
     </div>
   );
 }
@@ -1520,9 +1970,20 @@ function HubApp() {
   const [pendingChatStarts, setPendingChatStarts] = useState({});
   const [pendingContainerRefreshes, setPendingContainerRefreshes] = useState({});
   const [themePreference, setThemePreference] = useState(() => loadThemePreference());
+  const [hubStateHydrated, setHubStateHydrated] = useState(false);
   const [defaultAgentSettingSaving, setDefaultAgentSettingSaving] = useState(false);
   const [chatLayoutEngineSettingSaving, setChatLayoutEngineSettingSaving] = useState(false);
-  const [chatFlexLayoutActiveTabId, setChatFlexLayoutActiveTabId] = useState("");
+  const [chatFlexOuterLayoutJson, setChatFlexOuterLayoutJson] = useState(() => {
+    const loaded = readLocalStorageJson(CHAT_FLEX_OUTER_LAYOUT_STORAGE_KEY, null);
+    return loaded && typeof loaded === "object" ? loaded : null;
+  });
+  const [chatFlexProjectLayoutsByProjectId, setChatFlexProjectLayoutsByProjectId] = useState(() => {
+    const loaded = readLocalStorageJson(CHAT_FLEX_PROJECT_LAYOUT_STORAGE_KEY, {});
+    if (!loaded || typeof loaded !== "object" || Array.isArray(loaded)) {
+      return {};
+    }
+    return loaded;
+  });
   const [openAiProviderStatus, setOpenAiProviderStatus] = useState(() =>
     normalizeOpenAiProviderStatus(null)
   );
@@ -1579,6 +2040,7 @@ function HubApp() {
   const applyStatePayload = useCallback((payload) => {
     const normalizedPayload = normalizeHubStatePayload(payload);
     setHubState(normalizedPayload);
+    setHubStateHydrated(true);
     const serverChatMap = new Map((normalizedPayload.chats || []).map((chat) => [chat.id, chat]));
     setPendingSessions((prev) => reconcilePendingSessions(prev, serverChatMap));
     setPendingChatStarts((prev) => reconcilePendingChatStarts(prev, serverChatMap));
@@ -3033,58 +3495,45 @@ function HubApp() {
     }
     return { byProject, orphanChats };
   }, [orderedProjects, orderedVisibleChats]);
-  const chatFlexLayoutTabs = useMemo(() => {
-    const tabs = orderedProjects.map((project) => ({
-      id: `project-${project.id}`,
-      name: project.name,
-      component: "project-chat-group",
-      config: { project_id: project.id }
-    }));
-    if (chatsByProject.orphanChats.length > 0) {
-      tabs.push({
-        id: "orphan-chats",
-        name: "Unknown project",
-        component: "orphan-chat-group",
-        config: {}
-      });
+  const chatFlexOuterLayoutReconciledJson = useMemo(
+    () => reconcileOuterFlexLayoutJson(chatFlexOuterLayoutJson, orderedProjects, chatsByProject.orphanChats.length > 0),
+    [chatFlexOuterLayoutJson, orderedProjects, chatsByProject.orphanChats.length]
+  );
+  const chatFlexProjectLayoutsReconciledByProjectId = useMemo(() => {
+    const next = {};
+    for (const project of orderedProjects) {
+      const projectId = String(project.id || "");
+      if (!projectId) {
+        continue;
+      }
+      const projectChats = chatsByProject.byProject.get(projectId) || [];
+      const reconciled = reconcileProjectChatsFlexLayoutJson(
+        chatFlexProjectLayoutsByProjectId[projectId],
+        projectChats,
+        projectId
+      );
+      if (reconciled) {
+        next[projectId] = reconciled;
+      }
     }
-    return tabs;
-  }, [orderedProjects, chatsByProject.orphanChats.length]);
-  const chatFlexLayoutModel = useMemo(() => {
-    if (chatFlexLayoutTabs.length === 0) {
+    return next;
+  }, [chatFlexProjectLayoutsByProjectId, orderedProjects, chatsByProject]);
+  const chatFlexOuterModel = useMemo(() => {
+    if (
+      !chatFlexOuterLayoutReconciledJson ||
+      typeof chatFlexOuterLayoutReconciledJson !== "object" ||
+      !chatFlexOuterLayoutReconciledJson.layout ||
+      typeof chatFlexOuterLayoutReconciledJson.layout !== "object"
+    ) {
       return null;
     }
-    const selectedIndex = chatFlexLayoutTabs.findIndex((tab) => tab.id === chatFlexLayoutActiveTabId);
-    return Model.fromJson({
-      global: {
-        tabEnableClose: false,
-        tabSetEnableDeleteWhenEmpty: false,
-        tabSetEnableDrag: false,
-        tabSetEnableDrop: false,
-        tabSetEnableMaximize: false
-      },
-      borders: [],
-      layout: {
-        type: "row",
-        weight: 100,
-        children: [
-          {
-            type: "tabset",
-            id: "chat-layout-main-tabset",
-            weight: 100,
-            selected: selectedIndex >= 0 ? selectedIndex : 0,
-            children: chatFlexLayoutTabs.map((tab) => ({
-              type: "tab",
-              id: tab.id,
-              name: tab.name,
-              component: tab.component,
-              config: tab.config
-            }))
-          }
-        ]
-      }
-    });
-  }, [chatFlexLayoutTabs, chatFlexLayoutActiveTabId]);
+    try {
+      return Model.fromJson(chatFlexOuterLayoutReconciledJson);
+    } catch (err) {
+      console.error("Failed to parse outer flex layout model.", err);
+      return null;
+    }
+  }, [chatFlexOuterLayoutReconciledJson]);
   const chatFlexLayoutThemeClass = useMemo(
     () => `flexlayout__theme_${resolveEffectiveTheme(themePreference)}`,
     [themePreference]
@@ -3260,18 +3709,55 @@ function HubApp() {
   }, [themePreference]);
 
   useEffect(() => {
-    if (chatFlexLayoutTabs.length === 0) {
-      setChatFlexLayoutActiveTabId("");
+    if (!hubStateHydrated) {
       return;
     }
-    const tabIds = new Set(chatFlexLayoutTabs.map((tab) => tab.id));
-    setChatFlexLayoutActiveTabId((current) => {
-      if (current && tabIds.has(current)) {
-        return current;
+    const keepProjectIds = new Set(orderedProjects.map((project) => String(project.id || "")));
+    setChatFlexProjectLayoutsByProjectId((prev) => {
+      let changed = false;
+      const next = {};
+      for (const [projectId, layoutJson] of Object.entries(prev || {})) {
+        if (!keepProjectIds.has(projectId)) {
+          changed = true;
+          continue;
+        }
+        next[projectId] = layoutJson;
       }
-      return chatFlexLayoutTabs[0].id;
+      return changed ? next : prev;
     });
-  }, [chatFlexLayoutTabs]);
+  }, [hubStateHydrated, orderedProjects]);
+
+  useEffect(() => {
+    if (!hubStateHydrated) {
+      return;
+    }
+    const currentSerialized = JSON.stringify(chatFlexOuterLayoutJson || null);
+    const nextSerialized = JSON.stringify(chatFlexOuterLayoutReconciledJson || null);
+    if (currentSerialized === nextSerialized) {
+      return;
+    }
+    setChatFlexOuterLayoutJson(chatFlexOuterLayoutReconciledJson || null);
+  }, [chatFlexOuterLayoutJson, chatFlexOuterLayoutReconciledJson, hubStateHydrated]);
+
+  useEffect(() => {
+    if (!hubStateHydrated) {
+      return;
+    }
+    const currentSerialized = JSON.stringify(chatFlexProjectLayoutsByProjectId || {});
+    const nextSerialized = JSON.stringify(chatFlexProjectLayoutsReconciledByProjectId || {});
+    if (currentSerialized === nextSerialized) {
+      return;
+    }
+    setChatFlexProjectLayoutsByProjectId(chatFlexProjectLayoutsReconciledByProjectId || {});
+  }, [chatFlexProjectLayoutsByProjectId, chatFlexProjectLayoutsReconciledByProjectId, hubStateHydrated]);
+
+  useEffect(() => {
+    writeLocalStorageJson(CHAT_FLEX_OUTER_LAYOUT_STORAGE_KEY, chatFlexOuterLayoutJson || null);
+  }, [chatFlexOuterLayoutJson]);
+
+  useEffect(() => {
+    writeLocalStorageJson(CHAT_FLEX_PROJECT_LAYOUT_STORAGE_KEY, chatFlexProjectLayoutsByProjectId || {});
+  }, [chatFlexProjectLayoutsByProjectId]);
 
   useEffect(() => {
     if (!fullscreenChatId) {
@@ -3461,7 +3947,6 @@ function HubApp() {
         })
         .filter(Boolean)
       : [];
-    const rowOpen = fullscreenChatId === chat.id ? true : (openChats[chat.id] ?? true);
     const detailsOpen = openChatDetails[chat.id] ?? false;
     const thumbnailsVisible = showArtifactThumbnailsByChat[chat.id] ?? true;
     const isFullscreenChat = fullscreenChatId === chat.id;
@@ -3470,11 +3955,7 @@ function HubApp() {
     const containerClassName = ["card", isFullscreenChat ? "chat-card-popped" : ""].filter(Boolean).join(" ");
     const titleText = chat.display_name || chat.name;
     const titleStateLabel = titleStatus === "error" ? "Title error" : "";
-    const rowSubtitle = isStarting
-      ? "Starting chat and preparing terminal..."
-      : isFailed && startError
-        ? startError
-      : chat.display_subtitle || "No recent assistant summary yet.";
+    const terminalStatusOverride = isRunning ? "" : statusClassName;
 
     const buildArtifactRenderInfo = (artifact) => {
       const artifactId = String(artifact?.id || "");
@@ -3615,253 +4096,232 @@ function HubApp() {
     const nonPreviewableCurrentArtifacts = currentArtifactItems.filter(({ artifactInfo }) => !artifactInfo.canPreview);
     const previewableCurrentArtifacts = currentArtifactItems.filter(({ artifactInfo }) => artifactInfo.canPreview);
 
-    return (
-      <article className={containerClassName} key={chat.id}>
-        <div
-          className="chat-card-header"
-          role="button"
-          tabIndex={0}
-          onClick={() => toggleChatRow(chat)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              toggleChatRow(chat);
+    const terminalToolbarActions = (
+      <>
+        {showOpenAiHelperButton ? (
+          <button
+            type="button"
+            className="chat-header-helper-button"
+            title="Open OpenAI account login helper"
+            aria-label={`Open OpenAI account login helper for ${chat.display_name || chat.name}`}
+            onClick={openOpenAiLoginHelper}
+          >
+            <InfoIcon />
+            <span>Connect account</span>
+          </button>
+        ) : null}
+        {showContainerRefreshButton ? (
+          <button
+            type="button"
+            className={`icon-button chat-header-icon chat-header-refresh${isContainerRefreshInFlight ? " is-refreshing" : ""}`}
+            title={containerRefreshTooltip}
+            aria-label={
+              isContainerRefreshInFlight
+                ? `Refreshing container for ${chat.display_name || chat.name}`
+                : `Refresh out-of-date container for ${chat.display_name || chat.name}`
             }
+            disabled={isContainerRefreshInFlight}
+            onClick={() => handleRefreshChatContainer(resolvedChatId)}
+          >
+            <RefreshWarningIcon />
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className="icon-button chat-header-icon chat-header-popout"
+          title={isFullscreenChat ? "Minimize" : "Pop out"}
+          aria-label={isFullscreenChat ? `Minimize ${chat.display_name || chat.name}` : `Pop out ${chat.display_name || chat.name}`}
+          onClick={() => {
+            if (isFullscreenChat) {
+              setFullscreenChatId("");
+              return;
+            }
+            setOpenChats((prev) => ({ ...prev, [chat.id]: true }));
+            setFullscreenChatId(chat.id);
           }}
         >
-          <div className="chat-card-header-main">
-            <div className="chat-card-title-row">
-              <h3 className="chat-card-title">{titleText}</h3>
-              {titleStateLabel ? (
-                <span className={`chat-title-state ${titleStatus}`}>{titleStateLabel}</span>
+          {isFullscreenChat ? <MinimizeIcon /> : <ExpandIcon />}
+        </button>
+        <button
+          type="button"
+          className="icon-button chat-header-icon"
+          title={detailsOpen ? "Hide details" : "Show details"}
+          aria-label={detailsOpen ? `Hide details for ${chat.display_name || chat.name}` : `Show details for ${chat.display_name || chat.name}`}
+          onClick={() => {
+            setOpenChatDetails((prev) => ({ ...prev, [chat.id]: !(prev[chat.id] ?? false) }));
+          }}
+        >
+          <EllipsisIcon />
+        </button>
+        <button
+          type="button"
+          className="icon-button chat-header-icon chat-header-delete"
+          title={`Delete ${titleText}`}
+          aria-label={`Delete ${titleText}`}
+          onClick={() => {
+            if (!chatHasServer) {
+              setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chat.id));
+              setOpenChats((prev) => {
+                const next = { ...prev };
+                delete next[chat.id];
+                return next;
+              });
+              setOpenChatDetails((prev) => {
+                const next = { ...prev };
+                delete next[chat.id];
+                return next;
+              });
+              setFullscreenChatId((current) => (current === chat.id ? "" : current));
+              return;
+            }
+            handleDeleteChat(resolvedChatId, chat.id);
+          }}
+        >
+          <CloseIcon />
+        </button>
+      </>
+    );
+
+    return (
+      <article className={containerClassName} key={chat.id}>
+        <div className="stack compact chat-card-body">
+          {detailsOpen ? (
+            <section className="chat-details">
+              <div className="meta">
+                Status:{" "}
+                <span className={`status ${statusClassName}`}>
+                  {statusLabel}
+                </span>
+              </div>
+              {statusReason ? <div className="meta">Status reason: {statusReason}</div> : null}
+              {startError ? <div className="meta build-error">Start error: {startError}</div> : null}
+              {chat.last_exit_code !== null && chat.last_exit_code !== undefined
+                ? <div className="meta">Last exit code: {chat.last_exit_code}</div>
+                : null}
+              <div className="meta">Title status: {titleStatus || "idle"}</div>
+              {chat.title_error ? <div className="meta build-error">Title generation error: {chat.title_error}</div> : null}
+              <div className="meta">Chat ID: {resolvedChatId || "starting..."}</div>
+              <div className="meta">Agent: {agentTypeLabel(chat.agent_type, agentCapabilities)}</div>
+              <div className="meta">Workspace: {chat.workspace}</div>
+              <div className="meta">Container folder: {chat.container_workspace || "not started yet"}</div>
+              {chat.setup_snapshot_image ? (
+                <div className="meta">Setup snapshot image: {chat.setup_snapshot_image}</div>
               ) : null}
-            </div>
-            {!rowOpen ? (
-              <div className="meta chat-summary">{rowSubtitle}</div>
-            ) : null}
-          </div>
-          <div className="chat-card-header-actions">
-            {showOpenAiHelperButton ? (
-              <button
-                type="button"
-                className="chat-header-helper-button"
-                title="Open OpenAI account login helper"
-                aria-label={`Open OpenAI account login helper for ${chat.display_name || chat.name}`}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  openOpenAiLoginHelper();
-                }}
-              >
-                <InfoIcon />
-                <span>Connect account</span>
-              </button>
-            ) : null}
-            {showContainerRefreshButton ? (
-              <button
-                type="button"
-                className={`icon-button chat-header-icon chat-header-refresh${isContainerRefreshInFlight ? " is-refreshing" : ""}`}
-                title={containerRefreshTooltip}
-                aria-label={
-                  isContainerRefreshInFlight
-                    ? `Refreshing container for ${chat.display_name || chat.name}`
-                    : `Refresh out-of-date container for ${chat.display_name || chat.name}`
-                }
-                disabled={isContainerRefreshInFlight}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  handleRefreshChatContainer(resolvedChatId);
-                }}
-              >
-                <RefreshWarningIcon />
-              </button>
-            ) : null}
-            <button
-              type="button"
-              className="icon-button chat-header-icon chat-header-popout"
-              title={isFullscreenChat ? "Minimize" : "Pop out"}
-              aria-label={isFullscreenChat ? `Minimize ${chat.display_name || chat.name}` : `Pop out ${chat.display_name || chat.name}`}
-              onClick={(event) => {
-                event.stopPropagation();
-                if (isFullscreenChat) {
-                  setFullscreenChatId("");
-                  return;
-                }
-                setOpenChats((prev) => ({ ...prev, [chat.id]: true }));
-                setFullscreenChatId(chat.id);
-              }}
-            >
-              {isFullscreenChat ? <MinimizeIcon /> : <ExpandIcon />}
-            </button>
-            <button
-              type="button"
-              className="icon-button chat-header-icon"
-              title={detailsOpen ? "Hide details" : "Show details"}
-              aria-label={detailsOpen ? `Hide details for ${chat.display_name || chat.name}` : `Show details for ${chat.display_name || chat.name}`}
-              onClick={(event) => {
-                event.stopPropagation();
-                setOpenChatDetails((prev) => ({ ...prev, [chat.id]: !(prev[chat.id] ?? false) }));
-              }}
-            >
-              <EllipsisIcon />
-            </button>
-            <button
-              type="button"
-              className="icon-button chat-header-icon chat-header-delete"
-              title={`Delete ${titleText}`}
-              aria-label={`Delete ${titleText}`}
-              onClick={(event) => {
-                event.stopPropagation();
-                if (!chatHasServer) {
-                  setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chat.id));
-                  setOpenChats((prev) => {
-                    const next = { ...prev };
-                    delete next[chat.id];
-                    return next;
-                  });
-                  setOpenChatDetails((prev) => {
-                    const next = { ...prev };
-                    delete next[chat.id];
-                    return next;
-                  });
-                  setFullscreenChatId((current) => (current === chat.id ? "" : current));
-                  return;
-                }
-                handleDeleteChat(resolvedChatId, chat.id);
-              }}
-            >
-              <CloseIcon />
-            </button>
-          </div>
-        </div>
-
-        {rowOpen ? (
-          <div className="stack compact chat-card-body">
-            {detailsOpen ? (
-              <section className="chat-details">
-                <div className="meta">
-                  Status:{" "}
-                  <span className={`status ${statusClassName}`}>
-                    {statusLabel}
-                  </span>
-                </div>
-                {statusReason ? <div className="meta">Status reason: {statusReason}</div> : null}
-                {startError ? <div className="meta build-error">Start error: {startError}</div> : null}
-                {chat.last_exit_code !== null && chat.last_exit_code !== undefined
-                  ? <div className="meta">Last exit code: {chat.last_exit_code}</div>
-                  : null}
-                <div className="meta">Title status: {titleStatus || "idle"}</div>
-                {chat.title_error ? <div className="meta build-error">Title generation error: {chat.title_error}</div> : null}
-                <div className="meta">Chat ID: {resolvedChatId || "starting..."}</div>
-                <div className="meta">Agent: {agentTypeLabel(chat.agent_type, agentCapabilities)}</div>
-                <div className="meta">Workspace: {chat.workspace}</div>
-                <div className="meta">Container folder: {chat.container_workspace || "not started yet"}</div>
-                {chat.setup_snapshot_image ? (
-                  <div className="meta">Setup snapshot image: {chat.setup_snapshot_image}</div>
-                ) : null}
-                <div className="meta">Volumes: {volumeCount} | Env vars: {envCount}</div>
-                {artifactPromptHistory.length > 0 ? (
-                  <details className="details-block chat-artifact-history-block">
-                    <summary className="details-summary">Historical files ({artifactPromptHistory.length})</summary>
-                    <div className="chat-artifact-history-list">
-                      {artifactPromptHistory.map((historyEntry, index) => (
-                        <section
-                          className="chat-artifact-history-entry"
-                          key={`history-${chat.id}-${index}-${historyEntry.prompt}`}
-                        >
-                          <div className="meta chat-artifact-history-label">
-                            Prompt:{" "}
-                            <span className="chat-artifact-history-prompt">{historyEntry.prompt}</span>
-                            {historyEntry.archivedAt ? ` (${formatTimestamp(historyEntry.archivedAt)})` : ""}
-                          </div>
-                          <div className="chat-artifact-list">
-                            {historyEntry.artifacts.map((artifact, artifactIndex) =>
-                              renderArtifactBubble(artifact, `history-${index}-${artifactIndex}`)
-                            )}
-                          </div>
-                        </section>
-                      ))}
-                    </div>
-                  </details>
-                ) : null}
-              </section>
-            ) : null}
-
-            {isStarting && !isRunning ? (
-              <div className="terminal-shell chat-terminal-shell chat-terminal-placeholder">
-                <div className="terminal-overlay">
-                  <span className="inline-spinner" aria-hidden="true" />
-                </div>
-              </div>
-            ) : isRunning ? (
-              <ChatTerminal
-                key={`${resolvedChatId}-${isFullscreenChat ? "fullscreen" : "inline"}`}
-                chatId={resolvedChatId}
-                running={isRunning}
-              />
-            ) : chatHasServer ? (
-              <div className="stack compact">
-                <div className="meta chat-terminal-stopped">
-                  {isFailed ? "Chat failed. Review the error and retry." : "Chat is stopped. Start it to reconnect the terminal."}
-                </div>
-                {isFailed && startError ? <div className="meta build-error">{startError}</div> : null}
-                <div className="actions chat-actions">
-                  <button
-                    type="button"
-                    className="btn-primary chat-primary-action"
-                    onClick={() => handleStartChat(resolvedChatId)}
-                  >
-                    {isFailed ? "Retry chat" : "Start chat"}
-                  </button>
-                </div>
-              </div>
-            ) : null}
-
-            {currentArtifacts.length > 0 ? (
-              <section className="chat-artifacts" aria-label={`Generated files for ${titleText}`}>
-                {nonPreviewableCurrentArtifacts.length > 0 ? (
-                  <div className="chat-artifact-list">
-                    {nonPreviewableCurrentArtifacts.map(({ artifact, index, artifactInfo }) =>
-                      renderArtifactBubble(artifact, `current-${index}`, artifactInfo)
-                    )}
-                  </div>
-                ) : null}
-                {previewableCurrentArtifacts.length > 0 ? (
-                  <>
-                    <div className="chat-artifact-preview-header">
-                      <button
-                        type="button"
-                        className="btn-secondary btn-small chat-artifact-thumbnail-toggle"
-                        aria-label={`${thumbnailsVisible ? "Hide" : "Show"} thumbnails for ${titleText}`}
-                        aria-pressed={thumbnailsVisible}
-                        onClick={() =>
-                          setShowArtifactThumbnailsByChat((prev) => ({
-                            ...prev,
-                            [chat.id]: !(prev[chat.id] ?? true)
-                          }))
-                        }
+              <div className="meta">Volumes: {volumeCount} | Env vars: {envCount}</div>
+              {artifactPromptHistory.length > 0 ? (
+                <details className="details-block chat-artifact-history-block">
+                  <summary className="details-summary">Historical files ({artifactPromptHistory.length})</summary>
+                  <div className="chat-artifact-history-list">
+                    {artifactPromptHistory.map((historyEntry, index) => (
+                      <section
+                        className="chat-artifact-history-entry"
+                        key={`history-${chat.id}-${index}-${historyEntry.prompt}`}
                       >
-                        {thumbnailsVisible ? "Hide thumbnails" : "Show thumbnails"}
-                      </button>
+                        <div className="meta chat-artifact-history-label">
+                          Prompt:{" "}
+                          <span className="chat-artifact-history-prompt">{historyEntry.prompt}</span>
+                          {historyEntry.archivedAt ? ` (${formatTimestamp(historyEntry.archivedAt)})` : ""}
+                        </div>
+                        <div className="chat-artifact-list">
+                          {historyEntry.artifacts.map((artifact, artifactIndex) =>
+                            renderArtifactBubble(artifact, `history-${index}-${artifactIndex}`)
+                          )}
+                        </div>
+                      </section>
+                    ))}
+                  </div>
+                </details>
+              ) : null}
+            </section>
+          ) : null}
+
+          {isRunning ? (
+            <ChatTerminal
+              key={`${resolvedChatId}-${isFullscreenChat ? "fullscreen" : "inline"}`}
+              chatId={resolvedChatId}
+              running={isRunning}
+              title={titleText}
+              titleStateLabel={titleStateLabel}
+              titleStateClassName={titleStatus}
+              toolbarActions={terminalToolbarActions}
+            />
+          ) : (
+            <ChatTerminal
+              key={`offline-${chat.id}-${isFullscreenChat ? "fullscreen" : "inline"}`}
+              chatId={resolvedChatId}
+              running={false}
+              statusOverride={terminalStatusOverride}
+              title={titleText}
+              titleStateLabel={titleStateLabel}
+              titleStateClassName={titleStatus}
+              toolbarActions={terminalToolbarActions}
+              overlay={isStarting ? <span className="inline-spinner" aria-hidden="true" /> : null}
+            />
+          )}
+
+          {!isRunning && chatHasServer && !isStarting ? (
+            <div className="stack compact">
+              <div className="meta chat-terminal-stopped">
+                {isFailed ? "Chat failed. Review the error and retry." : "Chat is stopped. Start it to reconnect the terminal."}
+              </div>
+              {isFailed && startError ? <div className="meta build-error">{startError}</div> : null}
+              <div className="actions chat-actions">
+                <button
+                  type="button"
+                  className="btn-primary chat-primary-action"
+                  onClick={() => handleStartChat(resolvedChatId)}
+                >
+                  {isFailed ? "Retry chat" : "Start chat"}
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          {currentArtifacts.length > 0 ? (
+            <section className="chat-artifacts" aria-label={`Generated files for ${titleText}`}>
+              {nonPreviewableCurrentArtifacts.length > 0 ? (
+                <div className="chat-artifact-list">
+                  {nonPreviewableCurrentArtifacts.map(({ artifact, index, artifactInfo }) =>
+                    renderArtifactBubble(artifact, `current-${index}`, artifactInfo)
+                  )}
+                </div>
+              ) : null}
+              {previewableCurrentArtifacts.length > 0 ? (
+                <>
+                  <div className="chat-artifact-preview-header">
+                    <button
+                      type="button"
+                      className="btn-secondary btn-small chat-artifact-thumbnail-toggle"
+                      aria-label={`${thumbnailsVisible ? "Hide" : "Show"} thumbnails for ${titleText}`}
+                      aria-pressed={thumbnailsVisible}
+                      onClick={() =>
+                        setShowArtifactThumbnailsByChat((prev) => ({
+                          ...prev,
+                          [chat.id]: !(prev[chat.id] ?? true)
+                        }))
+                      }
+                    >
+                      {thumbnailsVisible ? "Hide thumbnails" : "Show thumbnails"}
+                    </button>
+                  </div>
+                  {thumbnailsVisible ? (
+                    <div className="chat-artifact-thumbnail-row">
+                      {previewableCurrentArtifacts.map(({ artifact, index, artifactInfo }) =>
+                        renderArtifactThumbnail(artifact, `current-preview-${index}`, artifactInfo)
+                      )}
                     </div>
-                    {thumbnailsVisible ? (
-                      <div className="chat-artifact-thumbnail-row">
-                        {previewableCurrentArtifacts.map(({ artifact, index, artifactInfo }) =>
-                          renderArtifactThumbnail(artifact, `current-preview-${index}`, artifactInfo)
-                        )}
-                      </div>
-                    ) : (
-                      <div className="chat-artifact-list chat-artifact-bubble-row">
-                        {previewableCurrentArtifacts.map(({ artifact, index, artifactInfo }) =>
-                          renderArtifactBubble(artifact, `current-preview-bubble-${index}`, artifactInfo)
-                        )}
-                      </div>
-                    )}
-                  </>
-                ) : null}
-              </section>
-            ) : null}
-          </div>
-        ) : null}
+                  ) : (
+                    <div className="chat-artifact-list chat-artifact-bubble-row">
+                      {previewableCurrentArtifacts.map(({ artifact, index, artifactInfo }) =>
+                        renderArtifactBubble(artifact, `current-preview-bubble-${index}`, artifactInfo)
+                      )}
+                    </div>
+                  )}
+                </>
+              ) : null}
+            </section>
+          ) : null}
+        </div>
       </article>
     );
   }
@@ -4028,6 +4488,157 @@ function HubApp() {
     );
   }
 
+  function renderFlexLayoutProjectHeaderControls(tabSetNode, renderValues) {
+    const selectedNode = tabSetNode?.getSelectedNode?.();
+    if (!selectedNode) {
+      return;
+    }
+    const selectedComponent = String(selectedNode.getComponent() || "");
+    if (selectedComponent !== "project-chat-group") {
+      return;
+    }
+    const projectId = String(selectedNode.getConfig()?.project_id || "");
+    const project = projectsById.get(projectId);
+    if (!project) {
+      return;
+    }
+    const buildStatus = String(project.build_status || "pending");
+    const canStartChat = buildStatus === "ready";
+    const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
+    const projectStartSettings = normalizeChatStartSettings(
+      chatStartSettingsByProject[project.id] || { agentType: hubSettings.defaultAgentType },
+      agentCapabilities
+    );
+    const projectAgentOptions = agentTypeOptions(agentCapabilities);
+    const projectModelOptions = startModelOptionsForAgent(projectStartSettings.agentType, agentCapabilities);
+    const projectReasoningOptions = reasoningModeOptionsForAgent(projectStartSettings.agentType, agentCapabilities);
+    const projectSupportsReasoning = projectReasoningOptions.length > 1;
+
+    renderValues.stickyButtons.push(
+      <div
+        key={`outer-project-controls-${tabSetNode.getId()}`}
+        className="chat-layout-project-controls"
+        onPointerDown={(event) => event.stopPropagation()}
+        onClick={(event) => event.stopPropagation()}
+      >
+        {canStartChat ? (
+          <>
+            <select
+              className="project-start-select"
+              aria-label={`Agent for ${project.name}`}
+              value={projectStartSettings.agentType}
+              onChange={(event) => {
+                updateProjectChatStartSettings(project.id, { agentType: event.target.value });
+              }}
+            >
+              {projectAgentOptions.map((option) => (
+                <option key={`${project.id}-outer-agent-${option.value}`} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <select
+              className="project-start-select"
+              aria-label={`Start model for ${project.name}`}
+              value={projectStartSettings.model}
+              onChange={(event) => {
+                updateProjectChatStartSettings(project.id, { model: event.target.value });
+              }}
+            >
+              {projectModelOptions.map((modelOption) => (
+                <option key={`${project.id}-outer-model-${projectStartSettings.agentType}-${modelOption}`} value={modelOption}>
+                  {modelOption}
+                </option>
+              ))}
+            </select>
+            {projectSupportsReasoning ? (
+              <select
+                className="project-start-select"
+                aria-label={`Reasoning mode for ${project.name}`}
+                value={projectStartSettings.reasoning}
+                onChange={(event) => {
+                  updateProjectChatStartSettings(project.id, { reasoning: event.target.value });
+                }}
+              >
+                {projectReasoningOptions.map((reasoningMode) => (
+                  <option key={`${project.id}-outer-reasoning-${reasoningMode}`} value={reasoningMode}>
+                    {reasoningMode}
+                  </option>
+                ))}
+              </select>
+            ) : null}
+          </>
+        ) : null}
+        <button
+          type="button"
+          className="btn-primary project-group-action chat-layout-project-control-button"
+          disabled={!canStartChat && isBuilding}
+          onClick={() => {
+            if (canStartChat) {
+              handleCreateChat(project.id, projectStartSettings);
+            } else {
+              handleBuildProject(project.id);
+            }
+          }}
+        >
+          {canStartChat
+            ? "New chat"
+            : isBuilding
+              ? <SpinnerLabel text="Building image..." />
+              : "Build image"}
+        </button>
+      </div>
+    );
+  }
+
+  function renderProjectChatsFlexLayout(project) {
+    const projectChats = chatsByProject.byProject.get(project.id) || [];
+    if (projectChats.length === 0) {
+      return <div className="empty">No chats yet for this project.</div>;
+    }
+    const projectChatLayoutJson = chatFlexProjectLayoutsReconciledByProjectId[project.id] || null;
+    if (!projectChatLayoutJson) {
+      return <div className="empty">No chats yet for this project.</div>;
+    }
+    if (!projectChatLayoutJson.layout || typeof projectChatLayoutJson.layout !== "object") {
+      return <div className="empty">No chats yet for this project.</div>;
+    }
+    let projectChatModel = null;
+    try {
+      projectChatModel = Model.fromJson(projectChatLayoutJson);
+    } catch (err) {
+      console.error(`Failed to parse project chat flex layout model for ${project.id}.`, err);
+      return <div className="empty">Unable to load saved chat layout for this project.</div>;
+    }
+    const chatsById = new Map(projectChats.map((chat) => [String(chat.id || ""), chat]));
+    const renderProjectChatPaneTab = (tabNode) => {
+      const component = String(tabNode.getComponent() || "");
+      if (component !== "project-chat-pane") {
+        return <div className="empty">Unsupported project chat tab.</div>;
+      }
+      const chatId = String(tabNode.getConfig()?.chat_id || "");
+      const chat = chatsById.get(chatId);
+      if (!chat) {
+        return <div className="empty">Chat no longer exists.</div>;
+      }
+      return <div className="chat-layout-project-chat-pane">{renderChatCard(chat)}</div>;
+    };
+    return (
+      <div className={`chat-layout-project-shell ${chatFlexLayoutThemeClass}`.trim()}>
+        <Layout
+          model={projectChatModel}
+          factory={renderProjectChatPaneTab}
+          onModelChange={(model) => {
+            setChatFlexProjectLayoutsByProjectId((prev) => ({
+              ...(prev || {}),
+              [project.id]: model.toJson()
+            }));
+          }}
+        />
+      </div>
+    );
+  }
+
   function renderChatFlexLayoutTab(node) {
     const component = String(node.getComponent() || "");
     if (component === "project-chat-group") {
@@ -4036,7 +4647,7 @@ function HubApp() {
       if (!project) {
         return <div className="empty">Project no longer exists.</div>;
       }
-      return <div className="chat-layout-flex-tab">{renderProjectChatGroup(project, `flex-${project.id}`)}</div>;
+      return <div className="chat-layout-flex-tab">{renderProjectChatsFlexLayout(project)}</div>;
     }
     if (component === "orphan-chat-group") {
       return <div className="chat-layout-flex-tab">{renderOrphanChatGroup("flex-group-orphan")}</div>;
@@ -4044,26 +4655,19 @@ function HubApp() {
     return <div className="empty">Unsupported chat layout tab.</div>;
   }
 
-  function handleChatFlexLayoutAction(action) {
-    if (String(action?.type || "") === Actions.SELECT_TAB) {
-      const selectedTabId = String(action?.data?.tabNode || "");
-      if (selectedTabId) {
-        setChatFlexLayoutActiveTabId(selectedTabId);
-      }
-    }
-    return action;
-  }
-
   function renderFlexLayoutChatsLayout() {
-    if (!chatFlexLayoutModel || chatFlexLayoutTabs.length === 0) {
+    if (!chatFlexOuterModel || !chatFlexOuterLayoutReconciledJson) {
       return <div className="empty">No projects yet.</div>;
     }
     return (
       <div className={`chat-layout-flex-shell ${chatFlexLayoutThemeClass}`.trim()}>
         <Layout
-          model={chatFlexLayoutModel}
+          model={chatFlexOuterModel}
           factory={renderChatFlexLayoutTab}
-          onAction={handleChatFlexLayoutAction}
+          onRenderTabSet={renderFlexLayoutProjectHeaderControls}
+          onModelChange={(model) => {
+            setChatFlexOuterLayoutJson(model.toJson());
+          }}
         />
       </div>
     );
