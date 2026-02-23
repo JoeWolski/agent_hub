@@ -102,6 +102,41 @@ def _set_umask() -> None:
         os.umask(int(local_umask, 8))
 
 
+def _ensure_claude_native_command_path(*, command: list[str], home: str, source_path: Path | None = None) -> None:
+    if not command:
+        return
+    if Path(command[0]).name != "claude":
+        return
+
+    resolved_source_path = source_path or Path("/usr/local/bin/claude")
+    target_path = Path(home) / ".local" / "bin" / "claude"
+    if target_path.exists() or target_path.is_symlink():
+        if target_path.is_file() and os.access(target_path, os.X_OK):
+            return
+        raise RuntimeError(
+            "Claude native bootstrap failed: "
+            f"command={command!r} home={home!r} target={str(target_path)!r} "
+            "target exists but is not an executable file."
+        )
+
+    if not resolved_source_path.is_file() or not os.access(resolved_source_path, os.X_OK):
+        raise RuntimeError(
+            "Claude native bootstrap failed: "
+            f"command={command!r} home={home!r} source={str(resolved_source_path)!r} "
+            "source command is missing or not executable."
+        )
+
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.symlink_to(resolved_source_path)
+    except OSError as exc:
+        raise RuntimeError(
+            "Claude native bootstrap failed: "
+            f"command={command!r} home={home!r} source={str(resolved_source_path)!r} target={str(target_path)!r} "
+            f"symlink creation error={exc}"
+        ) from exc
+
+
 def _entrypoint_main() -> None:
     command = list(sys.argv[1:]) if sys.argv[1:] else ["codex"]
     local_home = os.environ.get("LOCAL_HOME", "").strip() or os.environ.get("HOME", "").strip() or "/tmp"
@@ -109,6 +144,7 @@ def _entrypoint_main() -> None:
         os.environ["HOME"] = local_home
 
     _set_umask()
+    _ensure_claude_native_command_path(command=command, home=os.environ["HOME"])
     _prepare_git_credentials()
     _configure_git_identity()
 
