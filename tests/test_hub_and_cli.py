@@ -209,19 +209,42 @@ class HubStateTests(unittest.TestCase):
         updated = next(item for item in updated_payload["projects"] if item["id"] == project["id"])
         self.assertTrue(updated["has_build_log"])
 
-    def test_settings_default_agent_type_persists_and_is_exposed(self) -> None:
+    def test_settings_persist_and_are_exposed(self) -> None:
         initial_settings = self.state.settings_payload()
         self.assertEqual(initial_settings["default_agent_type"], hub_server.DEFAULT_CHAT_AGENT_TYPE)
+        self.assertEqual(initial_settings["chat_layout_engine"], hub_server.DEFAULT_CHAT_LAYOUT_ENGINE)
         initial_state_payload = self.state.state_payload()
         self.assertEqual(initial_state_payload["settings"]["default_agent_type"], hub_server.DEFAULT_CHAT_AGENT_TYPE)
+        self.assertEqual(initial_state_payload["settings"]["chat_layout_engine"], hub_server.DEFAULT_CHAT_LAYOUT_ENGINE)
 
-        updated_settings = self.state.update_settings({"default_agent_type": "claude"})
+        updated_settings = self.state.update_settings(
+            {
+                "default_agent_type": "claude",
+                "chat_layout_engine": "flexlayout",
+            }
+        )
         self.assertEqual(updated_settings["default_agent_type"], "claude")
+        self.assertEqual(updated_settings["chat_layout_engine"], "flexlayout")
 
         reloaded = self.state.load()
         self.assertEqual(reloaded["settings"]["default_agent_type"], "claude")
+        self.assertEqual(reloaded["settings"]["chat_layout_engine"], "flexlayout")
         updated_state_payload = self.state.state_payload()
         self.assertEqual(updated_state_payload["settings"]["default_agent_type"], "claude")
+        self.assertEqual(updated_state_payload["settings"]["chat_layout_engine"], "flexlayout")
+
+    def test_settings_chat_layout_engine_updates_without_changing_default_agent_type(self) -> None:
+        self.state.update_settings({"default_agent_type": "gemini"})
+
+        updated_settings = self.state.update_settings({"chat_layout_engine": "flexlayout"})
+        self.assertEqual(updated_settings["default_agent_type"], "gemini")
+        self.assertEqual(updated_settings["chat_layout_engine"], "flexlayout")
+
+    def test_settings_reject_invalid_chat_layout_engine(self) -> None:
+        with self.assertRaises(HTTPException) as exc:
+            self.state.update_settings({"chat_layout_engine": "grid-layout"})
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("chat_layout_engine must be one of", str(exc.exception.detail))
 
     def test_agent_capabilities_cache_loads_on_startup(self) -> None:
         cache_payload = {
@@ -6584,9 +6607,12 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         self.assertEqual(response.json(), {"chat": chat})
         refresh_chat.assert_called_once_with("chat-1")
 
-    def test_settings_patch_route_updates_default_agent_type(self) -> None:
+    def test_settings_patch_route_updates_multiple_settings(self) -> None:
         app = self._build_app()
-        updated_settings = {"default_agent_type": "gemini"}
+        updated_settings = {
+            "default_agent_type": "gemini",
+            "chat_layout_engine": "flexlayout",
+        }
 
         with patch.object(
             hub_server.HubState,
@@ -6596,12 +6622,14 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             with TestClient(app) as client:
                 response = client.patch(
                     "/api/settings",
-                    json={"default_agent_type": "gemini"},
+                    json={"default_agent_type": "gemini", "chat_layout_engine": "flexlayout"},
                 )
 
         self.assertEqual(response.status_code, 200, msg=response.text)
         self.assertEqual(response.json(), {"settings": updated_settings})
-        update_settings.assert_called_once_with({"default_agent_type": "gemini"})
+        update_settings.assert_called_once_with(
+            {"default_agent_type": "gemini", "chat_layout_engine": "flexlayout"}
+        )
 
     def test_agent_capabilities_routes_return_cached_and_discovery_payloads(self) -> None:
         app = self._build_app()
