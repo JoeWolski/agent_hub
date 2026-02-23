@@ -2720,6 +2720,7 @@ function HubApp() {
     [openAiAccountSession?.loginUrl]
   );
   const openAiAccountDirectLoginUrl = String(openAiAccountSession?.loginUrl || "").trim();
+  const openAiAccountLoginUrl = openAiAccountProxyLoginUrl || openAiAccountDirectLoginUrl;
   const openAiAccountSessionMethod = String(openAiAccountSession?.method || "");
   const openAiAccountLoginInFlight = Boolean(
     openAiAccountSession &&
@@ -2729,6 +2730,8 @@ function HubApp() {
   );
   const openAiBrowserCallbackInFlight = openAiAccountLoginInFlight && openAiAccountSessionMethod === "browser_callback";
   const openAiDeviceAuthInFlight = openAiAccountLoginInFlight && openAiAccountSessionMethod === "device_auth";
+  const openAiAccountConnected = Boolean(openAiProviderStatus.accountConnected);
+  const openAiCardCanExpand = !openAiAccountConnected;
   const openAiOverallConnected = openAiProviderStatus.accountConnected || openAiProviderStatus.connected;
   const openAiConnectionSummary = openAiProviderStatus.accountConnected && openAiProviderStatus.connected
     ? "Connected with OpenAI account and API key."
@@ -2794,10 +2797,16 @@ function HubApp() {
   }, [openAiAuthLoaded, openAiCardExpansionInitialized, openAiOverallConnected]);
 
   useEffect(() => {
-    if (openAiAccountLoginInFlight) {
+    if (openAiCardCanExpand && openAiAccountLoginInFlight) {
       setOpenAiCardExpanded(true);
     }
-  }, [openAiAccountLoginInFlight]);
+  }, [openAiCardCanExpand, openAiAccountLoginInFlight]);
+
+  useEffect(() => {
+    if (openAiAccountConnected && openAiCardExpanded) {
+      setOpenAiCardExpanded(false);
+    }
+  }, [openAiAccountConnected, openAiCardExpanded]);
 
   useEffect(() => {
     if (!openAiAuthLoaded || !githubCardExpanded) {
@@ -2985,7 +2994,9 @@ function HubApp() {
 
   function openOpenAiLoginHelper() {
     setOpenAiCardExpansionInitialized(true);
-    setOpenAiCardExpanded(true);
+    if (openAiCardCanExpand) {
+      setOpenAiCardExpanded(true);
+    }
     setActiveTab("settings");
   }
 
@@ -3053,7 +3064,7 @@ function HubApp() {
     const thumbnailsVisible = showArtifactThumbnailsByChat[chat.id] ?? true;
     const isFullscreenChat = fullscreenChatId === chat.id;
     const isCodexChat = normalizeAgentType(chat.agent_type, agentCapabilities) === "codex";
-    const showOpenAiHelperButton = isCodexChat && !openAiOverallConnected;
+    const showOpenAiHelperButton = isCodexChat && !openAiAccountConnected;
     const containerClassName = ["card", isFullscreenChat ? "chat-card-popped" : ""].filter(Boolean).join(" ");
     const titleText = chat.display_name || chat.name;
     const titleStateLabel = titleStatus === "error" ? "Title error" : "";
@@ -3226,6 +3237,21 @@ function HubApp() {
             ) : null}
           </div>
           <div className="chat-card-header-actions">
+            {showOpenAiHelperButton ? (
+              <button
+                type="button"
+                className="chat-header-helper-button"
+                title="Open OpenAI account login helper"
+                aria-label={`Open OpenAI account login helper for ${chat.display_name || chat.name}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  openOpenAiLoginHelper();
+                }}
+              >
+                <InfoIcon />
+                <span>Connect account</span>
+              </button>
+            ) : null}
             <button
               type="button"
               className="icon-button chat-header-icon chat-header-popout"
@@ -3255,20 +3281,6 @@ function HubApp() {
             >
               <EllipsisIcon />
             </button>
-            {showOpenAiHelperButton ? (
-              <button
-                type="button"
-                className="icon-button chat-header-icon chat-header-help"
-                title="Open OpenAI account login helper"
-                aria-label={`Open OpenAI account login helper for ${chat.display_name || chat.name}`}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  openOpenAiLoginHelper();
-                }}
-              >
-                <InfoIcon />
-              </button>
-            ) : null}
             <button
               type="button"
               className="icon-button chat-header-icon chat-header-delete"
@@ -3954,47 +3966,48 @@ function HubApp() {
                   <span className={`connection-pill ${openAiOverallConnected ? "connected" : "disconnected"}`}>
                     {openAiOverallConnected ? "connected" : "not connected"}
                   </span>
-                  <button
-                    type="button"
-                    className="btn-secondary btn-small"
-                    onClick={() => {
-                      setOpenAiCardExpansionInitialized(true);
-                      setOpenAiCardExpanded((expanded) => !expanded);
-                    }}
-                  >
-                    {openAiCardExpanded ? "Hide details" : "Show details"}
-                  </button>
+                  {openAiAccountConnected ? (
+                    <button
+                      type="button"
+                      className="btn-danger btn-small"
+                      onClick={handleDisconnectOpenAiAccount}
+                      disabled={openAiAccountDisconnecting || openAiAccountLoginInFlight}
+                    >
+                      {openAiAccountDisconnecting ? <SpinnerLabel text="Disconnecting..." /> : "Disconnect"}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn-secondary btn-small"
+                      onClick={() => {
+                        setOpenAiCardExpansionInitialized(true);
+                        setOpenAiCardExpanded((expanded) => !expanded);
+                      }}
+                    >
+                      {openAiCardExpanded ? "Hide details" : "Show details"}
+                    </button>
+                  )}
                 </div>
               </div>
               <p className="meta">{openAiConnectionSummary}</p>
-              {openAiCardExpanded ? (
+              {openAiCardExpanded && openAiCardCanExpand ? (
                 <>
                   <p className="meta">
                     Connect your OpenAI account here when you need the Settings login helper for Codex in Docker or remote
                     environments.
                   </p>
-                  <div className="actions">
-                    <button
-                      type="button"
-                      className="btn-secondary"
-                      onClick={handleCancelOpenAiAccountLogin}
-                      disabled={!openAiAccountLoginInFlight || openAiAccountCancelling}
-                    >
-                      {openAiAccountCancelling ? <SpinnerLabel text="Cancelling..." /> : "Cancel account login"}
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-secondary"
-                      onClick={handleDisconnectOpenAiAccount}
-                      disabled={
-                        !openAiProviderStatus.accountConnected ||
-                        openAiAccountDisconnecting ||
-                        openAiAccountLoginInFlight
-                      }
-                    >
-                      {openAiAccountDisconnecting ? <SpinnerLabel text="Disconnecting..." /> : "Disconnect account"}
-                    </button>
-                  </div>
+                  {openAiAccountLoginInFlight ? (
+                    <div className="actions">
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={handleCancelOpenAiAccountLogin}
+                        disabled={openAiAccountCancelling}
+                      >
+                        {openAiAccountCancelling ? <SpinnerLabel text="Cancelling..." /> : "Cancel account login"}
+                      </button>
+                    </div>
+                  ) : null}
                   {openAiAccountSession ? (
                     <div className="stack compact">
                       <div className="meta">
@@ -4023,8 +4036,8 @@ function HubApp() {
                       </p>
                     </div>
                     <ol className="settings-auth-help-list">
-                      <li>Click <strong>Start browser login</strong>.</li>
-                      <li>Click <strong>Open auth page</strong> and complete sign-in and consent.</li>
+                      <li>Click <strong>Connect account</strong>.</li>
+                      <li>Open the login URL and complete sign-in and consent.</li>
                       <li>If the browser ends on a localhost error page, copy the full URL and submit it below.</li>
                     </ol>
                     <div className="meta">
@@ -4049,29 +4062,17 @@ function HubApp() {
                           ? <SpinnerLabel text="Starting login..." />
                           : openAiBrowserCallbackInFlight
                             ? "Browser login running"
-                            : "Start browser login"}
+                            : "Connect account"}
                       </button>
-                      {openAiAccountDirectLoginUrl && openAiAccountSessionMethod === "browser_callback" ? (
-                        <button
-                          type="button"
-                          className="btn-secondary"
-                          onClick={() => window.open(openAiAccountProxyLoginUrl, "_blank", "noopener,noreferrer")}
-                        >
-                          Open auth page
-                        </button>
-                      ) : null}
-                      {openAiAccountDirectLoginUrl &&
-                      openAiAccountSessionMethod === "browser_callback" &&
-                      openAiAccountProxyLoginUrl !== openAiAccountDirectLoginUrl ? (
-                        <button
-                          type="button"
-                          className="btn-secondary"
-                          onClick={() => window.open(openAiAccountDirectLoginUrl, "_blank", "noopener,noreferrer")}
-                        >
-                          Open direct localhost URL
-                        </button>
-                      ) : null}
                     </div>
+                    {openAiAccountLoginUrl && openAiAccountSessionMethod === "browser_callback" ? (
+                      <p className="meta">
+                        Login URL:{" "}
+                        <a href={openAiAccountLoginUrl} target="_blank" rel="noopener noreferrer">
+                          {openAiAccountLoginUrl}
+                        </a>
+                      </p>
+                    ) : null}
                     {openAiAccountSessionMethod === "browser_callback" ? (
                       <div className="stack compact">
                         <p className="meta">
