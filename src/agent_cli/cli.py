@@ -20,6 +20,7 @@ CLAUDE_RUNTIME_IMAGE = "agent-ubuntu2204-claude:latest"
 GEMINI_RUNTIME_IMAGE = "agent-ubuntu2204-gemini:latest"
 DEFAULT_DOCKERFILE = "docker/agent_cli/Dockerfile"
 DEFAULT_AGENT_COMMAND = "codex"
+DEFAULT_CONTAINER_HOME = "/workspace"
 AGENT_PROVIDER_NONE = "none"
 AGENT_PROVIDER_CODEX = "codex"
 AGENT_PROVIDER_CLAUDE = "claude"
@@ -238,15 +239,6 @@ def _default_config_file() -> Path:
 
 def _default_credentials_file() -> Path:
     return _repo_root() / ".credentials"
-
-
-def _default_user() -> str:
-    try:
-        return os.getlogin()
-    except OSError:
-        import pwd
-
-        return pwd.getpwuid(os.getuid()).pw_name
 
 
 def _default_group_name() -> str:
@@ -677,8 +669,8 @@ def main(
             "--git-credential-file and --git-credential-host must be provided together"
         )
 
-    user = local_user or _default_user()
     uid = local_uid if local_uid is not None else os.getuid()
+    user = str(local_user or "").strip() or f"uid-{uid}"
     if local_gid is not None:
         gid = local_gid
     elif local_group:
@@ -701,9 +693,8 @@ def main(
     ):
         supplemental_group_ids.append(docker_socket_gid)
 
-    container_home_path = container_home or f"/home/{user}"
-    container_project_name = project_path.name
-    container_project_path = f"{container_home_path}/projects/{container_project_name}"
+    container_home_path = container_home or DEFAULT_CONTAINER_HOME
+    container_project_path = container_home_path
 
     host_agent_home = Path(agent_home_path or (Path.home() / ".agent-home" / user)).resolve()
     host_codex_dir = host_agent_home / ".codex"
@@ -941,6 +932,8 @@ def main(
                         "commit",
                         "--change",
                         "USER root",
+                        "--change",
+                        f"WORKDIR {DEFAULT_CONTAINER_HOME}",
                         "--change",
                         'ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]',
                         "--change",

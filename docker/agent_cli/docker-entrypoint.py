@@ -17,13 +17,12 @@ def _ensure_runtime_home_paths(local_home: str) -> None:
     home_path = Path(local_home)
     cache_dir = home_path / ".cache"
     uv_cache_dir = cache_dir / "uv"
-    projects_dir = home_path / "projects"
 
-    for path in (home_path, cache_dir, uv_cache_dir, projects_dir):
+    for path in (home_path, cache_dir, uv_cache_dir):
         try:
             path.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            continue
+        except OSError as exc:
+            raise RuntimeError(f"Unable to initialize runtime path '{path}': {exc}") from exc
 
 
 def _configure_git_identity() -> None:

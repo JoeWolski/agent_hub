@@ -132,7 +132,7 @@ This includes Linux-first deploy scripts:
 
 Behavior highlights:
 
-- Mounts your project into `/home/<user>/projects/<project-name>`.
+- Mounts your project into `/workspace` by default.
 - Runs container processes as the invoking host UID/GID (`docker run --user`) and forwards supplemental groups (`--group-add`) for deterministic mounted-volume permissions.
 - Mounts Docker socket (`/var/run/docker.sock`) so runtime tools can access Docker when available.
 - Mounts config file to `~/.codex/config.toml` in the container (Codex runtime).
@@ -142,7 +142,7 @@ Behavior highlights:
 - Can build and reuse snapshot images for deterministic setup.
 - Supports project-specific base image source from Docker tag, Dockerfile, or Docker context.
 - Snapshot setup scripts run as the mapped host UID/GID (not root); OS-level package installs should be done in the base image layer.
-- Setup snapshot commits reset image `USER` to root so follow-on provider overlay builds can install packages deterministically.
+- Setup snapshot commits reset image metadata (`USER`, `WORKDIR`, `ENTRYPOINT`, `CMD`) so follow-on provider overlay builds stay deterministic.
 - Applies permissive in-container defaults unless you explicitly override them with trailing agent args:
   Codex uses `--ask-for-approval never --sandbox danger-full-access`; Claude uses `--permission-mode bypassPermissions`; Gemini uses `--approval-mode yolo`.
 - In `agent_hub` repo-path mode, a Dockerfile file path uses repository-root build context, while a directory path uses that directory as context.

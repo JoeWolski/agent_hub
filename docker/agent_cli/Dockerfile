@@ -39,12 +39,14 @@ RUN if ! id -u agent >/dev/null 2>&1; then \
     fi \
  && agent_group="$(id -gn agent)" \
  && mkdir -p /home/agent/projects /home/agent/.cache/uv /home/agent/.codex \
- && chown -R "agent:${agent_group}" /home/agent
+ && chown -R "agent:${agent_group}" /home/agent \
+ && mkdir -p /workspace/.cache/uv /workspace/.codex \
+ && chmod -R 0777 /workspace
 
 COPY docker/agent_cli/docker-entrypoint.py /usr/local/bin/docker-entrypoint.py
 COPY docker/agent_cli/hub_artifact /usr/local/bin/hub_artifact
 RUN chmod +x /usr/local/bin/docker-entrypoint.py /usr/local/bin/hub_artifact
 
-WORKDIR /home/agent/projects
+WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]
 CMD ["codex"]
