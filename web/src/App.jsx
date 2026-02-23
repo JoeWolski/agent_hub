@@ -720,6 +720,22 @@ function CloseIcon() {
   );
 }
 
+function InfoIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      <circle cx="10" cy="10" r="6.25" fill="none" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="10" cy="7.15" r="1.05" fill="currentColor" />
+      <path
+        d="M10 9.9v4.35"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
 function DownloadArrowIcon() {
   return (
     <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
@@ -3036,6 +3052,8 @@ function HubApp() {
     const detailsOpen = openChatDetails[chat.id] ?? false;
     const thumbnailsVisible = showArtifactThumbnailsByChat[chat.id] ?? true;
     const isFullscreenChat = fullscreenChatId === chat.id;
+    const isCodexChat = normalizeAgentType(chat.agent_type, agentCapabilities) === "codex";
+    const showOpenAiHelperButton = isCodexChat && !openAiOverallConnected;
     const containerClassName = ["card", isFullscreenChat ? "chat-card-popped" : ""].filter(Boolean).join(" ");
     const titleText = chat.display_name || chat.name;
     const titleStateLabel = titleStatus === "error" ? "Title error" : "";
@@ -3237,6 +3255,20 @@ function HubApp() {
             >
               <EllipsisIcon />
             </button>
+            {showOpenAiHelperButton ? (
+              <button
+                type="button"
+                className="icon-button chat-header-icon chat-header-help"
+                title="Open OpenAI account login helper"
+                aria-label={`Open OpenAI account login helper for ${chat.display_name || chat.name}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  openOpenAiLoginHelper();
+                }}
+              >
+                <InfoIcon />
+              </button>
+            ) : null}
             <button
               type="button"
               className="icon-button chat-header-icon chat-header-delete"
@@ -3747,14 +3779,6 @@ function HubApp() {
           </section>
         ) : activeTab === "chats" ? (
           <section className="panel chats-panel">
-            {!openAiOverallConnected ? (
-              <div className="meta chats-openai-helper">
-                Need account auth for Codex in Docker or remote sessions?{" "}
-                <button type="button" className="inline-link-button" onClick={openOpenAiLoginHelper}>
-                  OpenAI account login helper
-                </button>
-              </div>
-            ) : null}
             <div className="stack chat-groups">
               {hubState.projects.length === 0 ? <div className="empty">No projects yet.</div> : null}
               {hubState.projects.map((project) => {
