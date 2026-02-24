@@ -217,7 +217,8 @@ function normalizeSingleActiveTabset(tabsets, preferredTabset = null) {
   return active;
 }
 
-export function pruneEmptyLayoutNode(node) {
+export function pruneEmptyLayoutNode(node, options = {}) {
+  const preserveContainerDepth = Boolean(options?.preserveContainerDepth);
   if (!node || typeof node !== "object") {
     return null;
   }
@@ -234,7 +235,7 @@ export function pruneEmptyLayoutNode(node) {
   }
   const nextChildren = [];
   for (const child of node.children) {
-    const normalizedChild = pruneEmptyLayoutNode(child);
+    const normalizedChild = pruneEmptyLayoutNode(child, options);
     if (normalizedChild) {
       nextChildren.push(normalizedChild);
     }
@@ -246,6 +247,11 @@ export function pruneEmptyLayoutNode(node) {
   if (node.children.length === 1) {
     const onlyChild = node.children[0];
     if (onlyChild && typeof onlyChild === "object") {
+      // FlexLayout row orientation depends on nesting depth; collapsing row->row/column
+      // wrappers can turn a vertical split into horizontal on reconciliation.
+      if (preserveContainerDepth && isLayoutContainerNode(onlyChild)) {
+        return node;
+      }
       if (onlyChild.weight === undefined && node.weight !== undefined) {
         onlyChild.weight = node.weight;
       }
@@ -256,7 +262,7 @@ export function pruneEmptyLayoutNode(node) {
 }
 
 function normalizeLayoutTreeRoot(layoutNode) {
-  const normalized = normalizeLayoutRootNode(pruneEmptyLayoutNode(layoutNode));
+  const normalized = normalizeLayoutRootNode(pruneEmptyLayoutNode(layoutNode, { preserveContainerDepth: true }));
   if (String(normalized.type || "") === "tabset") {
     return {
       type: "row",
