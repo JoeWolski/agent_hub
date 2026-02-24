@@ -538,6 +538,18 @@ Gemini CLI
         )
         self.assertEqual(codex["reasoning_modes"], ["default", "low", "medium", "high"])
 
+    def test_extract_model_candidates_from_claude_help_description(self) -> None:
+        output = """
+  --fallback-model <model>                          Enable automatic fallback to specified model when default model is overloaded (only works with --print)
+  --file <specs...>                                 File resources to download at startup. Format: file_id:relative_path (e.g., --file file_abc:doc.txt file_def:img.png)
+  --model <model>                                   Model for the current session. Provide an alias for the latest model (e.g. 'sonnet' or 'opus') or a model's full name (e.g. 'claude-sonnet-4-6').
+  --no-chrome                                       Disable Claude in Chrome integration
+"""
+        self.assertEqual(
+            hub_server._extract_model_candidates_from_output(output, hub_server.AGENT_TYPE_CLAUDE),
+            ["sonnet", "opus", "claude-sonnet-4-6"],
+        )
+
     def test_reasoning_candidate_extractor_requires_supported_modes_context(self) -> None:
         self.assertEqual(
             hub_server._extract_reasoning_candidates_from_output(
