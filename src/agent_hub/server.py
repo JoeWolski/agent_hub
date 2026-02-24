@@ -4500,14 +4500,14 @@ class HubState:
         token_id = str(record.get("token_id") or "").strip()
         return connected_at, token_id
 
-    def _personal_access_token_for_repo(
+    def _personal_access_tokens_for_repo(
         self,
         repo_url: str,
         credential_binding: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> list[dict[str, Any]]:
         repo_host = _git_repo_host(repo_url)
         if not repo_host:
-            return None
+            return []
         repo_scheme = _git_repo_scheme(repo_url)
         matching_host = [
             token
@@ -4515,7 +4515,7 @@ class HubState:
             if str(token.get("host") or "").strip().lower() == repo_host
         ]
         if not matching_host:
-            return None
+            return []
         if repo_scheme in GIT_CREDENTIAL_ALLOWED_SCHEMES:
             matching_scheme = [
                 token
@@ -4524,6 +4524,9 @@ class HubState:
             ]
             if matching_scheme:
                 matching_host = matching_scheme
+
+        tokens: list[dict[str, Any]] = []
+        seen_token_ids: set[str] = set()
 
         normalized_binding = _normalize_project_credential_binding(credential_binding)
         if normalized_binding["mode"] in {
@@ -4534,16 +4537,33 @@ class HubState:
             if preferred_ids:
                 by_id = {str(token.get("token_id") or "").strip(): token for token in matching_host}
                 for token_id in preferred_ids:
-                    if token_id in by_id:
-                        return by_id[token_id]
+                    if token_id in by_id and token_id not in seen_token_ids:
+                        tokens.append(by_id[token_id])
+                        seen_token_ids.add(token_id)
+                if normalized_binding["mode"] == PROJECT_CREDENTIAL_BINDING_MODE_SINGLE and tokens:
+                    return tokens
 
-        # Choose the most recently connected token; if timestamps tie at second precision,
-        # prefer the later record from storage order for deterministic selection.
+        # Add remaining matches, ordered by most recent first
         ordered_matches = list(enumerate(matching_host))
         ordered_matches.sort(
             key=lambda item: (str(item[1].get("connected_at") or "").strip(), -item[0]),
+            reverse=True,
         )
-        return ordered_matches[-1][1] if ordered_matches else None
+        for _, token in ordered_matches:
+            token_id = str(token.get("token_id") or "").strip()
+            if token_id not in seen_token_ids:
+                tokens.append(token)
+                seen_token_ids.add(token_id)
+
+        return tokens
+
+    def _personal_access_token_for_repo(
+        self,
+        repo_url: str,
+        credential_binding: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        tokens = self._personal_access_tokens_for_repo(repo_url, credential_binding=credential_binding)
+        return tokens[0] if tokens else None
 
     def _github_connected_personal_access_tokens(self) -> list[dict[str, Any]]:
         return self._connected_personal_access_tokens(GIT_PROVIDER_GITHUB)
@@ -4933,35 +4953,42 @@ class HubState:
         host_name, _port = _split_host_port(normalized_host)
         normalized_ssh_host = host_name or normalized_host
         git_prefix = f"{normalized_scheme}://{normalized_host}/"
+        
+        # Ensure we use an absolute path for the credential file
+        abs_cred_file = str(Path(credential_file).resolve())
+        
         return {
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_CONFIG_COUNT": "3",
             "GIT_CONFIG_KEY_0": "credential.helper",
-            "GIT_CONFIG_VALUE_0": f"store --file={credential_file}",
+            "GIT_CONFIG_VALUE_0": f"store --file={abs_cred_file}",
             "GIT_CONFIG_KEY_1": f"url.{git_prefix}.insteadOf",
             "GIT_CONFIG_VALUE_1": f"git@{normalized_ssh_host}:",
             "GIT_CONFIG_KEY_2": f"url.{git_prefix}.insteadOf",
             "GIT_CONFIG_VALUE_2": f"ssh://git@{normalized_ssh_host}/",
         }
 
-    def _github_repo_auth_context(
+    def _github_repo_all_auth_contexts(
         self,
         repo_url: str,
         project: dict[str, Any] | None = None,
-    ) -> tuple[str, str, dict[str, Any]] | None:
+    ) -> list[tuple[str, str, dict[str, Any]]]:
         repo_host = _git_repo_host(repo_url)
         if not repo_host:
-            return None
+            return []
+
         credential_binding = None
         if isinstance(project, dict):
             credential_binding = _normalize_project_credential_binding(project.get("credential_binding"))
-        personal_access = self._personal_access_token_for_repo(repo_url, credential_binding=credential_binding)
-        if personal_access is not None:
-            pat_host = str(personal_access.get("host") or "")
+
+        contexts: list[tuple[str, str, dict[str, Any]]] = []
+        personal_access_tokens = self._personal_access_tokens_for_repo(repo_url, credential_binding=credential_binding)
+        for token in personal_access_tokens:
+            pat_host = str(token.get("host") or "")
             if pat_host and repo_host == pat_host:
-                payload = dict(personal_access)
+                payload = dict(token)
                 payload["credential_id"] = str(payload.get("token_id") or "").strip()
-                return (GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN, pat_host, payload)
+                contexts.append((GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN, pat_host, payload))
 
         installation = self._github_connected_installation()
         provider_host = self._github_provider_host()
@@ -4970,19 +4997,83 @@ class HubState:
             if installation_id > 0:
                 app_credential_id = f"github_app:{installation_id}"
                 normalized_binding = _normalize_project_credential_binding(credential_binding)
+                is_allowed = True
                 if normalized_binding["mode"] in {
                     PROJECT_CREDENTIAL_BINDING_MODE_SET,
                     PROJECT_CREDENTIAL_BINDING_MODE_SINGLE,
                 }:
                     preferred_ids = normalized_binding["credential_ids"]
                     if preferred_ids and app_credential_id not in preferred_ids:
-                        return None
-                return (
-                    GITHUB_CONNECTION_MODE_GITHUB_APP,
-                    provider_host,
-                    {"installation_id": installation_id, "credential_id": app_credential_id, "provider": GIT_PROVIDER_GITHUB},
-                )
-        return None
+                        is_allowed = False
+
+                if is_allowed:
+                    contexts.append(
+                        (
+                            GITHUB_CONNECTION_MODE_GITHUB_APP,
+                            provider_host,
+                            {
+                                "installation_id": installation_id,
+                                "credential_id": app_credential_id,
+                                "provider": GIT_PROVIDER_GITHUB,
+                                "account_login": str(installation.get("installation_account_login") or ""),
+                            },
+                        )
+                    )
+        return contexts
+
+    def _github_repo_auth_context(
+        self,
+        repo_url: str,
+        project: dict[str, Any] | None = None,
+    ) -> tuple[str, str, dict[str, Any]] | None:
+        contexts = self._github_repo_all_auth_contexts(repo_url, project=project)
+        return contexts[0] if contexts else None
+
+    def _refresh_all_github_git_credentials(
+        self,
+        contexts: list[tuple[str, str, dict[str, Any]]],
+        *,
+        context_key: str = "",
+    ) -> str:
+        lines: list[str] = []
+        seen_lines: set[str] = set()
+        for mode, host, auth_payload in contexts:
+            scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
+            if mode == GITHUB_CONNECTION_MODE_GITHUB_APP:
+                installation_id = int(auth_payload.get("installation_id") or 0)
+                if installation_id <= 0:
+                    continue
+                token, _expires_at = self._github_installation_token(installation_id)
+                username = "x-access-token"
+            elif mode == GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
+                token = str(auth_payload.get("personal_access_token") or "").strip()
+                username = str(auth_payload.get("account_login") or "").strip()
+                try:
+                    scheme = _normalize_github_credential_scheme(
+                        auth_payload.get("scheme"),
+                        field_name="scheme",
+                    )
+                except HTTPException:
+                    scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
+            else:
+                continue
+
+            if not token or not username:
+                continue
+
+            encoded_username = urllib.parse.quote(username, safe="")
+            encoded_secret = urllib.parse.quote(token, safe="")
+            line = f"{scheme}://{encoded_username}:{encoded_secret}@{host}\n"
+            if line not in seen_lines:
+                lines.append(line)
+                seen_lines.add(line)
+
+        if not lines:
+            return ""
+
+        output_file = self._materialized_credential_file_path(context_key, "merged")
+        _write_private_env_file(output_file, "".join(lines))
+        return str(output_file)
 
     def _github_git_env_for_repo(
         self,
@@ -4991,44 +5082,17 @@ class HubState:
         *,
         context_key: str = "",
     ) -> dict[str, str]:
-        context = self._github_repo_auth_context(repo_url, project=project)
-        if context is None:
+        contexts = self._github_repo_all_auth_contexts(repo_url, project=project)
+        if not contexts:
             return {}
-        mode, host, auth_payload = context
-        scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
-        if mode == GITHUB_CONNECTION_MODE_GITHUB_APP:
-            installation_id = int(auth_payload.get("installation_id") or 0)
-            if installation_id <= 0:
-                return {}
-            credentials_file = self._refresh_github_git_credentials(
-                installation_id,
-                host,
-                context_key=context_key,
-            )
-        elif mode == GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
-            token = str(auth_payload.get("personal_access_token") or "").strip()
-            account_login = str(auth_payload.get("account_login") or "").strip()
-            credential_id = str(auth_payload.get("credential_id") or "").strip()
-            try:
-                scheme = _normalize_github_credential_scheme(
-                    auth_payload.get("scheme"),
-                    field_name="scheme",
-                )
-            except HTTPException:
-                scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
-            if not token or not account_login:
-                return {}
-            credentials_file = self._refresh_github_git_credentials_for_personal_access_token(
-                token=token,
-                host=host,
-                account_login=account_login,
-                scheme=scheme,
-                context_key=context_key,
-                credential_id=credential_id,
-            )
-        else:
+        credentials_file = self._refresh_all_github_git_credentials(
+            contexts,
+            context_key=context_key,
+        )
+        if not credentials_file:
             return {}
-        return self._git_env_for_credentials_file(credentials_file, host, scheme=scheme)
+        _mode, host, _auth_payload = contexts[0]
+        return self._git_env_for_credentials_file(credentials_file, host)
 
     def _github_git_args_for_repo(
         self,
@@ -5037,50 +5101,21 @@ class HubState:
         *,
         context_key: str = "",
     ) -> list[str]:
-        context = self._github_repo_auth_context(repo_url, project=project)
-        if context is None:
+        contexts = self._github_repo_all_auth_contexts(repo_url, project=project)
+        if not contexts:
             return []
-        mode, host, auth_payload = context
-        scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
-        if mode == GITHUB_CONNECTION_MODE_GITHUB_APP:
-            installation_id = int(auth_payload.get("installation_id") or 0)
-            if installation_id <= 0:
-                return []
-            credentials_file = self._refresh_github_git_credentials(
-                installation_id,
-                host,
-                context_key=context_key,
-            )
-        elif mode == GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
-            token = str(auth_payload.get("personal_access_token") or "").strip()
-            account_login = str(auth_payload.get("account_login") or "").strip()
-            credential_id = str(auth_payload.get("credential_id") or "").strip()
-            try:
-                scheme = _normalize_github_credential_scheme(
-                    auth_payload.get("scheme"),
-                    field_name="scheme",
-                )
-            except HTTPException:
-                scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
-            if not token or not account_login:
-                return []
-            credentials_file = self._refresh_github_git_credentials_for_personal_access_token(
-                token=token,
-                host=host,
-                account_login=account_login,
-                scheme=scheme,
-                context_key=context_key,
-                credential_id=credential_id,
-            )
-        else:
+        credentials_file = self._refresh_all_github_git_credentials(
+            contexts,
+            context_key=context_key,
+        )
+        if not credentials_file:
             return []
+        _mode, host, _auth_payload = contexts[0]
         return [
             "--git-credential-file",
             credentials_file,
             "--git-credential-host",
             host,
-            "--git-credential-scheme",
-            scheme,
         ]
 
     def _github_git_identity_env_vars_for_repo(
@@ -7434,14 +7469,13 @@ class HubState:
             return selected
 
         if mode == PROJECT_CREDENTIAL_BINDING_MODE_AUTO:
-            context = self._github_repo_auth_context(str(project.get("repo_url") or ""), project=project)
-            if context is None:
-                return []
-            _resolved_mode, _host, auth_payload = context
-            candidate_id = str(auth_payload.get("credential_id") or "").strip()
-            if candidate_id and candidate_id in available_id_set:
-                return [candidate_id]
-            return []
+            contexts = self._github_repo_all_auth_contexts(str(project.get("repo_url") or ""), project=project)
+            resolved_ids: list[str] = []
+            for _m, _h, auth_payload in contexts:
+                candidate_id = str(auth_payload.get("credential_id") or "").strip()
+                if candidate_id and candidate_id in available_id_set and candidate_id not in resolved_ids:
+                    resolved_ids.append(candidate_id)
+            return resolved_ids
 
         return []
 
