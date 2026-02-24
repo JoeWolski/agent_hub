@@ -32,6 +32,7 @@ import {
 } from "./chatStartSettings";
 import { createFirstSeenOrderState, stableOrderItemsByFirstSeen } from "./stableListOrder";
 import { buildProjectChatFlexModels } from "./projectChatLayoutModels";
+import { chatTerminalSocketStore } from "./chatTerminalSocketStore";
 import { terminalThemeForAppTheme } from "./theme";
 import {
   MdArchive,
@@ -669,11 +670,6 @@ async function fetchText(url) {
   return response.text();
 }
 
-function terminalSocketUrl(chatId) {
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  return `${protocol}://${window.location.host}/api/chats/${chatId}/terminal`;
-}
-
 function hubEventsSocketUrl() {
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   return `${protocol}://${window.location.host}/api/events`;
@@ -848,6 +844,7 @@ function ChatTerminal({
   const renderToolbar = Boolean(showToolbar);
 
   useEffect(() => {
+    chatTerminalSocketStore.setRunning(chatId, Boolean(running));
     if (!running) {
       setStatus("offline");
       return undefined;
@@ -871,10 +868,6 @@ function ChatTerminal({
     terminalRef.current = terminal;
     fitAddon.fit();
     terminal.focus();
-
-    const ws = new WebSocket(terminalSocketUrl(chatId));
-    setStatus("connecting");
-    const sentSizeRef = { cols: 0, rows: 0 };
     let resizeFrame = null;
 
     const sendInput = (text) => {
@@ -882,11 +875,7 @@ function ChatTerminal({
       if (!payload) {
         return false;
       }
-      if (ws.readyState !== WebSocket.OPEN) {
-        return false;
-      }
-      ws.send(JSON.stringify({ type: "input", data: payload }));
-      return true;
+      return chatTerminalSocketStore.sendInput(chatId, payload);
     };
 
     const sendPasteText = (text) => {
@@ -900,15 +889,7 @@ function ChatTerminal({
     const sendResize = (cols = terminal.cols, rows = terminal.rows, force = false) => {
       const nextCols = Math.max(1, Number(cols) || 1);
       const nextRows = Math.max(1, Number(rows) || 1);
-      if (ws.readyState !== WebSocket.OPEN) {
-        return;
-      }
-      if (!force && nextCols === sentSizeRef.cols && nextRows === sentSizeRef.rows) {
-        return;
-      }
-      ws.send(JSON.stringify({ type: "resize", cols: nextCols, rows: nextRows }));
-      sentSizeRef.cols = nextCols;
-      sentSizeRef.rows = nextRows;
+      chatTerminalSocketStore.sendResize(chatId, nextCols, nextRows, { force });
     };
 
     const fitAndResize = (force = false) => {
@@ -937,27 +918,28 @@ function ChatTerminal({
         !domEvent.ctrlKey &&
         !domEvent.metaKey
       ) {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "submit" }));
+        chatTerminalSocketStore.sendSubmit(chatId);
+      }
+    });
+    const unsubscribe = chatTerminalSocketStore.subscribe(chatId, {
+      onStatus: (nextStatus) => {
+        setStatus(nextStatus);
+        if (nextStatus === "connected") {
+          fitAndResize(true);
+          terminal.focus();
+        }
+      },
+      onBacklog: (backlog) => {
+        if (backlog) {
+          terminal.write(backlog);
+        }
+      },
+      onData: (chunk) => {
+        if (chunk) {
+          terminal.write(chunk);
         }
       }
     });
-    const onOpen = () => {
-      setStatus("connected");
-      fitAndResize(true);
-      terminal.focus();
-    };
-    const onMessage = (event) => {
-      if (typeof event.data === "string") {
-        terminal.write(event.data);
-      }
-    };
-    const onClose = () => {
-      setStatus("closed");
-    };
-    const onError = () => {
-      setStatus("error");
-    };
     const onTerminalPointerDown = () => {
       terminal.focus();
     };
@@ -994,12 +976,8 @@ function ChatTerminal({
       window.addEventListener("resize", onWindowResize);
     }
 
-    ws.addEventListener("open", onOpen);
-    ws.addEventListener("message", onMessage);
-    ws.addEventListener("close", onClose);
-    ws.addEventListener("error", onError);
-
     return () => {
+      unsubscribe();
       if (resizeObserver) {
         resizeObserver.disconnect();
       }
@@ -1015,15 +993,8 @@ function ChatTerminal({
       if (resizeFrame != null) {
         cancelAnimationFrame(resizeFrame);
       }
-      ws.removeEventListener("open", onOpen);
-      ws.removeEventListener("message", onMessage);
-      ws.removeEventListener("close", onClose);
-      ws.removeEventListener("error", onError);
       inputDisposable.dispose();
       keyDisposable.dispose();
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.close();
-      }
       terminalRef.current = null;
       terminal.dispose();
     };
@@ -1980,6 +1951,22 @@ function HubApp() {
       ),
     [visibleChats]
   );
+
+  useEffect(() => {
+    const runningStates = new Map();
+    for (const chat of orderedVisibleChats) {
+      const resolvedChatId = String(chat?.server_chat_id || chat?.id || "").trim();
+      if (!resolvedChatId) {
+        continue;
+      }
+      runningStates.set(resolvedChatId, Boolean(chat?.is_running));
+    }
+    chatTerminalSocketStore.syncRunningStates(runningStates);
+  }, [orderedVisibleChats]);
+
+  useEffect(() => () => {
+    chatTerminalSocketStore.disposeAll();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
