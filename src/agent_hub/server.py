@@ -127,12 +127,12 @@ AGENT_CAPABILITY_REASONING_LEVELS_BY_TYPE = {
 AGENT_CAPABILITY_REASONING_VALUE_RE = re.compile(r"\b(?:minimal|low|medium|high|xhigh|max)\b")
 AGENT_CAPABILITY_REASONING_LIST_RE = re.compile(
     r"(?:\b(?:reasoning|effort|thinking)(?:\s+(?:mode|modes|level|levels|effort))?\b[^:\n\r]{0,48})"
-    r"(?:\b(?:possible values?|choices?|available values?|valid values?)\b)?\s*[:=-]\s*([^\n\r]+)",
+    r"(?:\b(?:possible values?|choices?|available values?|valid values?)\b)?[ \t]*[:=-][ \t]*([^\n\r]+)",
     re.IGNORECASE,
 )
 AGENT_CAPABILITY_MODEL_LIST_RE = re.compile(
     r"(?:\bmodel(?:\s+aliases?)?\b[^:\n\r]{0,48})"
-    r"(?:\b(?:possible values?|choices?|available values?|valid values?)\b)?\s*[:=-]\s*([^\n\r]+)",
+    r"(?:\b(?:possible values?|choices?|available values?|valid values?)\b)?[ \t]*[:=-][ \t]*([^\n\r]+)",
     re.IGNORECASE,
 )
 AGENT_CAPABILITY_HELP_OPTION_RE = re.compile(r"(?<!\w)--([a-z0-9][a-z0-9-]*)", re.IGNORECASE)
@@ -1070,8 +1070,10 @@ def _token_is_model_candidate(agent_type: str, token: str) -> bool:
             return False
         return AGENT_CAPABILITY_CODEX_MODEL_TOKEN_RE.match(value) is not None
     if agent_type == AGENT_TYPE_CLAUDE:
+        if value in {"claude", "claude-code"}:
+            return False
         return (
-            value.startswith("claude")
+            value.startswith("claude-")
             or value.startswith("sonnet")
             or value.startswith("opus")
             or value.startswith("haiku")
@@ -1205,6 +1207,8 @@ def _extract_option_values_from_help_text(
             collect_bullet_values = False
 
         if active_option_matches:
+            # Parse the active option line directly so "e.g. 'sonnet' or 'opus'" style guidance is discovered.
+            add_segment(line)
             for match in AGENT_CAPABILITY_HELP_INLINE_VALUES_RE.finditer(line):
                 add_segment(match.group(1))
 
