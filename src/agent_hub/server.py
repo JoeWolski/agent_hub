@@ -9100,7 +9100,12 @@ def main(
 
         await websocket.accept()
         if backlog:
-            await websocket.send_text(backlog)
+            try:
+                await websocket.send_text(backlog)
+            except WebSocketDisconnect:
+                state._queue_put(listener, None)
+                state.detach_terminal(chat_id, listener)
+                return
 
         async def stream_output() -> None:
             while True:
@@ -9110,7 +9115,10 @@ def main(
                     continue
                 if chunk is None:
                     break
-                await websocket.send_text(chunk)
+                try:
+                    await websocket.send_text(chunk)
+                except WebSocketDisconnect:
+                    break
 
         async def stream_input() -> None:
             while True:
