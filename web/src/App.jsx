@@ -3,7 +3,12 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import { Layout, Model } from "flexlayout-react";
-import { isChatStarting, reconcilePendingChatStarts, reconcilePendingSessions } from "./chatPendingState";
+import {
+  findMatchingServerChatForPendingSession,
+  isChatStarting,
+  reconcilePendingChatStarts,
+  reconcilePendingSessions
+} from "./chatPendingState";
 import {
   chatLayoutEngineOptions,
   CHAT_LAYOUT_ENGINE_CLASSIC,
@@ -1877,13 +1882,7 @@ function HubApp() {
         merged.push({ ...serverChat, id: session.ui_id, server_chat_id: serverId });
         continue;
       }
-      const knownServerIds = new Set(session.known_server_chat_ids || []);
-      const matchedServerChat = serverChats.find(
-        (chat) =>
-          !mappedServerIds.has(chat.id) &&
-          String(chat.project_id || "") === String(session.project_id || "") &&
-          !knownServerIds.has(chat.id)
-      );
+      const matchedServerChat = findMatchingServerChatForPendingSession(session, serverChats, mappedServerIds);
       if (matchedServerChat) {
         mappedServerIds.add(matchedServerChat.id);
         const matchedStatus = String(matchedServerChat.status || "").toLowerCase();

@@ -14,6 +14,7 @@ class WebPendingStateTests(unittest.TestCase):
             """
             import assert from "node:assert/strict";
             import {
+              findMatchingServerChatForPendingSession,
               isChatStarting,
               PENDING_CHAT_START_STALE_MS,
               PENDING_SESSION_STALE_MS,
@@ -70,6 +71,37 @@ class WebPendingStateTests(unittest.TestCase):
               baseTimeMs + 10
             );
             assert.equal(seenThenMissing.length, 0, "session should be removed once chat disappears after being seen");
+
+            const pendingSession = {
+              ui_id: "pending-4",
+              project_id: "project-a",
+              known_server_chat_ids: []
+            };
+            const matchedServerChat = findMatchingServerChatForPendingSession(
+              pendingSession,
+              [
+                { id: "chat-failed", project_id: "project-a", status: "failed", is_running: false },
+                { id: "chat-stopped", project_id: "project-a", status: "stopped", is_running: false },
+                { id: "chat-starting", project_id: "project-a", status: "starting", is_running: false }
+              ],
+              new Set()
+            );
+            assert.equal(
+              matchedServerChat?.id || "",
+              "chat-starting",
+              "pending session matching should ignore failed/stopped chats and select startup candidates"
+            );
+
+            const noMatchForOnlyFailed = findMatchingServerChatForPendingSession(
+              pendingSession,
+              [{ id: "chat-failed-only", project_id: "project-a", status: "failed", is_running: false }],
+              new Set()
+            );
+            assert.equal(
+              noMatchForOnlyFailed,
+              null,
+              "pending session matching should not bind an optimistic row to failed chats"
+            );
 
             const keepPendingWithinGrace = reconcilePendingChatStarts(
               {
