@@ -2239,8 +2239,9 @@ Gemini CLI
             agent_args: list[str] | None = None,
             agent_type: str | None = None,
         ) -> dict[str, str]:
-            del project_id, profile, ro_mounts, rw_mounts, env_vars, agent_args
+            del project_id, profile, ro_mounts, rw_mounts, env_vars
             captured["agent_type"] = agent_type
+            captured["agent_args"] = list(agent_args or [])
             return {"id": "chat-created"}
 
         with patch.object(hub_server.HubState, "create_chat", fake_create), patch.object(
@@ -2249,6 +2250,7 @@ Gemini CLI
             result = self.state.create_and_start_chat(project["id"], agent_type="claude")
 
         self.assertEqual(captured["agent_type"], "claude")
+        self.assertEqual(captured["agent_args"], ["--model", hub_server.DEFAULT_CLAUDE_MODEL])
         self.assertEqual(result["id"], "chat-created")
 
     def test_create_and_start_chat_uses_configured_default_agent_type(self) -> None:
@@ -2280,6 +2282,73 @@ Gemini CLI
             self.state.create_and_start_chat(project["id"])
 
         self.assertEqual(captured["agent_type"], "gemini")
+
+    def test_create_and_start_chat_uses_default_claude_model_for_configured_claude_agent_type(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        self.state.update_settings({"default_agent_type": "claude"})
+        captured: dict[str, object] = {}
+
+        def fake_create(
+            _: hub_server.HubState,
+            project_id: str,
+            profile: str | None,
+            ro_mounts: list[str],
+            rw_mounts: list[str],
+            env_vars: list[str],
+            agent_args: list[str] | None = None,
+            agent_type: str | None = None,
+        ) -> dict[str, str]:
+            del project_id, profile, ro_mounts, rw_mounts, env_vars
+            captured["agent_type"] = agent_type
+            captured["agent_args"] = list(agent_args or [])
+            return {"id": "chat-created"}
+
+        with patch.object(hub_server.HubState, "create_chat", fake_create), patch.object(
+            hub_server.HubState, "start_chat", return_value={"id": "chat-created", "status": "running"}
+        ):
+            self.state.create_and_start_chat(project["id"])
+
+        self.assertEqual(captured["agent_type"], "claude")
+        self.assertEqual(captured["agent_args"], ["--model", hub_server.DEFAULT_CLAUDE_MODEL])
+
+    def test_create_and_start_chat_preserves_explicit_claude_model(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        captured: dict[str, object] = {}
+
+        def fake_create(
+            _: hub_server.HubState,
+            project_id: str,
+            profile: str | None,
+            ro_mounts: list[str],
+            rw_mounts: list[str],
+            env_vars: list[str],
+            agent_args: list[str] | None = None,
+            agent_type: str | None = None,
+        ) -> dict[str, str]:
+            del project_id, profile, ro_mounts, rw_mounts, env_vars
+            captured["agent_type"] = agent_type
+            captured["agent_args"] = list(agent_args or [])
+            return {"id": "chat-created"}
+
+        with patch.object(hub_server.HubState, "create_chat", fake_create), patch.object(
+            hub_server.HubState, "start_chat", return_value={"id": "chat-created", "status": "running"}
+        ):
+            self.state.create_and_start_chat(
+                project["id"],
+                agent_type="claude",
+                agent_args=["--model", "sonnet"],
+            )
+
+        self.assertEqual(captured["agent_type"], "claude")
+        self.assertEqual(captured["agent_args"], ["--model", "sonnet"])
 
     def test_start_chat_rejects_when_stored_snapshot_tag_is_stale(self) -> None:
         project = self.state.add_project(
@@ -5122,8 +5191,11 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn(image_cli.CLAUDE_RUNTIME_IMAGE, run_cmd)
             image_index = run_cmd.index(image_cli.CLAUDE_RUNTIME_IMAGE)
             self.assertEqual(run_cmd[image_index + 1], "claude")
-            self.assertIn("--permission-mode", run_cmd[image_index + 2 :])
-            self.assertIn("bypassPermissions", run_cmd[image_index + 2 :])
+            claude_args = run_cmd[image_index + 2 :]
+            self.assertIn("--model", claude_args)
+            self.assertIn(image_cli.DEFAULT_CLAUDE_MODEL, claude_args)
+            self.assertIn("--permission-mode", claude_args)
+            self.assertIn("bypassPermissions", claude_args)
 
     def test_claude_runtime_appends_shared_prompt_context_from_system_prompt_file_and_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5546,6 +5618,54 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("--permission-mode", claude_args)
             self.assertIn("acceptEdits", claude_args)
             self.assertNotIn("bypassPermissions", claude_args)
+
+    def test_claude_runtime_flags_respect_explicit_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-command",
+                        "claude",
+                        "--",
+                        "--model",
+                        "sonnet",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            image_index = run_cmd.index(image_cli.CLAUDE_RUNTIME_IMAGE)
+            claude_args = run_cmd[image_index + 2 :]
+            self.assertIn("--model", claude_args)
+            model_index = claude_args.index("--model")
+            self.assertEqual(claude_args[model_index + 1], "sonnet")
+            self.assertNotIn(image_cli.DEFAULT_CLAUDE_MODEL, claude_args)
 
     def test_snapshot_reuses_shared_setup_image_and_builds_provider_overlay(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

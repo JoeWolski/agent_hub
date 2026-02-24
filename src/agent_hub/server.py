@@ -85,6 +85,7 @@ AGENT_TYPE_CODEX = "codex"
 AGENT_TYPE_CLAUDE = "claude"
 AGENT_TYPE_GEMINI = "gemini"
 DEFAULT_CHAT_AGENT_TYPE = AGENT_TYPE_CODEX
+DEFAULT_CLAUDE_MODEL = "opus"
 SUPPORTED_CHAT_AGENT_TYPES = {AGENT_TYPE_CODEX, AGENT_TYPE_CLAUDE, AGENT_TYPE_GEMINI}
 CHAT_LAYOUT_ENGINE_CLASSIC = "classic"
 CHAT_LAYOUT_ENGINE_FLEXLAYOUT = "flexlayout"
@@ -536,6 +537,15 @@ def _cli_arg_matches_option(arg: str, *, long_option: str, short_option: str | N
 
 def _has_cli_option(args: list[str], *, long_option: str, short_option: str | None = None) -> bool:
     return any(_cli_arg_matches_option(str(arg), long_option=long_option, short_option=short_option) for arg in args)
+
+
+def _apply_default_model_for_agent(agent_type: str, agent_args: list[str]) -> list[str]:
+    normalized_args = [str(arg) for arg in agent_args if str(arg).strip()]
+    if agent_type != AGENT_TYPE_CLAUDE:
+        return normalized_args
+    if _has_cli_option(normalized_args, long_option="--model", short_option="-m"):
+        return normalized_args
+    return ["--model", DEFAULT_CLAUDE_MODEL, *normalized_args]
 
 
 def _normalize_chat_layout_engine(raw_value: Any, *, strict: bool = False) -> str:
@@ -6610,6 +6620,7 @@ class HubState:
             if agent_type is None
             else _normalize_chat_agent_type(agent_type)
         )
+        normalized_agent_args = _apply_default_model_for_agent(resolved_agent_type, normalized_agent_args)
         chat = self.create_chat(
             project_id,
             profile="",
