@@ -36,6 +36,7 @@ COPY --from=uv_distroless /uv /uvx /usr/local/bin/
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get update \
  && apt-get install -y --no-install-recommends nodejs \
+ && npm install -g vite@5.4.21 \
  && npm cache clean --force \
  && rm -rf /var/lib/apt/lists/*
 

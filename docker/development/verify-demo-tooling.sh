@@ -10,6 +10,7 @@ required_commands=(
   node
   npm
   npx
+  vite
   xauth
   xdotool
   xvfb-run
@@ -26,6 +27,7 @@ done
 uv --version >/dev/null
 node --version >/dev/null
 npm --version >/dev/null
+vite --version >/dev/null
 docker --version >/dev/null
 ffmpeg -version >/dev/null
 jq --version >/dev/null

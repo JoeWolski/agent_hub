@@ -6,7 +6,7 @@ It installs tooling needed for development and demo workflows, including:
 
 - `uv`
 - Docker CLI/daemon package (`docker.io`)
-- Node.js + Corepack
+- Node.js + Corepack + `vite` CLI
 - Playwright Firefox browser + dependencies
 - `ffmpeg`, `jq`, `xvfb`, `xdotool`, `xauth`
 - Build-time verification script for screenshot/video capture readiness (`docker/development/verify-demo-tooling.sh`)
