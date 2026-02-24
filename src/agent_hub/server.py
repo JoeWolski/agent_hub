@@ -264,6 +264,7 @@ AUTO_CONFIG_MODEL = "chatgpt-account-codex"
 AUTO_CONFIG_NOT_CONNECTED_ERROR = (
     "Auto configure needs a connected ChatGPT account in Settings to run a temporary repository analysis chat."
 )
+AUTO_CONFIG_CANCELLED_ERROR = "Auto-configure was cancelled by user."
 AUTO_CONFIG_MISSING_OUTPUT_ERROR = "Temporary auto-config chat did not return a JSON recommendation."
 AUTO_CONFIG_INVALID_OUTPUT_ERROR = "Temporary auto-config chat returned invalid JSON."
 AUTO_CONFIG_NOTES_MAX_CHARS = 400
@@ -446,6 +447,13 @@ class OpenAIAccountLoginSession:
     exit_code: int | None = None
     completed_at: str = ""
     error: str = ""
+
+
+@dataclass
+class AutoConfigRequestState:
+    request_id: str
+    process: subprocess.Popen[str] | None = None
+    cancel_requested: bool = False
 
 
 @dataclass(frozen=True)
@@ -3326,6 +3334,8 @@ class HubState:
         self._startup_reconcile_scheduled = False
         self._agent_tools_sessions_lock = Lock()
         self._agent_tools_sessions: dict[str, dict[str, Any]] = {}
+        self._auto_config_requests_lock = Lock()
+        self._auto_config_requests: dict[str, AutoConfigRequestState] = {}
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.project_dir.mkdir(parents=True, exist_ok=True)
         self.chat_dir.mkdir(parents=True, exist_ok=True)
@@ -3504,6 +3514,70 @@ class HubState:
                 "replace": bool(replace),
             },
         )
+
+    def _normalize_auto_config_request_id(self, request_id: Any) -> str:
+        return str(request_id or "").strip()[:AUTO_CONFIG_REQUEST_ID_MAX_CHARS]
+
+    def _auto_config_request_state(self, request_id: str) -> AutoConfigRequestState | None:
+        normalized_request_id = self._normalize_auto_config_request_id(request_id)
+        if not normalized_request_id:
+            return None
+        with self._auto_config_requests_lock:
+            return self._auto_config_requests.get(normalized_request_id)
+
+    def _register_auto_config_request(self, request_id: str) -> None:
+        normalized_request_id = self._normalize_auto_config_request_id(request_id)
+        if not normalized_request_id:
+            return
+        with self._auto_config_requests_lock:
+            self._auto_config_requests[normalized_request_id] = AutoConfigRequestState(request_id=normalized_request_id)
+
+    def _set_auto_config_request_process(self, request_id: str, process: subprocess.Popen[str] | None = None) -> None:
+        normalized_request_id = self._normalize_auto_config_request_id(request_id)
+        if not normalized_request_id:
+            return
+        should_stop_process = False
+        with self._auto_config_requests_lock:
+            state = self._auto_config_requests.get(normalized_request_id)
+            if state is None:
+                return
+            state.process = process
+            should_stop_process = (
+                bool(state.cancel_requested)
+                and process is not None
+                and _is_process_running(process.pid)
+            )
+        if should_stop_process:
+            _stop_process(process.pid)
+
+    def _is_auto_config_request_cancelled(self, request_id: str) -> bool:
+        state = self._auto_config_request_state(request_id)
+        return bool(state and state.cancel_requested)
+
+    def _clear_auto_config_request(self, request_id: str) -> None:
+        normalized_request_id = self._normalize_auto_config_request_id(request_id)
+        if not normalized_request_id:
+            return
+        with self._auto_config_requests_lock:
+            self._auto_config_requests.pop(normalized_request_id, None)
+
+    def cancel_auto_configure_project(self, request_id: str) -> dict[str, Any]:
+        normalized_request_id = self._normalize_auto_config_request_id(request_id)
+        if not normalized_request_id:
+            raise HTTPException(status_code=400, detail="request_id is required.")
+
+        process_to_cancel: subprocess.Popen[str] | None = None
+        with self._auto_config_requests_lock:
+            request_state = self._auto_config_requests.get(normalized_request_id)
+            if request_state is None:
+                return {"request_id": normalized_request_id, "cancelled": False, "active": False}
+            request_state.cancel_requested = True
+            process_to_cancel = request_state.process if request_state.process is not None else None
+
+        was_active = bool(process_to_cancel is not None and _is_process_running(process_to_cancel.pid))
+        if was_active:
+            _stop_process(process_to_cancel.pid)
+        return {"request_id": normalized_request_id, "cancelled": True, "active": was_active}
 
     def _emit_openai_account_session_changed(self, reason: str = "") -> None:
         payload = self.openai_account_session_payload()
@@ -5993,7 +6067,10 @@ class HubState:
         branch: str,
         on_output: Callable[[str], None] | None = None,
         retry_feedback: str = "",
+        request_id: str = "",
     ) -> dict[str, Any]:
+        normalized_request_id = self._normalize_auto_config_request_id(request_id)
+
         def emit(chunk: str) -> None:
             if on_output is None:
                 return
@@ -6080,6 +6157,9 @@ class HubState:
         if retry_feedback_text:
             emit("Applying previous build failure context for this retry.\n\n")
 
+        if self._is_auto_config_request_cancelled(normalized_request_id):
+            raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR)
+
         try:
             process = subprocess.Popen(
                 cmd,
@@ -6088,6 +6168,7 @@ class HubState:
                 stderr=subprocess.STDOUT,
                 bufsize=1,
             )
+            self._set_auto_config_request_process(normalized_request_id, process)
         except OSError as exc:
             try:
                 runtime_config_file.unlink()
@@ -6125,10 +6206,15 @@ class HubState:
                 except subprocess.TimeoutExpired:
                     pass
                 emit("\nTemporary auto-config chat timed out.\n")
+                if self._is_auto_config_request_cancelled(normalized_request_id):
+                    raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR) from exc
                 raise HTTPException(status_code=504, detail="Temporary auto-config chat timed out.") from exc
 
             output_text = "".join(output_chunks).strip()
             if return_code != 0:
+                if self._is_auto_config_request_cancelled(normalized_request_id):
+                    emit("\nAuto-config chat was cancelled by user.\n")
+                    raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR)
                 detail = _codex_exec_error_message(output_text)
                 raise HTTPException(status_code=502, detail=f"Temporary auto-config chat failed: {detail}")
 
@@ -6145,6 +6231,7 @@ class HubState:
                 raise HTTPException(status_code=502, detail=AUTO_CONFIG_INVALID_OUTPUT_ERROR) from exc
             return {"payload": parsed_payload, "model": AUTO_CONFIG_MODEL}
         finally:
+            self._set_auto_config_request_process(normalized_request_id, None)
             try:
                 output_file.unlink()
             except OSError:
@@ -6166,6 +6253,8 @@ class HubState:
         if not normalized_repo_url:
             raise HTTPException(status_code=400, detail="repo_url is required.")
         normalized_request_id = str(request_id or "").strip()[:AUTO_CONFIG_REQUEST_ID_MAX_CHARS]
+        if normalized_request_id:
+            self._register_auto_config_request(normalized_request_id)
 
         def emit_auto_config_log(text: str, replace: bool = False) -> None:
             if not normalized_request_id:
@@ -6195,6 +6284,9 @@ class HubState:
         emit_auto_config_log("Preparing repository checkout for temporary analysis chat...\n")
         emit_auto_config_log(f"Repository URL: {normalized_repo_url}\n")
         emit_auto_config_log(f"Requested branch: {requested_branch or 'auto-detect'}\n")
+
+        if self._is_auto_config_request_cancelled(normalized_request_id):
+            raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR)
 
         try:
             with tempfile.TemporaryDirectory(prefix="agent-hub-auto-config-", dir=str(self.data_dir)) as temp_dir:
@@ -6262,6 +6354,9 @@ class HubState:
                         resolved_branch = head_result.stdout.strip()
 
                 emit_auto_config_log("\nRepository checkout complete. Starting temporary analysis chat...\n")
+                if self._is_auto_config_request_cancelled(normalized_request_id):
+                    raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR)
+
                 recommendation: dict[str, Any] = {}
                 chat_result: dict[str, Any] = {}
                 retry_feedback = ""
@@ -6276,6 +6371,7 @@ class HubState:
                             resolved_branch,
                             on_output=emit_auto_config_log if normalized_request_id else None,
                             retry_feedback=retry_feedback,
+                            request_id=normalized_request_id,
                         )
                     else:
                         chat_result = self._run_temporary_auto_config_chat(
@@ -6283,6 +6379,7 @@ class HubState:
                             normalized_repo_url,
                             resolved_branch,
                             on_output=emit_auto_config_log if normalized_request_id else None,
+                            request_id=normalized_request_id,
                         )
                     recommendation = self._normalize_auto_config_recommendation(chat_result.get("payload") or {}, workspace)
                     recommendation = self._apply_auto_config_repository_hints(recommendation, workspace)
@@ -6348,6 +6445,8 @@ class HubState:
             detail = str(exc.detail or f"HTTP {exc.status_code}")
             emit_auto_config_log(f"\nAuto-config failed: {detail}\n")
             raise
+        finally:
+            self._clear_auto_config_request(normalized_request_id)
 
         recommendation["default_branch"] = resolved_branch
         recommendation["analysis_model"] = str(chat_result.get("model") or "")
@@ -10591,6 +10690,15 @@ def main(
             request_id=payload.get("request_id"),
         )
         return {"recommendation": recommendation}
+
+    @app.post("/api/projects/auto-configure/cancel")
+    async def api_cancel_auto_configure_project(request: Request) -> dict[str, Any]:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        return state.cancel_auto_configure_project(
+            request_id=payload.get("request_id"),
+        )
 
     @app.post("/api/projects")
     async def api_create_project(request: Request) -> dict[str, Any]:

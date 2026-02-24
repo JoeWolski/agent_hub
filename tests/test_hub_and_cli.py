@@ -1449,6 +1449,9 @@ Gemini CLI
         self.assertIn("1. test prompt", codex_prompt)
         self.assertIn("Repository URL: https://github.com/org/repo.git", auto_config_prompt)
         self.assertIn("Checked out branch: main", auto_config_prompt)
+        self.assertIn("Run this process in read-only mode", auto_config_prompt)
+        self.assertIn("Read-only analysis requirements", auto_config_prompt)
+        self.assertIn("Do not run commands that mutate files", auto_config_prompt)
         self.assertIn("Do not include compiler-cache mounts", auto_config_prompt)
         self.assertIn("Do not include Docker daemon socket mounts", auto_config_prompt)
         self.assertIn("Dockerfile file path: build context is repository root.", auto_config_prompt)
@@ -4728,6 +4731,49 @@ Gemini CLI
         self.assertEqual(recommendation["base_image_mode"], "tag")
         self.assertEqual(recommendation["analysis_model"], "chatgpt-account-codex")
 
+    def test_cancel_auto_configure_request_marks_cancelled_with_active_process(self) -> None:
+        request_id = "cancel-auto-001"
+        fake_process = SimpleNamespace(pid=12345, stdout=None)
+        self.state._register_auto_config_request(request_id)
+        self.state._set_auto_config_request_process(request_id, fake_process)
+
+        with patch("agent_hub.server._is_process_running", return_value=True), patch(
+            "agent_hub.server._stop_process"
+        ) as stop_process:
+            result = self.state.cancel_auto_configure_project(request_id)
+
+        self.assertEqual(
+            result,
+            {"request_id": request_id, "cancelled": True, "active": True},
+        )
+        stop_process.assert_called_once_with(12345)
+
+    def test_cancel_auto_configure_project_not_found_returns_inactive(self) -> None:
+        request_id = "missing-auto-001"
+        result = self.state.cancel_auto_configure_project(request_id)
+        self.assertEqual(
+            result,
+            {"request_id": request_id, "cancelled": False, "active": False},
+        )
+
+    def test_auto_configure_project_aborts_if_request_cancelled(self) -> None:
+        request_id = "cancel-auto-002"
+        self.state._register_auto_config_request(request_id)
+        with patch("agent_hub.server._is_process_running", return_value=True):
+            with self.state._auto_config_requests_lock:
+                self.state._auto_config_requests[request_id].cancel_requested = True
+
+            with self.assertRaises(HTTPException) as ctx:
+                self.state.auto_configure_project(
+                    repo_url="https://example.com/org/repo.git",
+                    default_branch="",
+                    request_id=request_id,
+                )
+
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertIn("cancelled", str(ctx.exception.detail).lower())
+        self.assertIsNone(self.state._auto_config_request_state(request_id))
+
     def test_auto_configure_project_emits_live_logs_for_request_id(self) -> None:
         emitted_logs: list[tuple[str, str, bool]] = []
 
@@ -4750,10 +4796,12 @@ Gemini CLI
             branch: str,
             on_output: Callable[[str], None] | None = None,
             retry_feedback: str = "",
+            request_id: str = "",
         ) -> dict[str, Any]:
             self.assertTrue(workspace.exists())
             self.assertEqual(repo_url, "https://example.com/org/repo.git")
             self.assertEqual(branch, "main")
+            self.assertEqual(request_id, "pending-auto-123")
             self.assertEqual(retry_feedback, "")
             if on_output is not None:
                 on_output("assistant> analyzing repository layout...\n")
@@ -4829,11 +4877,13 @@ Gemini CLI
             branch: str,
             on_output: Callable[[str], None] | None = None,
             retry_feedback: str = "",
+            request_id: str = "",
         ) -> dict[str, Any]:
             self.assertTrue(workspace.exists())
             self.assertEqual(repo_url, "https://example.com/org/repo.git")
             self.assertEqual(branch, "main")
             retry_feedbacks.append(retry_feedback)
+            self.assertEqual(request_id, "")
             if on_output is not None:
                 on_output("assistant> generated recommendation\n")
             if len(retry_feedbacks) == 1:
@@ -7708,6 +7758,31 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             default_branch="main",
             request_id="pending-auto-123",
         )
+
+    def test_auto_configure_cancel_route_calls_state_and_returns_result(self) -> None:
+        app = self._build_app()
+        cancellation_result = {"request_id": "pending-auto-123", "cancelled": True, "active": True}
+        with patch.object(
+            hub_server.HubState,
+            "cancel_auto_configure_project",
+            return_value=cancellation_result,
+        ) as cancel_auto_config:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/auto-configure/cancel",
+                    json={"request_id": "pending-auto-123"},
+                )
+
+        self.assertEqual(response.status_code, 200, msg=response.text)
+        self.assertEqual(response.json(), cancellation_result)
+        cancel_auto_config.assert_called_once_with(request_id="pending-auto-123")
+
+    def test_auto_configure_cancel_route_rejects_non_object_payload(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.post("/api/projects/auto-configure/cancel", json=["not-an-object"])
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
 
     def test_create_project_route_runs_state_call_in_worker_thread(self) -> None:
         app = self._build_app()
