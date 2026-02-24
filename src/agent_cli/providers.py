@@ -57,6 +57,10 @@ class AgentProvider(abc.ABC):
         """Injects the 'agent_tools' MCP server configuration into the base config text."""
         pass
 
+    def allowed_directories(self) -> list[str]:
+        """Returns the list of directories that the agent is allowed to access."""
+        return ["/tmp", "/workspace"]
+
     def sync_shared_context_file(self, host_agent_home: Path, shared_prompt_context: str) -> None:
         """Synchronizes any file-based shared prompt context required by the agent."""
         pass
@@ -135,6 +139,11 @@ class CodexProvider(AgentProvider):
         script_path: str,
     ) -> str:
         merged_config = _strip_mcp_server_toml(base_config_text, "agent_tools")
+        allowed_dirs = self.allowed_directories()
+        if allowed_dirs:
+            # Add to top-level of the TOML
+            merged_config = f"allow_directories = {json.dumps(allowed_dirs)}\n" + merged_config
+
         merged_config += (
             "\n[mcp_servers.agent_tools]\n"
             'command = "python3"\n'
@@ -213,6 +222,8 @@ class ClaudeProvider(AgentProvider):
         if "mcpServers" not in config or not isinstance(config["mcpServers"], dict):
             config["mcpServers"] = {}
 
+        config["allow_directories"] = self.allowed_directories()
+
         config["mcpServers"]["agent_tools"] = {
             "command": "python3",
             "args": [script_path],
@@ -242,6 +253,7 @@ class GeminiProvider(AgentProvider):
             parsed_args, long_option="--yolo"
         ):
             flags.extend(["--approval-mode", "yolo"])
+
         return flags
 
     def resume_shell_command(
@@ -267,6 +279,11 @@ class GeminiProvider(AgentProvider):
         script_path: str,
     ) -> str:
         merged_config = _strip_mcp_server_toml(base_config_text, "agent_tools")
+        allowed_dirs = self.allowed_directories()
+        if allowed_dirs:
+            # Add to top-level of the TOML
+            merged_config = f"allow_directories = {json.dumps(allowed_dirs)}\n" + merged_config
+
         merged_config += (
             "\n[mcp_servers.agent_tools]\n"
             'command = "python3"\n'
