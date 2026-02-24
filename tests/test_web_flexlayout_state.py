@@ -173,6 +173,89 @@ class WebFlexLayoutStateTests(unittest.TestCase):
             msg=f"Node flexlayout state test failed:\\nSTDOUT:\\n{result.stdout}\\nSTDERR:\\n{result.stderr}",
         )
 
+    def test_reconcile_preserves_nested_container_depth_for_vertical_splits(self) -> None:
+        node_script = textwrap.dedent(
+            """
+            import assert from "node:assert/strict";
+            import { reconcileProjectChatsFlexLayoutJson } from "./web/src/flexLayoutState.js";
+
+            const chats = [
+              { id: "chat-a", display_name: "Chat A" },
+              { id: "chat-b", display_name: "Chat B" }
+            ];
+
+            // FlexLayout represents vertical sibling splits with an extra nested row.
+            const verticalSplitLayout = {
+              global: {
+                tabEnableClose: false,
+                tabSetEnableDeleteWhenEmpty: true,
+                tabSetEnableMaximize: false
+              },
+              borders: [],
+              layout: {
+                type: "row",
+                children: [
+                  {
+                    type: "row",
+                    children: [
+                      {
+                        type: "tabset",
+                        id: "project-chat-top",
+                        active: true,
+                        selected: 0,
+                        children: [
+                          {
+                            type: "tab",
+                            id: "chat-chat-a",
+                            component: "project-chat-pane",
+                            config: { chat_id: "chat-a" }
+                          }
+                        ]
+                      },
+                      {
+                        type: "tabset",
+                        id: "project-chat-bottom",
+                        selected: 0,
+                        children: [
+                          {
+                            type: "tab",
+                            id: "chat-chat-b",
+                            component: "project-chat-pane",
+                            config: { chat_id: "chat-b" }
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            };
+
+            const reconciled = reconcileProjectChatsFlexLayoutJson(verticalSplitLayout, chats, "project-1");
+            assert.equal(String(reconciled?.layout?.type || ""), "row");
+            assert.equal(Array.isArray(reconciled?.layout?.children), true);
+            assert.equal(reconciled.layout.children.length, 1);
+            assert.equal(String(reconciled.layout.children[0]?.type || ""), "row");
+            assert.equal(Array.isArray(reconciled.layout.children[0]?.children), true);
+            assert.equal(reconciled.layout.children[0].children.length, 2);
+            assert.equal(String(reconciled.layout.children[0].children[0]?.id || ""), "project-chat-top");
+            assert.equal(String(reconciled.layout.children[0].children[1]?.id || ""), "project-chat-bottom");
+            """
+        )
+
+        result = subprocess.run(
+            ["node", "--input-type=module", "-e", node_script],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+            check=False,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"Node vertical split reconciliation test failed:\\nSTDOUT:\\n{result.stdout}\\nSTDERR:\\n{result.stderr}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
