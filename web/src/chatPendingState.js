@@ -37,6 +37,41 @@ export function isChatStarting(status, isRunning, isPendingStart) {
   return Boolean(isPendingStart);
 }
 
+export function findMatchingServerChatForPendingSession(session, serverChats, mappedServerIds) {
+  if (!session || typeof session !== "object") {
+    return null;
+  }
+  const projectId = String(session.project_id || "");
+  if (!projectId) {
+    return null;
+  }
+  const serverList = Array.isArray(serverChats) ? serverChats : [];
+  const mappedServerIdSet = mappedServerIds instanceof Set ? mappedServerIds : new Set();
+  const knownServerIds = new Set(
+    (Array.isArray(session.known_server_chat_ids) ? session.known_server_chat_ids : [])
+      .map((chatId) => String(chatId || ""))
+      .filter(Boolean)
+  );
+
+  for (const chat of serverList) {
+    const chatId = String(chat?.id || "");
+    if (!chatId || mappedServerIdSet.has(chatId) || knownServerIds.has(chatId)) {
+      continue;
+    }
+    if (String(chat?.project_id || "") !== projectId) {
+      continue;
+    }
+    const normalizedStatus = String(chat?.status || "").toLowerCase();
+    const isRunning = Boolean(chat?.is_running);
+    const isStartupCandidate = isRunning || normalizedStatus === "starting" || normalizedStatus === "running";
+    if (!isStartupCandidate) {
+      continue;
+    }
+    return chat;
+  }
+  return null;
+}
+
 export function reconcilePendingSessions(previousSessions, serverChatsById, nowMs = Date.now()) {
   const sessions = Array.isArray(previousSessions) ? previousSessions : [];
   const serverMap = serverChatsById instanceof Map ? serverChatsById : new Map();
