@@ -57,6 +57,7 @@ TEST_GITHUB_MANIFEST_CONVERSION_PAYLOAD = {
 TEST_GITHUB_PERSONAL_ACCESS_TOKEN = "github_pat_abcdefghijklmnopqrstuvwxyz1234567890"
 TEST_GITHUB_PERSONAL_ACCESS_TOKEN_SECOND = "github_pat_abcdefghijklmnopqrstuvwxyz0987654321"
 TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION = {
+    "provider": "github",
     "account_login": "agentuser",
     "account_name": "Agent User",
     "account_email": "agentuser@example.com",
@@ -131,7 +132,7 @@ class HubStateTests(unittest.TestCase):
             }
         return status
 
-    def _connect_github_pat(self, host: str = "github.com", owner_scopes: list[str] | None = None) -> dict[str, object]:
+    def _connect_github_pat(self, host: str = "github.com") -> dict[str, object]:
         with patch.object(
             hub_server.HubState,
             "_verify_github_personal_access_token",
@@ -140,7 +141,29 @@ class HubStateTests(unittest.TestCase):
             status = self.state.connect_github_personal_access_token(
                 TEST_GITHUB_PERSONAL_ACCESS_TOKEN,
                 host=host,
-                owner_scopes=owner_scopes,
+            )
+        return status
+
+    def _connect_gitlab_pat(self, host: str = "gitlab.com") -> dict[str, object]:
+        verification = dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION)
+        verification.update(
+            {
+                "provider": "gitlab",
+                "account_login": "gitlab-user",
+                "account_name": "GitLab User",
+                "account_email": "gitlab-user@example.com",
+                "account_id": "44",
+                "token_scopes": "api,read_repository,write_repository",
+            }
+        )
+        with patch.object(
+            hub_server.HubState,
+            "_verify_github_personal_access_token",
+            return_value=verification,
+        ):
+            status = self.state.connect_gitlab_personal_access_token(
+                TEST_GITHUB_PERSONAL_ACCESS_TOKEN,
+                host=host,
             )
         return status
 
@@ -842,7 +865,7 @@ Gemini CLI
         self.assertTrue(saved["connected"])
 
     def test_github_app_credentials_round_trip_status(self) -> None:
-        initial = self.state.github_auth_status()
+        initial = self.state.github_app_auth_status()
         self.assertFalse(initial["connected"])
         self.assertTrue(initial["app_configured"])
         self.assertEqual(initial["installation_id"], 0)
@@ -855,58 +878,42 @@ Gemini CLI
         self.assertEqual(saved["repository_selection"], "selected")
         self.assertTrue(saved["updated_at"])
         self.assertTrue(self.state.github_app_installation_file.exists())
-        self.assertTrue(self.state.github_git_credentials_file.exists())
 
         installation_mode = self.state.github_app_installation_file.stat().st_mode & 0o777
-        credentials_mode = self.state.github_git_credentials_file.stat().st_mode & 0o777
         self.assertEqual(installation_mode, 0o600)
-        self.assertEqual(credentials_mode, 0o600)
 
         payload = self.state.auth_settings_payload()
         self.assertIn("providers", payload)
-        self.assertIn("github", payload["providers"])
-        self.assertTrue(payload["providers"]["github"]["connected"])
+        self.assertIn("github_app", payload["providers"])
+        self.assertTrue(payload["providers"]["github_app"]["connected"])
 
         disconnected = self.state.disconnect_github_app()
         self.assertFalse(disconnected["connected"])
         self.assertFalse(self.state.github_app_installation_file.exists())
-        self.assertFalse(self.state.github_git_credentials_file.exists())
 
     def test_github_personal_access_token_credentials_round_trip_status(self) -> None:
-        initial = self.state.github_auth_status()
+        initial = self.state.github_tokens_status()
         self.assertFalse(initial["connected"])
 
         saved = self._connect_github_pat()
         self.assertTrue(saved["connected"])
-        self.assertEqual(saved["connection_mode"], "personal_access_token")
-        self.assertEqual(saved["personal_access_token_user_login"], "agentuser")
-        self.assertEqual(saved["personal_access_token_user_name"], "Agent User")
-        self.assertEqual(saved["personal_access_token_user_email"], "agentuser@example.com")
-        self.assertEqual(saved["personal_access_token_git_user_name"], "Agent User")
-        self.assertEqual(saved["personal_access_token_git_user_email"], "agentuser@example.com")
-        self.assertEqual(saved["personal_access_token_host"], "github.com")
-        self.assertEqual(saved["personal_access_token_count"], 1)
-        self.assertEqual(len(saved["personal_access_tokens"]), 1)
-        self.assertEqual(saved["personal_access_tokens"][0]["host"], "github.com")
-        self.assertEqual(saved["personal_access_tokens"][0]["owner_scopes"], [])
+        self.assertEqual(saved["token_count"], 1)
+        self.assertEqual(len(saved["tokens"]), 1)
+        self.assertEqual(saved["tokens"][0]["account_login"], "agentuser")
+        self.assertEqual(saved["tokens"][0]["account_name"], "Agent User")
+        self.assertEqual(saved["tokens"][0]["account_email"], "agentuser@example.com")
+        self.assertEqual(saved["tokens"][0]["git_user_name"], "Agent User")
+        self.assertEqual(saved["tokens"][0]["git_user_email"], "agentuser@example.com")
+        self.assertEqual(saved["tokens"][0]["host"], "github.com")
         self.assertTrue(saved["updated_at"])
-        self.assertTrue(self.state.github_personal_access_token_file.exists())
-        self.assertTrue(self.state.github_git_credentials_file.exists())
-        credentials_line = self.state.github_git_credentials_file.read_text(encoding="utf-8").strip()
-        self.assertEqual(
-            credentials_line,
-            f"https://agentuser:{TEST_GITHUB_PERSONAL_ACCESS_TOKEN}@github.com",
-        )
+        self.assertTrue(self.state.github_tokens_file.exists())
 
-        token_mode = self.state.github_personal_access_token_file.stat().st_mode & 0o777
-        credentials_mode = self.state.github_git_credentials_file.stat().st_mode & 0o777
+        token_mode = self.state.github_tokens_file.stat().st_mode & 0o777
         self.assertEqual(token_mode, 0o600)
-        self.assertEqual(credentials_mode, 0o600)
 
-        disconnected = self.state.disconnect_github_app()
+        disconnected = self.state.disconnect_github_personal_access_tokens()
         self.assertFalse(disconnected["connected"])
-        self.assertFalse(self.state.github_personal_access_token_file.exists())
-        self.assertFalse(self.state.github_git_credentials_file.exists())
+        self.assertFalse(self.state.github_tokens_file.exists())
 
     def test_connect_github_personal_access_token_rejects_invalid_token(self) -> None:
         with self.assertRaises(HTTPException) as ctx:
@@ -954,27 +961,25 @@ Gemini CLI
         try:
             port = int(server.server_address[1])
             host_input = f"http://127.0.0.1:{port}"
-            saved = self.state.connect_github_personal_access_token(
+            saved = self.state.connect_gitlab_personal_access_token(
                 token,
                 host=host_input,
-                owner_scopes=["acme-org"],
             )
             expected_host = f"127.0.0.1:{port}"
             self.assertTrue(saved["connected"])
-            self.assertEqual(saved["personal_access_token_host"], expected_host)
-            self.assertEqual(saved["personal_access_token_scheme"], "http")
-            self.assertEqual(saved["personal_access_token_provider"], "gitlab")
-            self.assertEqual(saved["personal_access_token_user_login"], "gitlab-user")
-            self.assertEqual(saved["personal_access_token_user_email"], "gitlab-user@example.com")
-            self.assertEqual(saved["personal_access_token_owner_scopes"], ["acme-org"])
-            credentials_line = self.state.github_git_credentials_file.read_text(encoding="utf-8").strip()
-            self.assertEqual(credentials_line, f"http://gitlab-user:{token}@{expected_host}")
+            self.assertEqual(saved["token_count"], 1)
+            self.assertEqual(saved["tokens"][0]["host"], expected_host)
+            self.assertEqual(saved["tokens"][0]["scheme"], "http")
+            self.assertEqual(saved["tokens"][0]["provider"], "gitlab")
+            self.assertEqual(saved["tokens"][0]["account_login"], "gitlab-user")
+            self.assertEqual(saved["tokens"][0]["account_email"], "gitlab-user@example.com")
+            self.assertTrue(self.state.gitlab_tokens_file.exists())
 
             context = self.state._github_repo_auth_context(f"http://{expected_host}/acme-org/repo.git")
             self.assertIsNotNone(context)
             assert context is not None
             mode, context_host, payload = context
-            self.assertEqual(mode, hub_server.GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN)
+            self.assertEqual(mode, hub_server.GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN)
             self.assertEqual(context_host, expected_host)
             self.assertEqual(payload["scheme"], "http")
             self.assertEqual(payload["provider"], "gitlab")
@@ -1028,13 +1033,14 @@ Gemini CLI
             self.assertEqual(ctx.exception.status_code, 400)
             self.assertIn("missing required scopes", str(ctx.exception.detail))
             self.assertIn("write_repository", str(ctx.exception.detail))
-            self.assertFalse(self.state.github_personal_access_token_file.exists())
+            self.assertFalse(self.state.github_tokens_file.exists())
+            self.assertFalse(self.state.gitlab_tokens_file.exists())
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=1.0)
 
-    def test_connect_github_app_clears_personal_access_token_state(self) -> None:
+    def test_connect_github_app_does_not_clear_personal_access_token_state(self) -> None:
         self._connect_github_pat()
         with patch.object(
             hub_server.HubState,
@@ -1046,18 +1052,22 @@ Gemini CLI
             return_value=("ghs_test_installation_token", "2030-01-01T00:00:00Z"),
         ):
             status = self.state.connect_github_app(TEST_GITHUB_INSTALLATION_ID)
-        self.assertEqual(status["connection_mode"], "github_app")
+        self.assertTrue(status["connected"])
         self.assertTrue(self.state.github_app_installation_file.exists())
-        self.assertFalse(self.state.github_personal_access_token_file.exists())
+        self.assertTrue(self.state.github_tokens_file.exists())
+        github_tokens = self.state.github_tokens_status()
+        self.assertEqual(github_tokens["token_count"], 1)
 
-    def test_connect_github_personal_access_token_clears_app_connection_state(self) -> None:
+    def test_connect_github_personal_access_token_does_not_clear_app_connection_state(self) -> None:
         self._connect_github_app()
         status = self._connect_github_pat()
-        self.assertEqual(status["connection_mode"], "personal_access_token")
-        self.assertTrue(self.state.github_personal_access_token_file.exists())
-        self.assertFalse(self.state.github_app_installation_file.exists())
+        self.assertTrue(status["connected"])
+        self.assertTrue(self.state.github_tokens_file.exists())
+        self.assertTrue(self.state.github_app_installation_file.exists())
+        github_app = self.state.github_app_auth_status()
+        self.assertTrue(github_app["connected"])
 
-    def test_github_auth_status_migrates_legacy_personal_access_token_record(self) -> None:
+    def test_github_tokens_status_reads_single_record_payload(self) -> None:
         legacy_payload = {
             "host": "github.com",
             "personal_access_token": TEST_GITHUB_PERSONAL_ACCESS_TOKEN,
@@ -1071,21 +1081,19 @@ Gemini CLI
             "verified_at": "2030-01-01T00:00:00Z",
             "connected_at": "2030-01-01T00:00:00Z",
         }
-        self.state.github_personal_access_token_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state.github_personal_access_token_file.write_text(
+        self.state.github_tokens_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state.github_tokens_file.write_text(
             json.dumps(legacy_payload, indent=2) + "\n",
             encoding="utf-8",
         )
 
-        status = self.state.github_auth_status()
+        status = self.state.github_tokens_status()
         self.assertTrue(status["connected"])
-        self.assertEqual(status["connection_mode"], "personal_access_token")
-        self.assertEqual(status["personal_access_token_count"], 1)
-        self.assertEqual(len(status["personal_access_tokens"]), 1)
-        self.assertEqual(status["personal_access_tokens"][0]["account_login"], "legacy-user")
-        self.assertEqual(status["personal_access_tokens"][0]["owner_scopes"], [])
+        self.assertEqual(status["token_count"], 1)
+        self.assertEqual(len(status["tokens"]), 1)
+        self.assertEqual(status["tokens"][0]["account_login"], "legacy-user")
 
-    def test_github_repo_auth_context_prefers_owner_scoped_personal_access_token(self) -> None:
+    def test_github_repo_auth_context_prefers_project_bound_personal_access_token(self) -> None:
         first_verification = dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION)
         first_verification["account_login"] = "fallback-user"
         first_verification["account_name"] = "Fallback User"
@@ -1102,16 +1110,24 @@ Gemini CLI
             "_verify_github_personal_access_token",
             side_effect=[first_verification, second_verification],
         ):
-            self.state.connect_github_personal_access_token(
+            first_status = self.state.connect_github_personal_access_token(
                 TEST_GITHUB_PERSONAL_ACCESS_TOKEN,
                 host="github.com",
-                owner_scopes=[],
             )
-            self.state.connect_github_personal_access_token(
+            second_status = self.state.connect_github_personal_access_token(
                 TEST_GITHUB_PERSONAL_ACCESS_TOKEN_SECOND,
                 host="github.com",
-                owner_scopes=["acme-org"],
             )
+        first_token_id = next(
+            token["token_id"]
+            for token in first_status["tokens"]
+            if token["account_login"] == "fallback-user"
+        )
+        second_token_id = next(
+            token["token_id"]
+            for token in second_status["tokens"]
+            if token["account_login"] == "scoped-user"
+        )
 
         context = self.state._github_repo_auth_context("https://github.com/acme-org/repo.git")
         self.assertIsNotNone(context)
@@ -1122,7 +1138,14 @@ Gemini CLI
         self.assertEqual(payload["account_login"], "scoped-user")
         self.assertEqual(payload["personal_access_token"], TEST_GITHUB_PERSONAL_ACCESS_TOKEN_SECOND)
 
-        fallback_context = self.state._github_repo_auth_context("https://github.com/other-org/repo.git")
+        project = {
+            "repo_url": "https://github.com/acme-org/repo.git",
+            "credential_binding": {
+                "mode": "single",
+                "credential_ids": [str(first_token_id)],
+            },
+        }
+        fallback_context = self.state._github_repo_auth_context("https://github.com/other-org/repo.git", project=project)
         self.assertIsNotNone(fallback_context)
         assert fallback_context is not None
         fallback_mode, fallback_host, fallback_payload = fallback_context
@@ -1130,6 +1153,7 @@ Gemini CLI
         self.assertEqual(fallback_host, "github.com")
         self.assertEqual(fallback_payload["account_login"], "fallback-user")
         self.assertEqual(fallback_payload["personal_access_token"], TEST_GITHUB_PERSONAL_ACCESS_TOKEN)
+        self.assertNotEqual(str(first_token_id), str(second_token_id))
 
     def test_disconnect_github_personal_access_token_removes_only_selected_token(self) -> None:
         first_verification = dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION)
@@ -1145,29 +1169,27 @@ Gemini CLI
             self.state.connect_github_personal_access_token(
                 TEST_GITHUB_PERSONAL_ACCESS_TOKEN,
                 host="github.com",
-                owner_scopes=[],
             )
             connected = self.state.connect_github_personal_access_token(
                 TEST_GITHUB_PERSONAL_ACCESS_TOKEN_SECOND,
                 host="github.com",
-                owner_scopes=["acme-org"],
             )
 
-        self.assertEqual(connected["personal_access_token_count"], 2)
-        first_token_id = str(connected["personal_access_tokens"][0]["token_id"])
-        second_token_id = str(connected["personal_access_tokens"][1]["token_id"])
+        self.assertEqual(connected["token_count"], 2)
+        first_token_id = str(connected["tokens"][0]["token_id"])
+        second_token_id = str(connected["tokens"][1]["token_id"])
         self.assertTrue(first_token_id)
         self.assertTrue(second_token_id)
 
         after_first_disconnect = self.state.disconnect_github_personal_access_token(first_token_id)
-        self.assertEqual(after_first_disconnect["personal_access_token_count"], 1)
-        self.assertEqual(after_first_disconnect["personal_access_tokens"][0]["token_id"], second_token_id)
-        self.assertTrue(self.state.github_personal_access_token_file.exists())
+        self.assertEqual(after_first_disconnect["token_count"], 1)
+        self.assertEqual(after_first_disconnect["tokens"][0]["token_id"], second_token_id)
+        self.assertTrue(self.state.github_tokens_file.exists())
 
         after_second_disconnect = self.state.disconnect_github_personal_access_token(second_token_id)
-        self.assertEqual(after_second_disconnect["personal_access_token_count"], 0)
+        self.assertEqual(after_second_disconnect["token_count"], 0)
         self.assertFalse(after_second_disconnect["connected"])
-        self.assertFalse(self.state.github_personal_access_token_file.exists())
+        self.assertFalse(self.state.github_tokens_file.exists())
 
     def test_connect_github_app_rejects_invalid_installation_id(self) -> None:
         with self.assertRaises(HTTPException) as ctx:
@@ -1223,7 +1245,7 @@ Gemini CLI
         self.assertTrue(payload["active"])
         self.assertEqual(payload["status"], "awaiting_user")
         self.assertTrue(str(payload["form_action"]).startswith("https://github.com/settings/apps/new?state="))
-        self.assertEqual(payload["manifest"]["redirect_url"], "http://localhost:8765/api/settings/auth/github/app/setup/callback")
+        self.assertEqual(payload["manifest"]["redirect_url"], "http://localhost:8765/api/settings/auth/github-app/setup/callback")
         self.assertTrue(str(payload["manifest"]["name"]).startswith(hub_server.GITHUB_APP_DEFAULT_NAME))
 
     def test_complete_github_app_setup_persists_settings(self) -> None:
@@ -2100,9 +2122,13 @@ Gemini CLI
 
         cmd = captured["cmd"]
         self.assertIn("--git-credential-file", cmd)
-        self.assertIn(str(self.state.github_git_credentials_file), cmd)
+        credential_path = Path(cmd[cmd.index("--git-credential-file") + 1])
+        self.assertTrue(credential_path.exists())
+        self.assertEqual(credential_path.parent, self.state.git_credentials_dir)
         self.assertIn("--git-credential-host", cmd)
         self.assertIn("github.com", cmd)
+        self.assertTrue(any(str(entry).startswith("AGENT_HUB_AGENT_TOOLS_URL=") for entry in cmd))
+        self.assertTrue(any(str(entry).startswith("AGENT_HUB_AGENT_TOOLS_TOKEN=") for entry in cmd))
 
     def test_start_chat_passes_github_pat_credentials_and_identity_when_configured(self) -> None:
         self._connect_github_pat()
@@ -2151,7 +2177,9 @@ Gemini CLI
 
         cmd = captured["cmd"]
         self.assertIn("--git-credential-file", cmd)
-        self.assertIn(str(self.state.github_git_credentials_file), cmd)
+        credential_path = Path(cmd[cmd.index("--git-credential-file") + 1])
+        self.assertTrue(credential_path.exists())
+        self.assertEqual(credential_path.parent, self.state.git_credentials_dir)
         self.assertIn("--git-credential-host", cmd)
         self.assertIn("github.com", cmd)
         self.assertIn("AGENT_HUB_GIT_USER_NAME=Agent User", cmd)
@@ -3039,7 +3067,9 @@ Gemini CLI
         self.assertIn("--credentials-file", cmd)
         self.assertIn(str(self.state.openai_credentials_file), cmd)
         self.assertIn("--git-credential-file", cmd)
-        self.assertIn(str(self.state.github_git_credentials_file), cmd)
+        credential_path = Path(cmd[cmd.index("--git-credential-file") + 1])
+        self.assertTrue(credential_path.exists())
+        self.assertEqual(credential_path.parent, self.state.git_credentials_dir)
         self.assertIn("--git-credential-host", cmd)
         self.assertIn("github.com", cmd)
         self.assertIn("--no-alt-screen", cmd)
@@ -3141,7 +3171,9 @@ Gemini CLI
         cmd = executed[0]
         self.assertIn("agent_cli", cmd)
         self.assertIn("--git-credential-file", cmd)
-        self.assertIn(str(self.state.github_git_credentials_file), cmd)
+        credential_path = Path(cmd[cmd.index("--git-credential-file") + 1])
+        self.assertTrue(credential_path.exists())
+        self.assertEqual(credential_path.parent, self.state.git_credentials_dir)
         self.assertIn("AGENT_HUB_GIT_USER_NAME=Agent User", cmd)
         self.assertIn("AGENT_HUB_GIT_USER_EMAIL=agentuser@example.com", cmd)
 
@@ -6729,7 +6761,8 @@ class CliEnvVarTests(unittest.TestCase):
                 / "share"
                 / "agent-hub"
                 / image_cli.AGENT_HUB_SECRETS_DIR_NAME
-                / image_cli.AGENT_HUB_GITHUB_CREDENTIALS_FILE_NAME
+                / image_cli.AGENT_HUB_GIT_CREDENTIALS_DIR_NAME
+                / "discovered-github.git-credentials"
             )
             stored_credentials.parent.mkdir(parents=True, exist_ok=True)
             stored_credentials.write_text(
@@ -6795,7 +6828,8 @@ class CliEnvVarTests(unittest.TestCase):
                 / "share"
                 / "agent-hub"
                 / image_cli.AGENT_HUB_SECRETS_DIR_NAME
-                / image_cli.AGENT_HUB_GITHUB_CREDENTIALS_FILE_NAME
+                / image_cli.AGENT_HUB_GIT_CREDENTIALS_DIR_NAME
+                / "discovered-ghe.git-credentials"
             )
             stored_credentials.parent.mkdir(parents=True, exist_ok=True)
             stored_credentials.write_text(
@@ -6858,7 +6892,8 @@ class CliEnvVarTests(unittest.TestCase):
                 / "share"
                 / "agent-hub"
                 / image_cli.AGENT_HUB_SECRETS_DIR_NAME
-                / image_cli.AGENT_HUB_GITHUB_CREDENTIALS_FILE_NAME
+                / image_cli.AGENT_HUB_GIT_CREDENTIALS_DIR_NAME
+                / "discovered-host-port.git-credentials"
             )
             stored_credentials.parent.mkdir(parents=True, exist_ok=True)
             stored_credentials.write_text(
@@ -7471,6 +7506,7 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             default_ro_mounts=[f"{host_ro}:/container/ro"],
             default_rw_mounts=[f"{host_rw}:/container/rw"],
             default_env_vars=["FOO=bar"],
+            credential_binding={"mode": "auto", "credential_ids": [], "source": "", "updated_at": ""},
         )
 
     def test_project_chat_start_route_runs_state_call_in_worker_thread(self) -> None:

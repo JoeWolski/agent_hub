@@ -15,6 +15,7 @@ dependencies = [
 [project.scripts]
 agent_cli = "agent_cli.cli:main"
 agent_hub = "agent_hub.server:main"
+agent_tools_mcp = "agent_hub.agent_tools_mcp:main"
 
 [build-system]
 requires = ["hatchling>=1.24"]

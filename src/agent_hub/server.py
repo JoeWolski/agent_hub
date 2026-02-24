@@ -48,8 +48,10 @@ SECRETS_DIR_NAME = "secrets"
 OPENAI_CREDENTIALS_FILE_NAME = "openai.env"
 OPENAI_CODEX_AUTH_FILE_NAME = "auth.json"
 GITHUB_APP_INSTALLATION_FILE_NAME = "github_app_installation.json"
-GITHUB_PERSONAL_ACCESS_TOKEN_FILE_NAME = "github_personal_access_token.json"
-GITHUB_GIT_CREDENTIALS_FILE_NAME = "github_credentials"
+GITHUB_TOKENS_FILE_NAME = "github_tokens.json"
+GITLAB_TOKENS_FILE_NAME = "gitlab_tokens.json"
+GIT_CREDENTIALS_DIR_NAME = "git_credentials"
+CHAT_RUNTIME_CONFIGS_DIR_NAME = "chat_runtime_configs"
 GITHUB_APP_SETTINGS_FILE_NAME = "github_app_settings.json"
 GITHUB_APP_ID_ENV = "AGENT_HUB_GITHUB_APP_ID"
 GITHUB_APP_PRIVATE_KEY_ENV = "AGENT_HUB_GITHUB_APP_PRIVATE_KEY"
@@ -67,10 +69,19 @@ GITHUB_APP_PRIVATE_KEY_MAX_CHARS = 256_000
 GITHUB_APP_SETUP_SESSION_LIFETIME_SECONDS = 60 * 60
 GITHUB_APP_DEFAULT_NAME = "Agent Hub"
 GITHUB_CONNECTION_MODE_GITHUB_APP = "github_app"
-GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN = "personal_access_token"
+GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN = "personal_access_token"
+PROJECT_CREDENTIAL_BINDING_MODE_AUTO = "auto"
+PROJECT_CREDENTIAL_BINDING_MODE_SET = "set"
+PROJECT_CREDENTIAL_BINDING_MODE_SINGLE = "single"
+PROJECT_CREDENTIAL_BINDING_MODE_ALL = "all"
+PROJECT_CREDENTIAL_BINDING_MODES = {
+    PROJECT_CREDENTIAL_BINDING_MODE_AUTO,
+    PROJECT_CREDENTIAL_BINDING_MODE_SET,
+    PROJECT_CREDENTIAL_BINDING_MODE_SINGLE,
+    PROJECT_CREDENTIAL_BINDING_MODE_ALL,
+}
 GITHUB_PERSONAL_ACCESS_TOKEN_MIN_CHARS = 20
 GITHUB_PERSONAL_ACCESS_TOKEN_ID_MAX_CHARS = 120
-GITHUB_OWNER_SCOPE_MAX_ITEMS = 64
 GIT_CREDENTIAL_DEFAULT_SCHEME = "https"
 GIT_CREDENTIAL_ALLOWED_SCHEMES = {"http", "https"}
 GIT_PROVIDER_GITHUB = "github"
@@ -375,7 +386,12 @@ RESERVED_ENV_VAR_KEYS = {
     "OPENAI_API_KEY",
     "AGENT_HUB_GIT_USER_NAME",
     "AGENT_HUB_GIT_USER_EMAIL",
+    "AGENT_HUB_AGENT_TOOLS_URL",
+    "AGENT_HUB_AGENT_TOOLS_TOKEN",
+    "AGENT_HUB_AGENT_TOOLS_PROJECT_ID",
+    "AGENT_HUB_AGENT_TOOLS_CHAT_ID",
 }
+AGENT_TOOLS_TOKEN_HEADER = "x-agent-hub-agent-tools-token"
 HUB_LOG_LEVEL_CHOICES = ("critical", "error", "warning", "info", "debug")
 GITHUB_APP_PRIVATE_KEY_BEGIN_MARKERS = {
     "-----BEGIN RSA PRIVATE KEY-----",
@@ -963,6 +979,35 @@ def _normalize_hub_settings_payload(raw_settings: Any) -> dict[str, Any]:
         "chat_layout_engine": _normalize_chat_layout_engine(
             raw_settings.get("chat_layout_engine") or raw_settings.get("chatLayoutEngine")
         ),
+    }
+
+
+def _normalize_project_credential_binding(raw_binding: Any) -> dict[str, Any]:
+    if not isinstance(raw_binding, dict):
+        raw_binding = {}
+    raw_mode = str(raw_binding.get("mode") or "").strip().lower()
+    mode = (
+        raw_mode
+        if raw_mode in PROJECT_CREDENTIAL_BINDING_MODES
+        else PROJECT_CREDENTIAL_BINDING_MODE_AUTO
+    )
+    raw_ids = raw_binding.get("credential_ids")
+    credential_ids: list[str] = []
+    if isinstance(raw_ids, list):
+        seen: set[str] = set()
+        for item in raw_ids:
+            value = str(item or "").strip()
+            if not value or value in seen:
+                continue
+            credential_ids.append(value)
+            seen.add(value)
+    source = str(raw_binding.get("source") or "").strip()
+    updated_at = str(raw_binding.get("updated_at") or "").strip()
+    return {
+        "mode": mode,
+        "credential_ids": credential_ids,
+        "source": source,
+        "updated_at": updated_at,
     }
 
 
@@ -1832,42 +1877,6 @@ def _normalize_github_personal_access_token(raw_value: Any) -> str:
     return token
 
 
-def _normalize_github_owner_scope(raw_value: Any, field_name: str = "owner_scope") -> str:
-    value = str(raw_value or "").strip().lower()
-    if value.startswith("@"):
-        value = value[1:].strip().lower()
-    if not value:
-        raise HTTPException(status_code=400, detail=f"{field_name} must not be empty.")
-    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}", value):
-        raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {raw_value}")
-    return value
-
-
-def _normalize_github_owner_scopes(raw_value: Any, field_name: str = "owner_scopes") -> list[str]:
-    if raw_value is None:
-        return []
-    if isinstance(raw_value, str):
-        candidates = re.split(r"[\s,]+", raw_value.strip())
-    elif isinstance(raw_value, list):
-        candidates = [str(item or "").strip() for item in raw_value]
-    else:
-        raise HTTPException(status_code=400, detail=f"{field_name} must be a string or array.")
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate:
-            continue
-        owner = _normalize_github_owner_scope(candidate, field_name=field_name)
-        if owner in seen:
-            continue
-        normalized.append(owner)
-        seen.add(owner)
-        if len(normalized) >= GITHUB_OWNER_SCOPE_MAX_ITEMS:
-            break
-    return normalized
-
-
 def _base64url_encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
@@ -2357,6 +2366,17 @@ def _new_artifact_publish_token() -> str:
 
 
 def _hash_artifact_publish_token(token: str) -> str:
+    value = str(token or "").strip()
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _new_agent_tools_token() -> str:
+    return secrets.token_hex(24)
+
+
+def _hash_agent_tools_token(token: str) -> str:
     value = str(token or "").strip()
     if not value:
         return ""
@@ -3255,11 +3275,13 @@ class HubState:
         self.chat_dir = self.data_dir / "chats"
         self.log_dir = self.data_dir / "logs"
         self.secrets_dir = self.data_dir / SECRETS_DIR_NAME
+        self.chat_runtime_configs_dir = self.data_dir / CHAT_RUNTIME_CONFIGS_DIR_NAME
         self.openai_credentials_file = self.secrets_dir / OPENAI_CREDENTIALS_FILE_NAME
         self.github_app_settings_file = self.secrets_dir / GITHUB_APP_SETTINGS_FILE_NAME
         self.github_app_installation_file = self.secrets_dir / GITHUB_APP_INSTALLATION_FILE_NAME
-        self.github_personal_access_token_file = self.secrets_dir / GITHUB_PERSONAL_ACCESS_TOKEN_FILE_NAME
-        self.github_git_credentials_file = self.secrets_dir / GITHUB_GIT_CREDENTIALS_FILE_NAME
+        self.github_tokens_file = self.secrets_dir / GITHUB_TOKENS_FILE_NAME
+        self.gitlab_tokens_file = self.secrets_dir / GITLAB_TOKENS_FILE_NAME
+        self.git_credentials_dir = self.secrets_dir / GIT_CREDENTIALS_DIR_NAME
         self.github_app_settings: GithubAppSettings | None = None
         self.github_app_settings_error = ""
         self._lock = Lock()
@@ -3287,11 +3309,15 @@ class HubState:
         self._startup_reconcile_lock = Lock()
         self._startup_reconcile_thread: Thread | None = None
         self._startup_reconcile_scheduled = False
+        self._agent_tools_sessions_lock = Lock()
+        self._agent_tools_sessions: dict[str, dict[str, Any]] = {}
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.project_dir.mkdir(parents=True, exist_ok=True)
         self.chat_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.secrets_dir.mkdir(parents=True, exist_ok=True)
+        self.chat_runtime_configs_dir.mkdir(parents=True, exist_ok=True)
+        self.git_credentials_dir.mkdir(parents=True, exist_ok=True)
         self.host_codex_dir.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(self.secrets_dir, 0o700)
@@ -3407,6 +3433,8 @@ class HubState:
             chat["artifact_prompt_history"] = _normalize_chat_artifact_prompt_history(chat.get("artifact_prompt_history"))
             chat["artifact_publish_token_hash"] = str(chat.get("artifact_publish_token_hash") or "")
             chat["artifact_publish_token_issued_at"] = str(chat.get("artifact_publish_token_issued_at") or "")
+            chat["agent_tools_token_hash"] = str(chat.get("agent_tools_token_hash") or "")
+            chat["agent_tools_token_issued_at"] = str(chat.get("agent_tools_token_issued_at") or "")
             chat["create_request_id"] = _compact_whitespace(str(chat.get("create_request_id") or "")).strip()
         return state
 
@@ -3775,6 +3803,8 @@ class HubState:
         chat["start_error"] = _compact_whitespace(str(detail or "")).strip()
         chat["artifact_publish_token_hash"] = ""
         chat["artifact_publish_token_issued_at"] = ""
+        chat["agent_tools_token_hash"] = ""
+        chat["agent_tools_token_issued_at"] = ""
         chat["last_exit_code"] = None
         chat["last_exit_at"] = _iso_now()
         chat["stop_requested_at"] = ""
@@ -3823,6 +3853,8 @@ class HubState:
         chat["pid"] = None
         chat["artifact_publish_token_hash"] = ""
         chat["artifact_publish_token_issued_at"] = ""
+        chat["agent_tools_token_hash"] = ""
+        chat["agent_tools_token_issued_at"] = ""
         chat["last_exit_code"] = _normalize_optional_int(exit_code)
         chat["last_exit_at"] = _iso_now()
         chat["updated_at"] = _iso_now()
@@ -3965,7 +3997,7 @@ class HubState:
 
         parsed_origin = urllib.parse.urlsplit(normalized_origin)
         callback_url = urllib.parse.urlunsplit(
-            (parsed_origin.scheme, parsed_origin.netloc, "/api/settings/auth/github/app/setup/callback", "", "")
+            (parsed_origin.scheme, parsed_origin.netloc, "/api/settings/auth/github-app/setup/callback", "", "")
         )
         web_base_url, api_base_url = self._github_setup_base_urls()
         setup_state = secrets.token_urlsafe(24)
@@ -4050,10 +4082,19 @@ class HubState:
             raise HTTPException(status_code=502, detail="GitHub returned invalid app setup conversion data.")
         return payload
 
+    def _clear_materialized_git_credentials(self) -> None:
+        if not self.git_credentials_dir.exists():
+            return
+        for path in self.git_credentials_dir.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                path.unlink()
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail="Failed to clear materialized git credentials.") from exc
+
     def _clear_github_installation_state(self, remove_credentials: bool = True) -> None:
         paths = [self.github_app_installation_file]
-        if remove_credentials:
-            paths.append(self.github_git_credentials_file)
         for path in paths:
             if not path.exists():
                 continue
@@ -4061,23 +4102,20 @@ class HubState:
                 path.unlink()
             except OSError as exc:
                 raise HTTPException(status_code=500, detail="Failed to clear previous GitHub installation state.") from exc
+        if remove_credentials:
+            self._clear_materialized_git_credentials()
         with self._github_token_lock:
             self._github_token_cache = {}
 
-    def _clear_github_personal_access_token_state(self, remove_credentials: bool = True) -> None:
-        paths = [self.github_personal_access_token_file]
-        if remove_credentials:
-            paths.append(self.github_git_credentials_file)
-        for path in paths:
-            if not path.exists():
-                continue
+    def _clear_personal_access_token_state(self, provider: str, remove_credentials: bool = True) -> None:
+        token_file = self._token_store_file_for_provider(provider)
+        if token_file.exists():
             try:
-                path.unlink()
+                token_file.unlink()
             except OSError as exc:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Failed to clear stored GitHub personal access token credentials.",
-                ) from exc
+                raise HTTPException(status_code=500, detail="Failed to clear stored personal access token credentials.") from exc
+        if remove_credentials:
+            self._clear_materialized_git_credentials()
 
     def _persist_github_app_settings(self, settings: GithubAppSettings) -> None:
         payload = {
@@ -4203,10 +4241,18 @@ class HubState:
             return payload
         return None
 
-    def _normalize_github_personal_access_token_record(
+    def _token_store_file_for_provider(self, provider: str) -> Path:
+        normalized_provider = str(provider or "").strip().lower()
+        if normalized_provider == GIT_PROVIDER_GITLAB:
+            return self.gitlab_tokens_file
+        return self.github_tokens_file
+
+    def _normalize_personal_access_token_record(
         self,
         raw_record: dict[str, Any],
+        *,
         default_host: str,
+        default_provider: str,
         record_index: int,
     ) -> dict[str, Any] | None:
         token = str(raw_record.get("personal_access_token") or "").strip()
@@ -4214,8 +4260,15 @@ class HubState:
         if not token or not account_login:
             return None
 
+        provider = str(raw_record.get("provider") or default_provider).strip().lower()
+        if provider not in {GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB}:
+            provider = default_provider
+
         host_value = raw_record.get("host") or default_host
-        default_scheme = str(raw_record.get("scheme") or GIT_CREDENTIAL_DEFAULT_SCHEME).strip() or GIT_CREDENTIAL_DEFAULT_SCHEME
+        default_scheme = (
+            str(raw_record.get("scheme") or GIT_CREDENTIAL_DEFAULT_SCHEME).strip()
+            or GIT_CREDENTIAL_DEFAULT_SCHEME
+        )
         try:
             scheme, host = _normalize_github_credential_endpoint(
                 host_value,
@@ -4227,15 +4280,13 @@ class HubState:
 
         account_name = str(raw_record.get("account_name") or account_login).strip() or account_login
         account_email = str(raw_record.get("account_email") or "").strip()
-        provider = str(raw_record.get("provider") or raw_record.get("service") or GIT_PROVIDER_GITHUB).strip().lower()
-        if provider not in {GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB}:
-            provider = GIT_PROVIDER_GITHUB
         host_name, _port = _split_host_port(host)
-        noreply_domain = "github.com"
-        if provider == GIT_PROVIDER_GITLAB:
-            noreply_domain = host_name or "gitlab.com"
         if not account_email:
-            account_email = f"{account_login}@users.noreply.{noreply_domain}"
+            if provider == GIT_PROVIDER_GITLAB:
+                account_email = f"{account_login}@users.noreply.{host_name or 'gitlab.com'}"
+            else:
+                account_email = f"{account_login}@users.noreply.github.com"
+
         git_user_name = str(raw_record.get("git_user_name") or account_name).strip() or account_name
         git_user_email = str(raw_record.get("git_user_email") or account_email).strip() or account_email
         account_id = str(raw_record.get("account_id") or "").strip()
@@ -4243,26 +4294,18 @@ class HubState:
         verified_at = str(raw_record.get("verified_at") or "").strip()
         connected_at = str(raw_record.get("connected_at") or "").strip()
 
-        owner_scopes_raw = raw_record.get("owner_scopes")
-        if owner_scopes_raw is None:
-            owner_scopes_raw = raw_record.get("owners")
-        try:
-            owner_scopes = _normalize_github_owner_scopes(owner_scopes_raw, field_name="owner_scopes")
-        except HTTPException:
-            owner_scopes = []
-
         token_id = str(raw_record.get("token_id") or raw_record.get("id") or "").strip()
         if token_id:
             token_id = token_id[:GITHUB_PERSONAL_ACCESS_TOKEN_ID_MAX_CHARS]
         if not token_id:
-            token_seed = f"{host}|{account_login.lower()}|{','.join(owner_scopes)}|{record_index}"
+            token_seed = f"{provider}|{host}|{account_login.lower()}|{record_index}"
             token_id = hashlib.sha256(token_seed.encode("utf-8")).hexdigest()[:32]
 
         return {
             "token_id": token_id,
+            "provider": provider,
             "host": host,
             "scheme": scheme,
-            "provider": provider,
             "personal_access_token": token,
             "account_login": account_login,
             "account_name": account_name,
@@ -4273,65 +4316,72 @@ class HubState:
             "token_scopes": token_scopes,
             "verified_at": verified_at,
             "connected_at": connected_at,
-            "owner_scopes": owner_scopes,
         }
 
-    def _github_connected_personal_access_tokens(self) -> list[dict[str, Any]]:
-        payload = _read_json_if_exists(self.github_personal_access_token_file)
-        if payload is None:
-            return []
+    def _connected_personal_access_tokens(self, provider: str = "") -> list[dict[str, Any]]:
+        providers: list[str]
+        normalized_provider = str(provider or "").strip().lower()
+        if normalized_provider in {GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB}:
+            providers = [normalized_provider]
+        else:
+            providers = [GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB]
 
-        raw_records: list[dict[str, Any]] = []
-        if isinstance(payload.get("tokens"), list):
-            raw_records = [item for item in payload["tokens"] if isinstance(item, dict)]
-        elif isinstance(payload, dict):
-            raw_records = [payload]
-
-        if not raw_records:
-            return []
-
-        default_host = self._github_provider_host()
         records: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
-        for index, raw_record in enumerate(raw_records):
-            normalized = self._normalize_github_personal_access_token_record(raw_record, default_host, index)
-            if normalized is None:
+        for provider_name in providers:
+            token_file = self._token_store_file_for_provider(provider_name)
+            payload = _read_json_if_exists(token_file)
+            if payload is None:
                 continue
-            token_id = str(normalized.get("token_id") or "").strip()
-            if token_id in seen_ids:
-                token_id = hashlib.sha256(f"{token_id}|{index}".encode("utf-8")).hexdigest()[:32]
-                normalized["token_id"] = token_id
-            seen_ids.add(token_id)
-            records.append(normalized)
+            raw_records: list[dict[str, Any]] = []
+            if isinstance(payload.get("tokens"), list):
+                raw_records = [item for item in payload["tokens"] if isinstance(item, dict)]
+            elif isinstance(payload, dict):
+                raw_records = [payload]
+            default_host = self._github_provider_host() if provider_name == GIT_PROVIDER_GITHUB else "gitlab.com"
+            for index, raw_record in enumerate(raw_records):
+                normalized = self._normalize_personal_access_token_record(
+                    raw_record,
+                    default_host=default_host,
+                    default_provider=provider_name,
+                    record_index=index,
+                )
+                if normalized is None:
+                    continue
+                token_id = str(normalized.get("token_id") or "").strip()
+                if token_id in seen_ids:
+                    token_id = hashlib.sha256(f"{token_id}|{provider_name}|{index}".encode("utf-8")).hexdigest()[:32]
+                    normalized["token_id"] = token_id
+                seen_ids.add(token_id)
+                records.append(normalized)
         return records
 
-    def _persist_github_personal_access_tokens(self, records: list[dict[str, Any]]) -> None:
-        if not records:
-            if self.github_personal_access_token_file.exists():
+    def _persist_personal_access_tokens(self, records: list[dict[str, Any]], provider: str) -> None:
+        normalized_provider = (
+            GIT_PROVIDER_GITLAB if str(provider or "").strip().lower() == GIT_PROVIDER_GITLAB else GIT_PROVIDER_GITHUB
+        )
+        token_file = self._token_store_file_for_provider(normalized_provider)
+        provider_records = [
+            record
+            for record in records
+            if str(record.get("provider") or "").strip().lower() == normalized_provider
+        ]
+        if not provider_records:
+            if token_file.exists():
                 try:
-                    self.github_personal_access_token_file.unlink()
+                    token_file.unlink()
                 except OSError as exc:
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Failed to clear stored GitHub personal access token credentials.",
-                    ) from exc
+                    raise HTTPException(status_code=500, detail="Failed to clear stored personal access token credentials.") from exc
             return
 
         payload_records: list[dict[str, Any]] = []
-        for record in records:
+        for record in provider_records:
             payload_records.append(
                 {
                     "token_id": str(record.get("token_id") or "").strip(),
+                    "provider": normalized_provider,
                     "host": str(record.get("host") or "").strip(),
-                    "scheme": _normalize_github_credential_scheme(
-                        record.get("scheme"),
-                        field_name="scheme",
-                    ),
-                    "provider": (
-                        str(record.get("provider") or GIT_PROVIDER_GITHUB).strip().lower()
-                        if str(record.get("provider") or "").strip().lower() in {GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB}
-                        else GIT_PROVIDER_GITHUB
-                    ),
+                    "scheme": _normalize_github_credential_scheme(record.get("scheme"), field_name="scheme"),
                     "personal_access_token": str(record.get("personal_access_token") or "").strip(),
                     "account_login": str(record.get("account_login") or "").strip(),
                     "account_name": str(record.get("account_name") or "").strip(),
@@ -4342,27 +4392,29 @@ class HubState:
                     "token_scopes": str(record.get("token_scopes") or "").strip(),
                     "verified_at": str(record.get("verified_at") or "").strip(),
                     "connected_at": str(record.get("connected_at") or "").strip(),
-                    "owner_scopes": _normalize_github_owner_scopes(record.get("owner_scopes"), field_name="owner_scopes"),
                 }
             )
         payload = {"tokens": payload_records, "updated_at": _iso_now()}
-        _write_private_env_file(self.github_personal_access_token_file, json.dumps(payload, indent=2) + "\n")
+        _write_private_env_file(token_file, json.dumps(payload, indent=2) + "\n")
 
-    def _github_connected_personal_access_token(self) -> dict[str, Any] | None:
-        tokens = self._github_connected_personal_access_tokens()
-        if not tokens:
-            return None
-        return dict(tokens[0])
+    @staticmethod
+    def _connected_at_sort_key(record: dict[str, Any]) -> tuple[str, str]:
+        connected_at = str(record.get("connected_at") or "").strip()
+        token_id = str(record.get("token_id") or "").strip()
+        return connected_at, token_id
 
-    def _github_personal_access_token_for_repo(self, repo_url: str) -> dict[str, Any] | None:
+    def _personal_access_token_for_repo(
+        self,
+        repo_url: str,
+        credential_binding: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         repo_host = _git_repo_host(repo_url)
         if not repo_host:
             return None
         repo_scheme = _git_repo_scheme(repo_url)
-        repo_owner = _git_repo_owner(repo_url)
         matching_host = [
             token
-            for token in self._github_connected_personal_access_tokens()
+            for token in self._connected_personal_access_tokens()
             if str(token.get("host") or "").strip().lower() == repo_host
         ]
         if not matching_host:
@@ -4376,16 +4428,31 @@ class HubState:
             if matching_scheme:
                 matching_host = matching_scheme
 
-        if repo_owner:
-            for token in matching_host:
-                owner_scopes = [str(item or "").strip().lower() for item in _empty_list(token.get("owner_scopes"))]
-                if repo_owner in owner_scopes:
-                    return token
-        for token in matching_host:
-            owner_scopes = [str(item or "").strip().lower() for item in _empty_list(token.get("owner_scopes"))]
-            if not owner_scopes:
-                return token
-        return matching_host[0]
+        normalized_binding = _normalize_project_credential_binding(credential_binding)
+        if normalized_binding["mode"] in {
+            PROJECT_CREDENTIAL_BINDING_MODE_SET,
+            PROJECT_CREDENTIAL_BINDING_MODE_SINGLE,
+        }:
+            preferred_ids = normalized_binding["credential_ids"]
+            if preferred_ids:
+                by_id = {str(token.get("token_id") or "").strip(): token for token in matching_host}
+                for token_id in preferred_ids:
+                    if token_id in by_id:
+                        return by_id[token_id]
+
+        # Choose the most recently connected token; if timestamps tie at second precision,
+        # prefer the later record from storage order for deterministic selection.
+        ordered_matches = list(enumerate(matching_host))
+        ordered_matches.sort(
+            key=lambda item: (str(item[1].get("connected_at") or "").strip(), -item[0]),
+        )
+        return ordered_matches[-1][1] if ordered_matches else None
+
+    def _github_connected_personal_access_tokens(self) -> list[dict[str, Any]]:
+        return self._connected_personal_access_tokens(GIT_PROVIDER_GITHUB)
+
+    def _gitlab_connected_personal_access_tokens(self) -> list[dict[str, Any]]:
+        return self._connected_personal_access_tokens(GIT_PROVIDER_GITLAB)
 
     def _github_api_base_url_for_host(self, host: str, scheme: str = GIT_CREDENTIAL_DEFAULT_SCHEME) -> str:
         normalized_scheme = _normalize_github_credential_scheme(scheme, field_name="scheme")
@@ -4696,13 +4763,21 @@ class HubState:
             }
         return token, expires_at
 
-    def _refresh_github_git_credentials(self, installation_id: int, host: str) -> str:
+    def _materialized_credential_file_path(self, context_key: str, credential_id: str) -> Path:
+        context = str(context_key or "").strip() or "default"
+        token = str(credential_id or "").strip() or "credential"
+        digest = hashlib.sha256(f"{context}|{token}".encode("utf-8")).hexdigest()[:24]
+        return self.git_credentials_dir / f"{digest}.git-credentials"
+
+    def _refresh_github_git_credentials(self, installation_id: int, host: str, context_key: str = "") -> str:
         token, _expires_at = self._github_installation_token(installation_id)
         return self._write_github_git_credentials(
             host=host,
             username="x-access-token",
             secret=token,
             scheme=GIT_CREDENTIAL_DEFAULT_SCHEME,
+            credential_id=f"github_app:{installation_id}",
+            context_key=context_key,
         )
 
     def _write_github_git_credentials(
@@ -4711,6 +4786,8 @@ class HubState:
         username: str,
         secret: str,
         scheme: str = GIT_CREDENTIAL_DEFAULT_SCHEME,
+        credential_id: str = "",
+        context_key: str = "",
     ) -> str:
         normalized_scheme = _normalize_github_credential_scheme(scheme, field_name="scheme")
         normalized_host = _normalize_github_credential_host(host, field_name="host")
@@ -4722,11 +4799,13 @@ class HubState:
             raise HTTPException(status_code=500, detail="Missing GitHub credential secret.")
         encoded_username = urllib.parse.quote(resolved_username, safe="")
         encoded_secret = urllib.parse.quote(resolved_secret, safe="")
+        resolved_credential_id = str(credential_id or "").strip() or f"{normalized_host}:{resolved_username}"
+        output_file = self._materialized_credential_file_path(context_key, resolved_credential_id)
         _write_private_env_file(
-            self.github_git_credentials_file,
+            output_file,
             f"{normalized_scheme}://{encoded_username}:{encoded_secret}@{normalized_host}\n",
         )
-        return str(self.github_git_credentials_file)
+        return str(output_file)
 
     def _refresh_github_git_credentials_for_personal_access_token(
         self,
@@ -4734,12 +4813,16 @@ class HubState:
         host: str,
         account_login: str,
         scheme: str = GIT_CREDENTIAL_DEFAULT_SCHEME,
+        context_key: str = "",
+        credential_id: str = "",
     ) -> str:
         return self._write_github_git_credentials(
             host=host,
             username=account_login,
             secret=token,
             scheme=scheme,
+            credential_id=credential_id,
+            context_key=context_key,
         )
 
     @staticmethod
@@ -4764,31 +4847,54 @@ class HubState:
             "GIT_CONFIG_VALUE_2": f"ssh://git@{normalized_ssh_host}/",
         }
 
-    def _github_repo_auth_context(self, repo_url: str) -> tuple[str, str, dict[str, Any]] | None:
+    def _github_repo_auth_context(
+        self,
+        repo_url: str,
+        project: dict[str, Any] | None = None,
+    ) -> tuple[str, str, dict[str, Any]] | None:
         repo_host = _git_repo_host(repo_url)
         if not repo_host:
             return None
-
-        personal_access = self._github_personal_access_token_for_repo(repo_url)
+        credential_binding = None
+        if isinstance(project, dict):
+            credential_binding = _normalize_project_credential_binding(project.get("credential_binding"))
+        personal_access = self._personal_access_token_for_repo(repo_url, credential_binding=credential_binding)
         if personal_access is not None:
             pat_host = str(personal_access.get("host") or "")
             if pat_host and repo_host == pat_host:
-                return (GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN, pat_host, personal_access)
+                payload = dict(personal_access)
+                payload["credential_id"] = str(payload.get("token_id") or "").strip()
+                return (GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN, pat_host, payload)
 
         installation = self._github_connected_installation()
         provider_host = self._github_provider_host()
         if installation is not None and repo_host == provider_host:
             installation_id = int(installation.get("installation_id") or 0)
             if installation_id > 0:
+                app_credential_id = f"github_app:{installation_id}"
+                normalized_binding = _normalize_project_credential_binding(credential_binding)
+                if normalized_binding["mode"] in {
+                    PROJECT_CREDENTIAL_BINDING_MODE_SET,
+                    PROJECT_CREDENTIAL_BINDING_MODE_SINGLE,
+                }:
+                    preferred_ids = normalized_binding["credential_ids"]
+                    if preferred_ids and app_credential_id not in preferred_ids:
+                        return None
                 return (
                     GITHUB_CONNECTION_MODE_GITHUB_APP,
                     provider_host,
-                    {"installation_id": installation_id},
+                    {"installation_id": installation_id, "credential_id": app_credential_id, "provider": GIT_PROVIDER_GITHUB},
                 )
         return None
 
-    def _github_git_env_for_repo(self, repo_url: str) -> dict[str, str]:
-        context = self._github_repo_auth_context(repo_url)
+    def _github_git_env_for_repo(
+        self,
+        repo_url: str,
+        project: dict[str, Any] | None = None,
+        *,
+        context_key: str = "",
+    ) -> dict[str, str]:
+        context = self._github_repo_auth_context(repo_url, project=project)
         if context is None:
             return {}
         mode, host, auth_payload = context
@@ -4797,10 +4903,15 @@ class HubState:
             installation_id = int(auth_payload.get("installation_id") or 0)
             if installation_id <= 0:
                 return {}
-            credentials_file = self._refresh_github_git_credentials(installation_id, host)
-        elif mode == GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
+            credentials_file = self._refresh_github_git_credentials(
+                installation_id,
+                host,
+                context_key=context_key,
+            )
+        elif mode == GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
             token = str(auth_payload.get("personal_access_token") or "").strip()
             account_login = str(auth_payload.get("account_login") or "").strip()
+            credential_id = str(auth_payload.get("credential_id") or "").strip()
             try:
                 scheme = _normalize_github_credential_scheme(
                     auth_payload.get("scheme"),
@@ -4815,13 +4926,21 @@ class HubState:
                 host=host,
                 account_login=account_login,
                 scheme=scheme,
+                context_key=context_key,
+                credential_id=credential_id,
             )
         else:
             return {}
         return self._git_env_for_credentials_file(credentials_file, host, scheme=scheme)
 
-    def _github_git_args_for_repo(self, repo_url: str) -> list[str]:
-        context = self._github_repo_auth_context(repo_url)
+    def _github_git_args_for_repo(
+        self,
+        repo_url: str,
+        project: dict[str, Any] | None = None,
+        *,
+        context_key: str = "",
+    ) -> list[str]:
+        context = self._github_repo_auth_context(repo_url, project=project)
         if context is None:
             return []
         mode, host, auth_payload = context
@@ -4830,10 +4949,15 @@ class HubState:
             installation_id = int(auth_payload.get("installation_id") or 0)
             if installation_id <= 0:
                 return []
-            credentials_file = self._refresh_github_git_credentials(installation_id, host)
-        elif mode == GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
+            credentials_file = self._refresh_github_git_credentials(
+                installation_id,
+                host,
+                context_key=context_key,
+            )
+        elif mode == GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
             token = str(auth_payload.get("personal_access_token") or "").strip()
             account_login = str(auth_payload.get("account_login") or "").strip()
+            credential_id = str(auth_payload.get("credential_id") or "").strip()
             try:
                 scheme = _normalize_github_credential_scheme(
                     auth_payload.get("scheme"),
@@ -4848,6 +4972,8 @@ class HubState:
                 host=host,
                 account_login=account_login,
                 scheme=scheme,
+                context_key=context_key,
+                credential_id=credential_id,
             )
         else:
             return []
@@ -4860,12 +4986,16 @@ class HubState:
             scheme,
         ]
 
-    def _github_git_identity_env_vars_for_repo(self, repo_url: str) -> list[str]:
-        context = self._github_repo_auth_context(repo_url)
+    def _github_git_identity_env_vars_for_repo(
+        self,
+        repo_url: str,
+        project: dict[str, Any] | None = None,
+    ) -> list[str]:
+        context = self._github_repo_auth_context(repo_url, project=project)
         if context is None:
             return []
         mode, _host, auth_payload = context
-        if mode != GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
+        if mode != GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
             return []
 
         git_user_name = str(auth_payload.get("git_user_name") or auth_payload.get("account_name") or "").strip()
@@ -4912,79 +5042,53 @@ class HubState:
             "account_updated_at": account_payload["account_updated_at"],
         }
 
-    def github_auth_status(self) -> dict[str, Any]:
+    def github_app_auth_status(self) -> dict[str, Any]:
         installation = self._github_connected_installation()
-        personal_access_tokens = self._github_connected_personal_access_tokens()
-        personal_access = personal_access_tokens[0] if personal_access_tokens else None
         app_configured = self.github_app_settings is not None and not self.github_app_settings_error
-
         installation_id = int(installation.get("installation_id") or 0) if installation else 0
-        account_login = str(installation.get("account_login") or "") if installation else ""
-        account_type = str(installation.get("account_type") or "") if installation else ""
-        repository_selection = str(installation.get("repository_selection") or "") if installation else ""
-        personal_access_token = str(personal_access.get("personal_access_token") or "") if personal_access else ""
-        personal_access_host = str(personal_access.get("host") or "") if personal_access else ""
-        personal_access_scheme = (
-            _normalize_github_credential_scheme(personal_access.get("scheme"), field_name="scheme")
-            if personal_access
-            else GIT_CREDENTIAL_DEFAULT_SCHEME
-        )
-        personal_access_provider = (
-            str(personal_access.get("provider") or GIT_PROVIDER_GITHUB).strip().lower()
-            if personal_access
-            else GIT_PROVIDER_GITHUB
-        )
-        personal_access_login = str(personal_access.get("account_login") or "") if personal_access else ""
-        personal_access_name = str(personal_access.get("account_name") or "") if personal_access else ""
-        personal_access_email = str(personal_access.get("account_email") or "") if personal_access else ""
-        personal_access_account_id = str(personal_access.get("account_id") or "") if personal_access else ""
-        personal_access_git_user_name = str(personal_access.get("git_user_name") or "") if personal_access else ""
-        personal_access_git_user_email = str(personal_access.get("git_user_email") or "") if personal_access else ""
-        personal_access_scopes = str(personal_access.get("token_scopes") or "") if personal_access else ""
-        personal_access_verified_at = str(personal_access.get("verified_at") or "") if personal_access else ""
-
-        connected_via_app = bool(installation and installation_id > 0 and app_configured)
-        connected_via_pat = bool(personal_access_tokens)
-        connection_mode = ""
-        connection_host = ""
-        if connected_via_pat:
-            connection_mode = GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN
-            connection_host = personal_access_host
-        elif connected_via_app:
-            connection_mode = GITHUB_CONNECTION_MODE_GITHUB_APP
-            connection_host = self._github_provider_host()
-
-        updated_path: Path | None = None
-        if connection_mode == GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN and self.github_personal_access_token_file.exists():
-            updated_path = self.github_personal_access_token_file
-        elif connection_mode == GITHUB_CONNECTION_MODE_GITHUB_APP and self.github_app_installation_file.exists():
-            updated_path = self.github_app_installation_file
-        elif self.github_personal_access_token_file.exists():
-            updated_path = self.github_personal_access_token_file
-        elif self.github_app_installation_file.exists():
-            updated_path = self.github_app_installation_file
 
         updated_at = ""
-        if updated_path is not None:
+        if self.github_app_installation_file.exists():
             try:
-                updated_at = _iso_from_timestamp(updated_path.stat().st_mtime)
+                updated_at = _iso_from_timestamp(self.github_app_installation_file.stat().st_mtime)
+            except OSError:
+                updated_at = ""
+        elif self.github_app_settings_file.exists():
+            try:
+                updated_at = _iso_from_timestamp(self.github_app_settings_file.stat().st_mtime)
             except OSError:
                 updated_at = ""
 
-        personal_access_entries: list[dict[str, Any]] = []
-        for token_record in personal_access_tokens:
+        return {
+            "provider": "github_app",
+            "connected": bool(app_configured and installation_id > 0),
+            "app_configured": app_configured,
+            "app_slug": self.github_app_settings.app_slug if self.github_app_settings else "",
+            "install_url": self._github_install_url(),
+            "installation_id": installation_id,
+            "installation_account_login": str(installation.get("account_login") or "") if installation else "",
+            "installation_account_type": str(installation.get("account_type") or "") if installation else "",
+            "repository_selection": str(installation.get("repository_selection") or "") if installation else "",
+            "connection_host": self._github_provider_host(),
+            "updated_at": updated_at,
+            "error": str(self.github_app_settings_error or ""),
+        }
+
+    def _personal_access_tokens_status(self, provider: str) -> dict[str, Any]:
+        normalized_provider = (
+            GIT_PROVIDER_GITLAB if str(provider or "").strip().lower() == GIT_PROVIDER_GITLAB else GIT_PROVIDER_GITHUB
+        )
+        token_records = self._connected_personal_access_tokens(normalized_provider)
+        entries: list[dict[str, Any]] = []
+        for token_record in token_records:
             token_value = str(token_record.get("personal_access_token") or "").strip()
-            personal_access_entries.append(
+            entries.append(
                 {
                     "token_id": str(token_record.get("token_id") or "").strip(),
                     "token_hint": _mask_secret(token_value) if token_value else "",
                     "host": str(token_record.get("host") or "").strip(),
                     "scheme": _normalize_github_credential_scheme(token_record.get("scheme"), field_name="scheme"),
-                    "provider": (
-                        str(token_record.get("provider") or GIT_PROVIDER_GITHUB).strip().lower()
-                        if str(token_record.get("provider") or "").strip().lower() in {GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB}
-                        else GIT_PROVIDER_GITHUB
-                    ),
+                    "provider": normalized_provider,
                     "account_login": str(token_record.get("account_login") or "").strip(),
                     "account_name": str(token_record.get("account_name") or "").strip(),
                     "account_email": str(token_record.get("account_email") or "").strip(),
@@ -4994,40 +5098,36 @@ class HubState:
                     "token_scopes": str(token_record.get("token_scopes") or "").strip(),
                     "verified_at": str(token_record.get("verified_at") or "").strip(),
                     "connected_at": str(token_record.get("connected_at") or "").strip(),
-                    "owner_scopes": _empty_list(token_record.get("owner_scopes")),
                 }
             )
 
+        token_file = self._token_store_file_for_provider(normalized_provider)
+        updated_at = ""
+        if token_file.exists():
+            try:
+                updated_at = _iso_from_timestamp(token_file.stat().st_mtime)
+            except OSError:
+                updated_at = ""
+
+        provider_key = "gitlab_tokens" if normalized_provider == GIT_PROVIDER_GITLAB else "github_tokens"
+        default_host = (
+            "gitlab.com" if normalized_provider == GIT_PROVIDER_GITLAB else self._github_provider_host()
+        )
         return {
-            "provider": "github",
-            "connection_mode": connection_mode,
-            "connection_host": connection_host,
-            "app_configured": app_configured,
-            "app_slug": self.github_app_settings.app_slug if self.github_app_settings else "",
-            "install_url": self._github_install_url(),
-            "connected": bool(connected_via_app or connected_via_pat),
-            "installation_id": installation_id,
-            "installation_account_login": account_login,
-            "installation_account_type": account_type,
-            "repository_selection": repository_selection,
-            "personal_access_token_hint": _mask_secret(personal_access_token) if personal_access_token else "",
-            "personal_access_token_host": personal_access_host,
-            "personal_access_token_scheme": personal_access_scheme,
-            "personal_access_token_provider": personal_access_provider,
-            "personal_access_token_user_login": personal_access_login,
-            "personal_access_token_user_name": personal_access_name,
-            "personal_access_token_user_email": personal_access_email,
-            "personal_access_token_user_id": personal_access_account_id,
-            "personal_access_token_git_user_name": personal_access_git_user_name,
-            "personal_access_token_git_user_email": personal_access_git_user_email,
-            "personal_access_token_scopes": personal_access_scopes,
-            "personal_access_token_verified_at": personal_access_verified_at,
-            "personal_access_token_owner_scopes": _empty_list(personal_access.get("owner_scopes")) if personal_access else [],
-            "personal_access_token_count": len(personal_access_entries),
-            "personal_access_tokens": personal_access_entries,
+            "provider": provider_key,
+            "git_provider": normalized_provider,
+            "connected": bool(entries),
+            "token_count": len(entries),
+            "tokens": entries,
+            "default_host": default_host,
             "updated_at": updated_at,
-            "error": str(self.github_app_settings_error or ""),
         }
+
+    def github_tokens_status(self) -> dict[str, Any]:
+        return self._personal_access_tokens_status(GIT_PROVIDER_GITHUB)
+
+    def gitlab_tokens_status(self) -> dict[str, Any]:
+        return self._personal_access_tokens_status(GIT_PROVIDER_GITLAB)
 
     def _chat_title_generation_auth(self) -> tuple[str, str]:
         account_connected, _ = _read_codex_auth(self.openai_codex_auth_file)
@@ -5061,12 +5161,73 @@ class HubState:
             return title, CHAT_TITLE_OPENAI_MODEL
         raise RuntimeError(CHAT_TITLE_NO_CREDENTIALS_ERROR)
 
+    def _credential_catalog(self) -> list[dict[str, Any]]:
+        credentials: list[dict[str, Any]] = []
+
+        github_app_status = self.github_app_auth_status()
+        if github_app_status.get("connected"):
+            installation_id = int(github_app_status.get("installation_id") or 0)
+            if installation_id > 0:
+                installation_login = str(github_app_status.get("installation_account_login") or "")
+                credentials.append(
+                    {
+                        "credential_id": f"github_app:{installation_id}",
+                        "kind": "github_app_installation",
+                        "provider": GIT_PROVIDER_GITHUB,
+                        "host": self._github_provider_host(),
+                        "scheme": GIT_CREDENTIAL_DEFAULT_SCHEME,
+                        "account_login": installation_login,
+                        "account_name": installation_login,
+                        "connected_at": str(github_app_status.get("updated_at") or ""),
+                        "summary": f"GitHub App installation #{installation_id}"
+                        + (f" ({installation_login})" if installation_login else ""),
+                    }
+                )
+
+        for provider in (GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB):
+            for token in self._connected_personal_access_tokens(provider):
+                token_id = str(token.get("token_id") or "").strip()
+                if not token_id:
+                    continue
+                account_login = str(token.get("account_login") or "").strip()
+                host = str(token.get("host") or "").strip()
+                credentials.append(
+                    {
+                        "credential_id": token_id,
+                        "kind": "personal_access_token",
+                        "provider": provider,
+                        "host": host,
+                        "scheme": _normalize_github_credential_scheme(token.get("scheme"), field_name="scheme"),
+                        "account_login": account_login,
+                        "account_name": str(token.get("account_name") or "").strip(),
+                        "connected_at": str(token.get("connected_at") or "").strip(),
+                        "summary": (
+                            f"{provider.capitalize()} token"
+                            f"{f' ({account_login})' if account_login else ''}"
+                            f"{f' on {host}' if host else ''}"
+                        ),
+                    }
+                )
+
+        credentials.sort(
+            key=lambda entry: (
+                str(entry.get("provider") or ""),
+                str(entry.get("host") or ""),
+                str(entry.get("account_login") or ""),
+                str(entry.get("credential_id") or ""),
+            )
+        )
+        return credentials
+
     def auth_settings_payload(self) -> dict[str, Any]:
         return {
             "providers": {
                 "openai": self.openai_auth_status(),
-                "github": self.github_auth_status(),
-            }
+                "github_app": self.github_app_auth_status(),
+                "github_tokens": self.github_tokens_status(),
+                "gitlab_tokens": self.gitlab_tokens_status(),
+            },
+            "credential_catalog": self._credential_catalog(),
         }
 
     def test_openai_chat_title_generation(self, prompt: Any) -> dict[str, Any]:
@@ -5832,10 +5993,6 @@ class HubState:
         account_connected, _ = _read_codex_auth(self.openai_codex_auth_file)
         if not account_connected:
             raise HTTPException(status_code=409, detail=AUTO_CONFIG_NOT_CONNECTED_ERROR)
-        try:
-            codex_exec = _resolve_codex_executable(self.host_codex_dir)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
         prompt = self._auto_config_prompt(repo_url, branch)
         retry_feedback_text = str(retry_feedback or "").strip()
@@ -5848,22 +6005,56 @@ class HubState:
                 f"{retry_feedback_text}\n\n"
                 "Return exactly one JSON object with the required schema."
             )
-        output_file = self.host_codex_dir / f"auto-config-{uuid.uuid4().hex}.json"
-        env = os.environ.copy()
-        env["HOME"] = str(self.host_agent_home)
-        env["CODEX_HOME"] = str(self.host_codex_dir)
+        output_file = workspace / f".agent-hub-auto-config-{uuid.uuid4().hex}.json"
+        session_id, session_token = self._create_agent_tools_session(repo_url=repo_url)
+        runtime_config_file = self._prepare_chat_runtime_config(f"auto-config-{session_id}")
         cmd = [
-            codex_exec,
-            "exec",
-            "--skip-git-repo-check",
-            "--cd",
+            "uv",
+            "run",
+            "--project",
+            str(_repo_root()),
+            "agent_cli",
+            "--agent-command",
+            AGENT_COMMAND_BY_TYPE[AGENT_TYPE_CODEX],
+            "--project",
             str(workspace),
-            "--sandbox",
-            "workspace-write",
-            "--output-last-message",
-            str(output_file),
-            prompt,
+            "--container-project-name",
+            _container_project_name(_extract_repo_name(repo_url) or "auto-config"),
+            "--agent-home-path",
+            str(self.host_agent_home),
+            "--config-file",
+            str(runtime_config_file),
+            "--system-prompt-file",
+            str(self.system_prompt_file),
+            "--no-alt-screen",
         ]
+        cmd.extend(self._openai_credentials_arg())
+        cmd.extend(
+            self._github_git_args_for_repo(
+                repo_url,
+                context_key=f"auto_config_chat:{session_id}",
+            )
+        )
+        for git_identity_env in self._github_git_identity_env_vars_for_repo(repo_url):
+            cmd.extend(["--env-var", git_identity_env])
+        cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_URL={self.artifact_publish_base_url}/api/agent-tools/sessions/{session_id}"])
+        cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_TOKEN={session_token}"])
+        cmd.extend(["--env-var", "AGENT_HUB_AGENT_TOOLS_PROJECT_ID="])
+        cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_CHAT_ID=auto-config:{session_id}"])
+        cmd.extend(
+            [
+                "--",
+                "exec",
+                "--skip-git-repo-check",
+                "--cd",
+                str(workspace),
+                "--sandbox",
+                "workspace-write",
+                "--output-last-message",
+                str(output_file),
+                prompt,
+            ]
+        )
         emit("Launching temporary repository analysis chat...\n")
         emit(f"Working directory: {workspace}\n")
         emit(f"Repository URL: {repo_url}\n")
@@ -5878,9 +6069,14 @@ class HubState:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 bufsize=1,
-                env=env,
             )
         except OSError as exc:
+            try:
+                runtime_config_file.unlink()
+            except OSError:
+                pass
+            with self._agent_tools_sessions_lock:
+                self._agent_tools_sessions.pop(session_id, None)
             raise HTTPException(status_code=502, detail=f"Temporary auto-config chat failed to start: {exc}") from exc
 
         output_chunks: list[str] = []
@@ -5899,41 +6095,48 @@ class HubState:
                 stdout.close()
 
         try:
-            consumer = Thread(target=consume_output, daemon=True)
-            consumer.start()
-            return_code = process.wait(timeout=max(20.0, float(AUTO_CONFIG_CHAT_TIMEOUT_SECONDS)))
-            consumer.join(timeout=2.0)
-        except subprocess.TimeoutExpired as exc:
-            process.kill()
             try:
-                process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                pass
-            emit("\nTemporary auto-config chat timed out.\n")
-            raise HTTPException(status_code=504, detail="Temporary auto-config chat timed out.") from exc
+                consumer = Thread(target=consume_output, daemon=True)
+                consumer.start()
+                return_code = process.wait(timeout=max(20.0, float(AUTO_CONFIG_CHAT_TIMEOUT_SECONDS)))
+                consumer.join(timeout=2.0)
+            except subprocess.TimeoutExpired as exc:
+                process.kill()
+                try:
+                    process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    pass
+                emit("\nTemporary auto-config chat timed out.\n")
+                raise HTTPException(status_code=504, detail="Temporary auto-config chat timed out.") from exc
 
-        output_text = "".join(output_chunks).strip()
-        if return_code != 0:
-            detail = _codex_exec_error_message(output_text)
-            raise HTTPException(status_code=502, detail=f"Temporary auto-config chat failed: {detail}")
+            output_text = "".join(output_chunks).strip()
+            if return_code != 0:
+                detail = _codex_exec_error_message(output_text)
+                raise HTTPException(status_code=502, detail=f"Temporary auto-config chat failed: {detail}")
 
-        try:
-            raw_payload_text = output_file.read_text(encoding="utf-8", errors="ignore").strip()
-        except OSError as exc:
-            raise HTTPException(status_code=502, detail=AUTO_CONFIG_MISSING_OUTPUT_ERROR) from exc
+            try:
+                raw_payload_text = output_file.read_text(encoding="utf-8", errors="ignore").strip()
+            except OSError as exc:
+                raise HTTPException(status_code=502, detail=AUTO_CONFIG_MISSING_OUTPUT_ERROR) from exc
+            if not raw_payload_text:
+                raise HTTPException(status_code=502, detail=AUTO_CONFIG_MISSING_OUTPUT_ERROR)
+
+            try:
+                parsed_payload = _parse_json_object_from_text(raw_payload_text)
+            except ValueError as exc:
+                raise HTTPException(status_code=502, detail=AUTO_CONFIG_INVALID_OUTPUT_ERROR) from exc
+            return {"payload": parsed_payload, "model": AUTO_CONFIG_MODEL}
         finally:
             try:
                 output_file.unlink()
             except OSError:
                 pass
-        if not raw_payload_text:
-            raise HTTPException(status_code=502, detail=AUTO_CONFIG_MISSING_OUTPUT_ERROR)
-
-        try:
-            parsed_payload = _parse_json_object_from_text(raw_payload_text)
-        except ValueError as exc:
-            raise HTTPException(status_code=502, detail=AUTO_CONFIG_INVALID_OUTPUT_ERROR) from exc
-        return {"payload": parsed_payload, "model": AUTO_CONFIG_MODEL}
+            try:
+                runtime_config_file.unlink()
+            except OSError:
+                pass
+            with self._agent_tools_sessions_lock:
+                self._agent_tools_sessions.pop(session_id, None)
 
     def auto_configure_project(
         self,
@@ -6132,6 +6335,31 @@ class HubState:
         recommendation["analysis_model"] = str(chat_result.get("model") or "")
         recommendation["analysis_auth_mode"] = CHAT_TITLE_AUTH_MODE_ACCOUNT
         recommendation["analyzed_repo_url"] = normalized_repo_url
+        auto_project = {
+            "id": self._auto_config_validation_project_id(normalized_repo_url, resolved_branch),
+            "repo_url": normalized_repo_url,
+            "credential_binding": _normalize_project_credential_binding(None),
+        }
+        auto_selected_credential_ids = self._resolve_agent_tools_credential_ids(
+            auto_project,
+            PROJECT_CREDENTIAL_BINDING_MODE_AUTO,
+            [],
+        )
+        if auto_selected_credential_ids:
+            recommendation["credential_binding"] = _normalize_project_credential_binding(
+                {
+                    "mode": (
+                        PROJECT_CREDENTIAL_BINDING_MODE_SINGLE
+                        if len(auto_selected_credential_ids) == 1
+                        else PROJECT_CREDENTIAL_BINDING_MODE_SET
+                    ),
+                    "credential_ids": auto_selected_credential_ids,
+                    "source": "auto_configure",
+                    "updated_at": _iso_now(),
+                }
+            )
+        else:
+            recommendation["credential_binding"] = _normalize_project_credential_binding(None)
         emit_auto_config_log("\nAuto-config completed successfully.\n")
         return recommendation
 
@@ -6160,7 +6388,7 @@ class HubState:
         return status
 
     def list_github_app_installations(self) -> dict[str, Any]:
-        status = self.github_auth_status()
+        status = self.github_app_auth_status()
         if not status.get("app_configured"):
             return {
                 "app_configured": False,
@@ -6217,7 +6445,7 @@ class HubState:
         }
 
     def connect_github_app(self, installation_id: Any) -> dict[str, Any]:
-        status = self.github_auth_status()
+        status = self.github_app_auth_status()
         if not status.get("app_configured"):
             detail = str(status.get("error") or "GitHub App is not configured on this server.")
             raise HTTPException(status_code=400, detail=detail)
@@ -6243,8 +6471,7 @@ class HubState:
             account_type = str(account.get("type") or "")
         repository_selection = str(installation_payload.get("repository_selection") or "")
 
-        self._clear_github_personal_access_token_state(remove_credentials=True)
-        self._refresh_github_git_credentials(normalized_id, self._github_provider_host())
+        self._clear_github_installation_state(remove_credentials=False)
         record = {
             "installation_id": normalized_id,
             "account_login": account_login,
@@ -6253,53 +6480,54 @@ class HubState:
             "connected_at": _iso_now(),
         }
         _write_private_env_file(self.github_app_installation_file, json.dumps(record, indent=2) + "\n")
-        status = self.github_auth_status()
+        status = self.github_app_auth_status()
         self._emit_auth_changed(reason="github_app_connected")
         LOGGER.debug("GitHub App installation connected: id=%s account=%s", normalized_id, account_login)
         return status
 
-    def connect_github_personal_access_token(
+    def _connect_personal_access_token(
         self,
+        provider: str,
         personal_access_token: Any,
         host: Any = "",
-        owner_scopes: Any = None,
     ) -> dict[str, Any]:
+        normalized_provider = (
+            GIT_PROVIDER_GITLAB if str(provider or "").strip().lower() == GIT_PROVIDER_GITLAB else GIT_PROVIDER_GITHUB
+        )
         normalized_token = _normalize_github_personal_access_token(personal_access_token)
         host_candidate = str(host or "").strip()
         if not host_candidate:
-            host_candidate = self._github_provider_host()
+            host_candidate = "gitlab.com" if normalized_provider == GIT_PROVIDER_GITLAB else self._github_provider_host()
         normalized_scheme, normalized_host = _normalize_github_credential_endpoint(
             host_candidate,
             field_name="host",
             default_scheme=GIT_CREDENTIAL_DEFAULT_SCHEME,
         )
-        normalized_owner_scopes = _normalize_github_owner_scopes(owner_scopes, field_name="owner_scopes")
         verification = self._verify_github_personal_access_token(
             normalized_token,
             normalized_host,
             normalized_scheme,
         )
+        verified_provider = str(verification.get("provider") or "").strip().lower()
+        if verified_provider != normalized_provider:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Connected token resolved to provider '{verified_provider or 'unknown'}', "
+                    f"but this endpoint expects '{normalized_provider}'."
+                ),
+            )
         account_login = verification["account_login"]
 
-        self._clear_github_installation_state(remove_credentials=True)
-        self._refresh_github_git_credentials_for_personal_access_token(
-            token=normalized_token,
-            host=normalized_host,
-            account_login=account_login,
-            scheme=normalized_scheme,
-        )
         account_name = str(verification.get("account_name") or account_login).strip() or account_login
         account_email = str(verification.get("account_email") or "").strip()
         account_id = str(verification.get("account_id") or "").strip()
         connected_at = _iso_now()
-        provider = str(verification.get("provider") or GIT_PROVIDER_GITHUB).strip().lower()
-        if provider not in {GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB}:
-            provider = GIT_PROVIDER_GITHUB
         record = {
             "token_id": uuid.uuid4().hex,
             "host": normalized_host,
             "scheme": normalized_scheme,
-            "provider": provider,
+            "provider": normalized_provider,
             "personal_access_token": normalized_token,
             "account_login": account_login,
             "account_name": account_name,
@@ -6310,10 +6538,9 @@ class HubState:
             "token_scopes": verification.get("token_scopes") or "",
             "verified_at": connected_at,
             "connected_at": connected_at,
-            "owner_scopes": normalized_owner_scopes,
         }
 
-        existing = self._github_connected_personal_access_tokens()
+        existing = self._connected_personal_access_tokens(normalized_provider)
         filtered_existing: list[dict[str, Any]] = []
         for existing_record in existing:
             existing_host = str(existing_record.get("host") or "").strip().lower()
@@ -6325,90 +6552,113 @@ class HubState:
             except HTTPException:
                 existing_scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
             existing_login = str(existing_record.get("account_login") or "").strip().lower()
-            existing_owner_scopes = _normalize_github_owner_scopes(
-                existing_record.get("owner_scopes"),
-                field_name="owner_scopes",
-            )
             if (
                 existing_host == normalized_host
                 and existing_scheme == normalized_scheme
                 and existing_login == account_login.lower()
-                and existing_owner_scopes == normalized_owner_scopes
             ):
                 continue
             filtered_existing.append(existing_record)
 
-        self._persist_github_personal_access_tokens([record, *filtered_existing])
-        status = self.github_auth_status()
-        self._emit_auth_changed(reason="github_personal_access_token_connected")
+        self._persist_personal_access_tokens([record, *filtered_existing], normalized_provider)
+        status = (
+            self.gitlab_tokens_status()
+            if normalized_provider == GIT_PROVIDER_GITLAB
+            else self.github_tokens_status()
+        )
+        self._emit_auth_changed(reason=f"{normalized_provider}_personal_access_token_connected")
         LOGGER.debug(
-            "GitHub personal access token connected: host=%s account=%s owner_scopes=%s",
+            "Personal access token connected: provider=%s host=%s account=%s",
+            normalized_provider,
             normalized_host,
             account_login,
-            ",".join(normalized_owner_scopes),
         )
         return status
 
-    def disconnect_github_personal_access_token(self, token_id: Any) -> dict[str, Any]:
+    def connect_github_personal_access_token(
+        self,
+        personal_access_token: Any,
+        host: Any = "",
+    ) -> dict[str, Any]:
+        return self._connect_personal_access_token(
+            GIT_PROVIDER_GITHUB,
+            personal_access_token=personal_access_token,
+            host=host,
+        )
+
+    def connect_gitlab_personal_access_token(
+        self,
+        personal_access_token: Any,
+        host: Any = "",
+    ) -> dict[str, Any]:
+        return self._connect_personal_access_token(
+            GIT_PROVIDER_GITLAB,
+            personal_access_token=personal_access_token,
+            host=host,
+        )
+
+    def _disconnect_personal_access_token(self, provider: str, token_id: Any) -> dict[str, Any]:
+        normalized_provider = (
+            GIT_PROVIDER_GITLAB if str(provider or "").strip().lower() == GIT_PROVIDER_GITLAB else GIT_PROVIDER_GITHUB
+        )
         normalized_token_id = str(token_id or "").strip()
         if not normalized_token_id:
             raise HTTPException(status_code=400, detail="token_id is required.")
         if len(normalized_token_id) > GITHUB_PERSONAL_ACCESS_TOKEN_ID_MAX_CHARS:
             raise HTTPException(status_code=400, detail="token_id is invalid.")
 
-        existing = self._github_connected_personal_access_tokens()
+        existing = self._connected_personal_access_tokens(normalized_provider)
         remaining = [record for record in existing if str(record.get("token_id") or "").strip() != normalized_token_id]
         if len(remaining) == len(existing):
-            raise HTTPException(status_code=404, detail="GitHub personal access token not found.")
+            raise HTTPException(status_code=404, detail=f"{normalized_provider.capitalize()} personal access token not found.")
 
-        if remaining:
-            self._persist_github_personal_access_tokens(remaining)
-            primary = remaining[0]
-            token = str(primary.get("personal_access_token") or "").strip()
-            host = str(primary.get("host") or "").strip()
-            try:
-                scheme = _normalize_github_credential_scheme(primary.get("scheme"), field_name="scheme")
-            except HTTPException:
-                scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
-            account_login = str(primary.get("account_login") or "").strip()
-            if token and host and account_login:
-                self._refresh_github_git_credentials_for_personal_access_token(
-                    token=token,
-                    host=host,
-                    account_login=account_login,
-                    scheme=scheme,
-                )
-            else:
-                self._clear_github_personal_access_token_state(remove_credentials=True)
-        else:
-            self._clear_github_personal_access_token_state(remove_credentials=True)
+        self._persist_personal_access_tokens(remaining, normalized_provider)
 
-        status = self.github_auth_status()
-        self._emit_auth_changed(reason="github_personal_access_token_disconnected")
+        status = (
+            self.gitlab_tokens_status()
+            if normalized_provider == GIT_PROVIDER_GITLAB
+            else self.github_tokens_status()
+        )
+        self._emit_auth_changed(reason=f"{normalized_provider}_personal_access_token_disconnected")
         LOGGER.debug(
-            "GitHub personal access token disconnected: token_id=%s remaining=%s",
+            "Personal access token disconnected: provider=%s token_id=%s remaining=%s",
+            normalized_provider,
             normalized_token_id,
             len(remaining),
         )
         return status
 
+    def disconnect_github_personal_access_token(self, token_id: Any) -> dict[str, Any]:
+        return self._disconnect_personal_access_token(GIT_PROVIDER_GITHUB, token_id)
+
+    def disconnect_gitlab_personal_access_token(self, token_id: Any) -> dict[str, Any]:
+        return self._disconnect_personal_access_token(GIT_PROVIDER_GITLAB, token_id)
+
+    def _disconnect_all_personal_access_tokens(self, provider: str) -> dict[str, Any]:
+        normalized_provider = (
+            GIT_PROVIDER_GITLAB if str(provider or "").strip().lower() == GIT_PROVIDER_GITLAB else GIT_PROVIDER_GITHUB
+        )
+        self._clear_personal_access_token_state(normalized_provider, remove_credentials=False)
+        status = (
+            self.gitlab_tokens_status()
+            if normalized_provider == GIT_PROVIDER_GITLAB
+            else self.github_tokens_status()
+        )
+        self._emit_auth_changed(reason=f"{normalized_provider}_personal_access_tokens_disconnected")
+        LOGGER.debug("All personal access tokens disconnected for provider=%s", normalized_provider)
+        return status
+
+    def disconnect_github_personal_access_tokens(self) -> dict[str, Any]:
+        return self._disconnect_all_personal_access_tokens(GIT_PROVIDER_GITHUB)
+
+    def disconnect_gitlab_personal_access_tokens(self) -> dict[str, Any]:
+        return self._disconnect_all_personal_access_tokens(GIT_PROVIDER_GITLAB)
+
     def disconnect_github_app(self) -> dict[str, Any]:
-        for path in [
-            self.github_app_installation_file,
-            self.github_personal_access_token_file,
-            self.github_git_credentials_file,
-        ]:
-            if not path.exists():
-                continue
-            try:
-                path.unlink()
-            except OSError as exc:
-                raise HTTPException(status_code=500, detail="Failed to remove stored GitHub credentials.") from exc
-        with self._github_token_lock:
-            self._github_token_cache = {}
-        status = self.github_auth_status()
-        self._emit_auth_changed(reason="github_disconnected")
-        LOGGER.debug("GitHub credentials disconnected.")
+        self._clear_github_installation_state(remove_credentials=False)
+        status = self.github_app_auth_status()
+        self._emit_auth_changed(reason="github_app_disconnected")
+        LOGGER.debug("GitHub App installation disconnected.")
         return status
 
     def disconnect_openai_account(self) -> dict[str, Any]:
@@ -6753,6 +7003,40 @@ class HubState:
     def project_build_log(self, project_id: str) -> Path:
         return self.log_dir / f"project-{project_id}.log"
 
+    def _chat_runtime_config_path(self, chat_id: str) -> Path:
+        return self.chat_runtime_configs_dir / f"{chat_id}.toml"
+
+    @staticmethod
+    def _strip_mcp_server_table(config_text: str, server_name: str) -> str:
+        if not config_text:
+            return ""
+        escaped_name = re.escape(server_name)
+        pattern = re.compile(r"(?ms)^\[mcp_servers\." + escaped_name + r"\]\n.*?(?=^\[|\Z)")
+        stripped = re.sub(pattern, "", config_text)
+        return stripped.rstrip() + "\n"
+
+    def _prepare_chat_runtime_config(self, chat_id: str) -> Path:
+        try:
+            base_text = self.config_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to read config file: {self.config_file}") from exc
+
+        merged_text = self._strip_mcp_server_table(base_text, "agent_tools")
+        merged_text += (
+            "\n[mcp_servers.agent_tools]\n"
+            'command = "python3"\n'
+            'args = ["-m", "agent_hub.agent_tools_mcp"]\n'
+            "startup_timeout_sec = 20\n"
+            "tool_timeout_sec = 120\n"
+        )
+
+        runtime_config_path = self._chat_runtime_config_path(chat_id)
+        _write_private_env_file(runtime_config_path, merged_text)
+        return runtime_config_path
+
+    def _chat_agent_tools_url(self, chat_id: str) -> str:
+        return f"{self.artifact_publish_base_url}/api/chats/{chat_id}/agent-tools"
+
     def _chat_artifact_publish_url(self, chat_id: str) -> str:
         return f"{self.artifact_publish_base_url}/api/chats/{chat_id}/artifacts/publish"
 
@@ -6821,6 +7105,328 @@ class HubState:
         submitted_hash = _hash_artifact_publish_token(submitted_token)
         if not submitted_hash or not hmac.compare_digest(submitted_hash, expected_hash):
             raise HTTPException(status_code=403, detail="Invalid artifact publish token.")
+
+    @staticmethod
+    def _require_agent_tools_token(chat: dict[str, Any], token: Any) -> None:
+        expected_hash = str(chat.get("agent_tools_token_hash") or "")
+        if not expected_hash:
+            raise HTTPException(status_code=409, detail="agent_tools is unavailable until the chat is started.")
+
+        submitted_token = str(token or "").strip()
+        if not submitted_token:
+            raise HTTPException(status_code=401, detail="Missing agent_tools token.")
+        submitted_hash = _hash_agent_tools_token(submitted_token)
+        if not submitted_hash or not hmac.compare_digest(submitted_hash, expected_hash):
+            raise HTTPException(status_code=403, detail="Invalid agent_tools token.")
+
+    def _chat_and_project_for_agent_tools(self, chat_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        state = self.load()
+        chat = state["chats"].get(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        project_id = str(chat.get("project_id") or "").strip()
+        project = state["projects"].get(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found.")
+        return chat, project
+
+    @staticmethod
+    def _credential_lookup_key(credential: dict[str, Any]) -> str:
+        return str(credential.get("credential_id") or "").strip()
+
+    def _credential_from_id(self, credential_id: str) -> dict[str, Any] | None:
+        normalized_id = str(credential_id or "").strip()
+        if not normalized_id:
+            return None
+        for credential in self._credential_catalog():
+            if self._credential_lookup_key(credential) == normalized_id:
+                return credential
+        return None
+
+    def _materialize_agent_tool_credential(
+        self,
+        credential: dict[str, Any],
+        *,
+        context_key: str,
+    ) -> dict[str, Any]:
+        credential_id = str(credential.get("credential_id") or "").strip()
+        kind = str(credential.get("kind") or "").strip()
+        provider = str(credential.get("provider") or "").strip()
+        host = str(credential.get("host") or "").strip()
+        scheme = _normalize_github_credential_scheme(credential.get("scheme"), field_name="scheme")
+        account_login = str(credential.get("account_login") or "").strip()
+        account_name = str(credential.get("account_name") or "").strip()
+
+        username = account_login
+        secret = ""
+        if kind == "github_app_installation":
+            installation_id = int(str(credential_id).split(":", 1)[1]) if ":" in credential_id else 0
+            if installation_id <= 0:
+                raise HTTPException(status_code=400, detail=f"Invalid GitHub App credential id: {credential_id}")
+            installation_status = self.github_app_auth_status()
+            if int(installation_status.get("installation_id") or 0) != installation_id:
+                raise HTTPException(status_code=404, detail="GitHub App installation credential is no longer connected.")
+            token, _expires_at = self._github_installation_token(installation_id)
+            username = "x-access-token"
+            secret = token
+        elif kind == "personal_access_token":
+            matching = None
+            for token in self._connected_personal_access_tokens(provider):
+                if str(token.get("token_id") or "").strip() == credential_id:
+                    matching = token
+                    break
+            if matching is None:
+                raise HTTPException(status_code=404, detail="Personal access token credential is no longer connected.")
+            username = str(matching.get("account_login") or "").strip()
+            secret = str(matching.get("personal_access_token") or "").strip()
+            account_login = str(matching.get("account_login") or "").strip()
+            account_name = str(matching.get("account_name") or "").strip()
+            host = str(matching.get("host") or "").strip()
+            scheme = _normalize_github_credential_scheme(matching.get("scheme"), field_name="scheme")
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported credential kind: {kind}")
+
+        if not username or not secret or not host:
+            raise HTTPException(status_code=500, detail="Resolved credential is missing required fields.")
+
+        credential_file = self._write_github_git_credentials(
+            host=host,
+            username=username,
+            secret=secret,
+            scheme=scheme,
+            credential_id=credential_id,
+            context_key=context_key,
+        )
+        encoded_username = urllib.parse.quote(username, safe="")
+        encoded_secret = urllib.parse.quote(secret, safe="")
+        credential_line = f"{scheme}://{encoded_username}:{encoded_secret}@{host}"
+        return {
+            "credential_id": credential_id,
+            "kind": kind,
+            "provider": provider,
+            "host": host,
+            "scheme": scheme,
+            "account_login": account_login,
+            "account_name": account_name,
+            "summary": str(credential.get("summary") or ""),
+            "username": username,
+            "secret": secret,
+            "credential_line": credential_line,
+            "host_credential_file": credential_file,
+            "git_env": self._git_env_for_credentials_file(credential_file, host, scheme=scheme),
+        }
+
+    def _resolve_agent_tools_credential_ids(
+        self,
+        project: dict[str, Any],
+        mode: str,
+        credential_ids: list[str],
+    ) -> list[str]:
+        available = self._project_available_credentials(project)
+        available_ids = [self._credential_lookup_key(entry) for entry in available if self._credential_lookup_key(entry)]
+        available_id_set = set(available_ids)
+        requested_ids = [str(item or "").strip() for item in credential_ids if str(item or "").strip()]
+
+        if mode == PROJECT_CREDENTIAL_BINDING_MODE_ALL:
+            return available_ids
+        if mode in {PROJECT_CREDENTIAL_BINDING_MODE_SET, PROJECT_CREDENTIAL_BINDING_MODE_SINGLE}:
+            selected = requested_ids
+            if not selected:
+                selected = self._resolved_project_credential_ids(project)
+            selected = [credential_id for credential_id in selected if credential_id in available_id_set]
+            if mode == PROJECT_CREDENTIAL_BINDING_MODE_SINGLE and selected:
+                return selected[:1]
+            return selected
+
+        if mode == PROJECT_CREDENTIAL_BINDING_MODE_AUTO:
+            context = self._github_repo_auth_context(str(project.get("repo_url") or ""), project=project)
+            if context is None:
+                return []
+            _resolved_mode, _host, auth_payload = context
+            candidate_id = str(auth_payload.get("credential_id") or "").strip()
+            if candidate_id and candidate_id in available_id_set:
+                return [candidate_id]
+            return []
+
+        return []
+
+    def agent_tools_credentials_list_payload(self, chat_id: str) -> dict[str, Any]:
+        _chat, project = self._chat_and_project_for_agent_tools(chat_id)
+        binding_payload = self.project_credential_binding_payload(str(project.get("id") or ""))
+        return {
+            "project_id": str(project.get("id") or ""),
+            "repo_url": str(project.get("repo_url") or ""),
+            "credential_binding": binding_payload["binding"],
+            "available_credentials": binding_payload["available_credentials"],
+            "effective_credential_ids": binding_payload["effective_credential_ids"],
+        }
+
+    def resolve_agent_tools_credentials(
+        self,
+        chat_id: str,
+        mode: Any = PROJECT_CREDENTIAL_BINDING_MODE_AUTO,
+        credential_ids: Any = None,
+    ) -> dict[str, Any]:
+        _chat, project = self._chat_and_project_for_agent_tools(chat_id)
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode not in PROJECT_CREDENTIAL_BINDING_MODES:
+            normalized_mode = PROJECT_CREDENTIAL_BINDING_MODE_AUTO
+        submitted_ids = credential_ids if isinstance(credential_ids, list) else []
+        selected_ids = self._resolve_agent_tools_credential_ids(project, normalized_mode, submitted_ids)
+        resolved_credentials: list[dict[str, Any]] = []
+        for credential_id in selected_ids:
+            credential = self._credential_from_id(credential_id)
+            if credential is None:
+                continue
+            resolved_credentials.append(
+                self._materialize_agent_tool_credential(
+                    credential,
+                    context_key=f"agent_tools:{chat_id}:{credential_id}",
+                )
+            )
+        return {
+            "project_id": str(project.get("id") or ""),
+            "repo_url": str(project.get("repo_url") or ""),
+            "mode": normalized_mode,
+            "credential_ids": selected_ids,
+            "credentials": resolved_credentials,
+        }
+
+    def attach_agent_tools_project_credentials(
+        self,
+        chat_id: str,
+        mode: Any,
+        credential_ids: Any = None,
+    ) -> dict[str, Any]:
+        _chat, project = self._chat_and_project_for_agent_tools(chat_id)
+        return self.attach_project_credentials(
+            str(project.get("id") or ""),
+            mode=mode,
+            credential_ids=credential_ids if isinstance(credential_ids, list) else [],
+            source=f"agent_tools:{chat_id}",
+        )
+
+    def _create_agent_tools_session(
+        self,
+        *,
+        project_id: str = "",
+        repo_url: str = "",
+        credential_binding: dict[str, Any] | None = None,
+    ) -> tuple[str, str]:
+        session_id = uuid.uuid4().hex
+        token = _new_agent_tools_token()
+        payload = {
+            "id": session_id,
+            "project_id": str(project_id or "").strip(),
+            "repo_url": str(repo_url or "").strip(),
+            "credential_binding": _normalize_project_credential_binding(credential_binding),
+            "token_hash": _hash_agent_tools_token(token),
+            "created_at": _iso_now(),
+        }
+        with self._agent_tools_sessions_lock:
+            self._agent_tools_sessions[session_id] = payload
+        return session_id, token
+
+    def _agent_tools_session(self, session_id: str) -> dict[str, Any]:
+        normalized_session_id = str(session_id or "").strip()
+        if not normalized_session_id:
+            raise HTTPException(status_code=400, detail="session_id is required.")
+        with self._agent_tools_sessions_lock:
+            session = self._agent_tools_sessions.get(normalized_session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="agent_tools session not found.")
+        return dict(session)
+
+    def require_agent_tools_session_token(self, session_id: str, token: Any) -> dict[str, Any]:
+        session = self._agent_tools_session(session_id)
+        expected_hash = str(session.get("token_hash") or "")
+        if not expected_hash:
+            raise HTTPException(status_code=409, detail="agent_tools session is not active.")
+        submitted = str(token or "").strip()
+        if not submitted:
+            raise HTTPException(status_code=401, detail="Missing agent_tools token.")
+        submitted_hash = _hash_agent_tools_token(submitted)
+        if not submitted_hash or not hmac.compare_digest(submitted_hash, expected_hash):
+            raise HTTPException(status_code=403, detail="Invalid agent_tools token.")
+        return session
+
+    def _agent_tools_project_context_from_session(self, session: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(session.get("project_id") or "").strip()
+        if project_id:
+            project = self.project(project_id)
+            if project is not None:
+                return dict(project)
+        repo_url = str(session.get("repo_url") or "").strip()
+        return {
+            "id": project_id,
+            "repo_url": repo_url,
+            "credential_binding": _normalize_project_credential_binding(session.get("credential_binding")),
+        }
+
+    def agent_tools_session_credentials_list_payload(self, session_id: str) -> dict[str, Any]:
+        session = self._agent_tools_session(session_id)
+        project = self._agent_tools_project_context_from_session(session)
+        binding = _normalize_project_credential_binding(project.get("credential_binding"))
+        return {
+            "project_id": str(project.get("id") or ""),
+            "repo_url": str(project.get("repo_url") or ""),
+            "credential_binding": binding,
+            "available_credentials": self._project_available_credentials(project),
+            "effective_credential_ids": self._resolve_agent_tools_credential_ids(
+                project,
+                PROJECT_CREDENTIAL_BINDING_MODE_AUTO,
+                [],
+            ),
+        }
+
+    def resolve_agent_tools_session_credentials(
+        self,
+        session_id: str,
+        mode: Any = PROJECT_CREDENTIAL_BINDING_MODE_AUTO,
+        credential_ids: Any = None,
+    ) -> dict[str, Any]:
+        session = self._agent_tools_session(session_id)
+        project = self._agent_tools_project_context_from_session(session)
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode not in PROJECT_CREDENTIAL_BINDING_MODES:
+            normalized_mode = PROJECT_CREDENTIAL_BINDING_MODE_AUTO
+        submitted_ids = credential_ids if isinstance(credential_ids, list) else []
+        selected_ids = self._resolve_agent_tools_credential_ids(project, normalized_mode, submitted_ids)
+        resolved_credentials: list[dict[str, Any]] = []
+        for credential_id in selected_ids:
+            credential = self._credential_from_id(credential_id)
+            if credential is None:
+                continue
+            resolved_credentials.append(
+                self._materialize_agent_tool_credential(
+                    credential,
+                    context_key=f"agent_tools_session:{session_id}:{credential_id}",
+                )
+            )
+        return {
+            "project_id": str(project.get("id") or ""),
+            "repo_url": str(project.get("repo_url") or ""),
+            "mode": normalized_mode,
+            "credential_ids": selected_ids,
+            "credentials": resolved_credentials,
+        }
+
+    def attach_agent_tools_session_project_credentials(
+        self,
+        session_id: str,
+        mode: Any,
+        credential_ids: Any = None,
+    ) -> dict[str, Any]:
+        session = self._agent_tools_session(session_id)
+        project_id = str(session.get("project_id") or "").strip()
+        if not project_id:
+            raise HTTPException(status_code=409, detail="This agent_tools session is not attached to a persisted project.")
+        return self.attach_project_credentials(
+            project_id=project_id,
+            mode=mode,
+            credential_ids=credential_ids if isinstance(credential_ids, list) else [],
+            source=f"agent_tools_session:{session_id}",
+        )
 
     def list_chat_artifacts(self, chat_id: str) -> list[dict[str, Any]]:
         chat = self.chat(chat_id)
@@ -6950,16 +7556,21 @@ class HubState:
         default_ro_mounts: list[str] | None = None,
         default_rw_mounts: list[str] | None = None,
         default_env_vars: list[str] | None = None,
-        ) -> dict[str, Any]:
+        credential_binding: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not repo_url:
             raise HTTPException(status_code=400, detail="repo_url is required.")
 
         state = self.load()
         project_id = uuid.uuid4().hex
         project_name = name or _extract_repo_name(repo_url)
+        normalized_binding = _normalize_project_credential_binding(credential_binding)
         resolved_default_branch = str(default_branch or "").strip()
         if not resolved_default_branch:
-            git_env = self._github_git_env_for_repo(repo_url)
+            git_env = self._github_git_env_for_repo(
+                repo_url,
+                project={"repo_url": repo_url, "credential_binding": normalized_binding},
+            )
             resolved_default_branch = _detect_default_branch(repo_url, env=git_env)
         project = {
             "id": project_id,
@@ -6979,6 +7590,7 @@ class HubState:
             "build_error": "",
             "build_started_at": "",
             "build_finished_at": "",
+            "credential_binding": normalized_binding,
         }
         state["projects"][project_id] = project
         self.save(state)
@@ -7000,6 +7612,7 @@ class HubState:
             "default_ro_mounts",
             "default_rw_mounts",
             "default_env_vars",
+            "credential_binding",
         ]:
             if field in update:
                 project[field] = update[field]
@@ -7029,6 +7642,86 @@ class HubState:
             self._schedule_project_build(project_id)
             return self.load()["projects"][project_id]
         return self.load()["projects"][project_id]
+
+    def _project_available_credentials(self, project: dict[str, Any]) -> list[dict[str, Any]]:
+        repo_host = _git_repo_host(str(project.get("repo_url") or ""))
+        if not repo_host:
+            return []
+        host_credentials: list[dict[str, Any]] = []
+        for credential in self._credential_catalog():
+            credential_host = str(credential.get("host") or "").strip().lower()
+            if credential_host != repo_host:
+                continue
+            host_credentials.append(dict(credential))
+        return host_credentials
+
+    def _resolved_project_credential_ids(self, project: dict[str, Any]) -> list[str]:
+        binding = _normalize_project_credential_binding(project.get("credential_binding"))
+        available = self._project_available_credentials(project)
+        available_ids = [str(entry.get("credential_id") or "").strip() for entry in available if str(entry.get("credential_id") or "").strip()]
+        available_id_set = set(available_ids)
+
+        if binding["mode"] in {PROJECT_CREDENTIAL_BINDING_MODE_SET, PROJECT_CREDENTIAL_BINDING_MODE_SINGLE}:
+            selected = [credential_id for credential_id in binding["credential_ids"] if credential_id in available_id_set]
+            if binding["mode"] == PROJECT_CREDENTIAL_BINDING_MODE_SINGLE and selected:
+                return selected[:1]
+            return selected
+        if binding["mode"] == PROJECT_CREDENTIAL_BINDING_MODE_ALL:
+            return available_ids
+        return []
+
+    def project_credential_binding_payload(self, project_id: str) -> dict[str, Any]:
+        project = self.project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found.")
+        binding = _normalize_project_credential_binding(project.get("credential_binding"))
+        return {
+            "project_id": project_id,
+            "binding": binding,
+            "available_credentials": self._project_available_credentials(project),
+            "effective_credential_ids": self._resolved_project_credential_ids(project),
+        }
+
+    def attach_project_credentials(
+        self,
+        project_id: str,
+        mode: Any,
+        credential_ids: Any = None,
+        source: str = "agent_tools",
+    ) -> dict[str, Any]:
+        state = self.load()
+        project = state["projects"].get(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found.")
+
+        requested_ids = credential_ids if isinstance(credential_ids, list) else []
+        binding = _normalize_project_credential_binding(
+            {
+                "mode": mode,
+                "credential_ids": requested_ids,
+                "source": source,
+                "updated_at": _iso_now(),
+            }
+        )
+        available_ids = {
+            str(entry.get("credential_id") or "").strip()
+            for entry in self._project_available_credentials(project)
+            if str(entry.get("credential_id") or "").strip()
+        }
+        if binding["mode"] in {PROJECT_CREDENTIAL_BINDING_MODE_SET, PROJECT_CREDENTIAL_BINDING_MODE_SINGLE}:
+            filtered = [credential_id for credential_id in binding["credential_ids"] if credential_id in available_ids]
+            if not filtered:
+                raise HTTPException(status_code=400, detail="No valid credentials were provided for this project.")
+            binding["credential_ids"] = filtered[:1] if binding["mode"] == PROJECT_CREDENTIAL_BINDING_MODE_SINGLE else filtered
+        else:
+            binding["credential_ids"] = []
+
+        project["credential_binding"] = binding
+        project["updated_at"] = _iso_now()
+        state["projects"][project_id] = project
+        self.save(state, reason="project_credential_binding_updated")
+        self._emit_state_changed(reason="project_credential_binding_updated")
+        return self.project_credential_binding_payload(project_id)
 
     def _schedule_project_build(self, project_id: str) -> None:
         with self._project_build_lock:
@@ -7198,6 +7891,8 @@ class HubState:
             "artifact_prompt_history": [],
             "artifact_publish_token_hash": "",
             "artifact_publish_token_issued_at": "",
+            "agent_tools_token_hash": "",
+            "agent_tools_token_issued_at": "",
             "create_request_id": _compact_whitespace(str(create_request_id or "")).strip(),
             "created_at": now,
             "updated_at": now,
@@ -7344,6 +8039,12 @@ class HubState:
         workspace = Path(str(chat.get("workspace") or self.chat_dir / chat_id))
         if workspace.exists():
             self._delete_path(workspace)
+        runtime_config_file = self._chat_runtime_config_path(chat_id)
+        if runtime_config_file.exists():
+            try:
+                runtime_config_file.unlink()
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=f"Failed to remove chat runtime config: {runtime_config_file}") from exc
 
         with self._chat_input_lock:
             self._chat_input_buffers.pop(chat_id, None)
@@ -7961,6 +8662,8 @@ class HubState:
                     chat["last_exit_at"] = _iso_now()
             chat["artifact_publish_token_hash"] = ""
             chat["artifact_publish_token_issued_at"] = ""
+            chat["agent_tools_token_hash"] = ""
+            chat["agent_tools_token_issued_at"] = ""
             chat["stop_requested_at"] = ""
             chat["updated_at"] = _iso_now()
             state["chats"][chat_id] = chat
@@ -8109,7 +8812,11 @@ class HubState:
             workspace = Path(str(chat.get("workspace") or self.chat_dir / chat["id"]))
 
         workspace.mkdir(parents=True, exist_ok=True)
-        git_env = self._github_git_env_for_repo(str(project.get("repo_url") or ""))
+        git_env = self._github_git_env_for_repo(
+            str(project.get("repo_url") or ""),
+            project=project,
+            context_key=f"chat_clone:{chat.get('id')}",
+        )
         _run(["git", "clone", project["repo_url"], str(workspace)], check=True, env=git_env)
         return workspace
 
@@ -8121,12 +8828,20 @@ class HubState:
                 return workspace
             self._delete_path(workspace)
         workspace.parent.mkdir(parents=True, exist_ok=True)
-        git_env = self._github_git_env_for_repo(str(project.get("repo_url") or ""))
+        git_env = self._github_git_env_for_repo(
+            str(project.get("repo_url") or ""),
+            project=project,
+            context_key=f"project_clone:{project.get('id')}",
+        )
         _run(["git", "clone", project["repo_url"], str(workspace)], check=True, env=git_env)
         return workspace
 
     def _sync_checkout_to_remote(self, workspace: Path, project: dict[str, Any]) -> None:
-        git_env = self._github_git_env_for_repo(str(project.get("repo_url") or ""))
+        git_env = self._github_git_env_for_repo(
+            str(project.get("repo_url") or ""),
+            project=project,
+            context_key=f"project_sync:{project.get('id')}",
+        )
         _run_for_repo(["fetch", "--all", "--prune"], workspace, check=True, env=git_env)
         branch = project.get("default_branch") or "master"
         remote_default = _git_default_remote_branch(workspace)
@@ -8256,8 +8971,14 @@ class HubState:
         ]
         repo_url = str(project.get("repo_url") or "")
         cmd.extend(self._openai_credentials_arg())
-        cmd.extend(self._github_git_args_for_repo(repo_url))
-        for git_identity_env in self._github_git_identity_env_vars_for_repo(repo_url):
+        cmd.extend(
+            self._github_git_args_for_repo(
+                repo_url,
+                project=project,
+                context_key=f"snapshot:{project.get('id')}",
+            )
+        )
+        for git_identity_env in self._github_git_identity_env_vars_for_repo(repo_url, project=project):
             cmd.extend(["--env-var", git_identity_env])
         self._append_project_base_args(cmd, workspace, project)
         for mount in project.get("default_ro_mounts") or []:
@@ -8357,6 +9078,7 @@ class HubState:
     def state_payload(self) -> dict[str, Any]:
         state = self.load()
         project_map: dict[str, dict[str, Any]] = {}
+        should_save = False
         for pid, project in state["projects"].items():
             project_copy = dict(project)
             project_copy["base_image_mode"] = _normalize_base_image_mode(project_copy.get("base_image_mode"))
@@ -8369,6 +9091,11 @@ class HubState:
             project_copy["build_error"] = str(project_copy.get("build_error") or "")
             project_copy["build_started_at"] = str(project_copy.get("build_started_at") or "")
             project_copy["build_finished_at"] = str(project_copy.get("build_finished_at") or "")
+            normalized_binding = _normalize_project_credential_binding(project_copy.get("credential_binding"))
+            project_copy["credential_binding"] = normalized_binding
+            if state["projects"].get(pid, {}).get("credential_binding") != normalized_binding:
+                state["projects"][pid]["credential_binding"] = normalized_binding
+                should_save = True
             log_path = self.project_build_log(pid)
             try:
                 project_copy["has_build_log"] = log_path.exists() and log_path.stat().st_size > 0
@@ -8376,7 +9103,6 @@ class HubState:
                 project_copy["has_build_log"] = False
             project_map[pid] = project_copy
         chats = []
-        should_save = False
         for chat_id, chat in list(state["chats"].items()):
             chat_copy = dict(chat)
             pid = chat_copy.get("pid")
@@ -8427,6 +9153,8 @@ class HubState:
             ]
             chat_copy.pop("artifact_publish_token_hash", None)
             chat_copy.pop("artifact_publish_token_issued_at", None)
+            chat_copy.pop("agent_tools_token_hash", None)
+            chat_copy.pop("agent_tools_token_issued_at", None)
             chat_copy.pop("create_request_id", None)
             running = _is_process_running(pid)
             normalized_status = _normalize_chat_status(chat_copy.get("status"))
@@ -8461,6 +9189,8 @@ class HubState:
                     persisted_chat["pid"] = None
                     persisted_chat["artifact_publish_token_hash"] = ""
                     persisted_chat["artifact_publish_token_issued_at"] = ""
+                    persisted_chat["agent_tools_token_hash"] = ""
+                    persisted_chat["agent_tools_token_issued_at"] = ""
                     persisted_chat["last_exit_code"] = _normalize_optional_int(persisted_chat.get("last_exit_code"))
                     if not str(persisted_chat.get("last_exit_at") or "").strip():
                         persisted_chat["last_exit_at"] = _iso_now()
@@ -8577,6 +9307,8 @@ class HubState:
                 self._chat_input_buffers[chat_id] = ""
                 self._chat_input_ansi_carry[chat_id] = ""
             artifact_publish_token = _new_artifact_publish_token()
+            agent_tools_token = _new_agent_tools_token()
+            runtime_config_file = self._prepare_chat_runtime_config(chat_id)
             agent_type = _normalize_chat_agent_type(chat.get("agent_type"))
             agent_command = AGENT_COMMAND_BY_TYPE.get(agent_type, AGENT_COMMAND_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE])
             chat["agent_type"] = agent_type
@@ -8597,7 +9329,7 @@ class HubState:
                 "--agent-home-path",
                 str(self.host_agent_home),
                 "--config-file",
-                str(self.config_file),
+                str(runtime_config_file),
                 "--system-prompt-file",
                 str(self.system_prompt_file),
                 "--no-alt-screen",
@@ -8606,8 +9338,14 @@ class HubState:
                 cmd.append("--resume")
             repo_url = str(project.get("repo_url") or "")
             cmd.extend(self._openai_credentials_arg())
-            cmd.extend(self._github_git_args_for_repo(repo_url))
-            for git_identity_env in self._github_git_identity_env_vars_for_repo(repo_url):
+            cmd.extend(
+                self._github_git_args_for_repo(
+                    repo_url,
+                    project=project,
+                    context_key=f"chat_start:{chat_id}",
+                )
+            )
+            for git_identity_env in self._github_git_identity_env_vars_for_repo(repo_url, project=project):
                 cmd.extend(["--env-var", git_identity_env])
             self._append_project_base_args(cmd, workspace, project)
             cmd.extend(["--snapshot-image-tag", snapshot_tag])
@@ -8617,6 +9355,10 @@ class HubState:
                 cmd.extend(["--rw-mount", mount])
             cmd.extend(["--env-var", f"AGENT_HUB_ARTIFACTS_URL={self._chat_artifact_publish_url(chat_id)}"])
             cmd.extend(["--env-var", f"AGENT_HUB_ARTIFACT_TOKEN={artifact_publish_token}"])
+            cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_URL={self._chat_agent_tools_url(chat_id)}"])
+            cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_TOKEN={agent_tools_token}"])
+            cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_PROJECT_ID={project.get('id')}"])
+            cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_CHAT_ID={chat_id}"])
             for env_entry in chat.get("env_vars") or []:
                 if _is_reserved_env_entry(str(env_entry)):
                     continue
@@ -8655,6 +9397,8 @@ class HubState:
         chat["container_workspace"] = container_workspace
         chat["artifact_publish_token_hash"] = _hash_artifact_publish_token(artifact_publish_token)
         chat["artifact_publish_token_issued_at"] = _iso_now()
+        chat["agent_tools_token_hash"] = _hash_agent_tools_token(agent_tools_token)
+        chat["agent_tools_token_issued_at"] = _iso_now()
         chat["last_started_at"] = _iso_now()
         chat["stop_requested_at"] = ""
         state["chats"][chat_id] = chat
@@ -9589,31 +10333,14 @@ def main(
     def api_disconnect_openai() -> dict[str, Any]:
         return {"provider": state.disconnect_openai()}
 
-    @app.post("/api/settings/auth/github/connect")
-    async def api_connect_github(request: Request) -> dict[str, Any]:
+    @app.post("/api/settings/auth/github-app/connect")
+    async def api_connect_github_app(request: Request) -> dict[str, Any]:
         payload = await request.json()
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        connection_mode = str(payload.get("connection_mode") or "").strip().lower()
-        if not connection_mode:
-            if str(payload.get("personal_access_token") or "").strip():
-                connection_mode = GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN
-            else:
-                connection_mode = GITHUB_CONNECTION_MODE_GITHUB_APP
+        return {"provider": state.connect_github_app(payload.get("installation_id"))}
 
-        if connection_mode == GITHUB_CONNECTION_MODE_GITHUB_APP:
-            provider = state.connect_github_app(payload.get("installation_id"))
-        elif connection_mode == GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
-            provider = state.connect_github_personal_access_token(
-                payload.get("personal_access_token"),
-                host=payload.get("host"),
-                owner_scopes=payload.get("owner_scopes"),
-            )
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported GitHub connection mode: {connection_mode}")
-        return {"provider": provider}
-
-    @app.post("/api/settings/auth/github/app/setup/start")
+    @app.post("/api/settings/auth/github-app/setup/start")
     async def api_start_github_app_setup(request: Request) -> dict[str, Any]:
         origin = f"{request.url.scheme}://{request.url.netloc}"
         raw_body = await request.body()
@@ -9628,11 +10355,11 @@ def main(
                 origin = str(payload.get("origin") or "").strip()
         return state.start_github_app_setup(origin=origin)
 
-    @app.get("/api/settings/auth/github/app/setup/session")
+    @app.get("/api/settings/auth/github-app/setup/session")
     def api_github_app_setup_session() -> dict[str, Any]:
         return state.github_app_setup_session_payload()
 
-    @app.get("/api/settings/auth/github/app/setup/callback", response_class=HTMLResponse)
+    @app.get("/api/settings/auth/github-app/setup/callback", response_class=HTMLResponse)
     def api_github_app_setup_callback(request: Request) -> HTMLResponse:
         denied_error = str(request.query_params.get("error") or "").strip()
         state_value = str(request.query_params.get("state") or "").strip()
@@ -9667,17 +10394,53 @@ def main(
                 status_code=int(exc.status_code or 400),
             )
 
-    @app.post("/api/settings/auth/github/disconnect")
-    def api_disconnect_github() -> dict[str, Any]:
+    @app.post("/api/settings/auth/github-app/disconnect")
+    def api_disconnect_github_app() -> dict[str, Any]:
         return {"provider": state.disconnect_github_app()}
 
-    @app.delete("/api/settings/auth/github/personal-access-tokens/{token_id}")
+    @app.get("/api/settings/auth/github-app/installations")
+    def api_list_github_installations() -> dict[str, Any]:
+        return state.list_github_app_installations()
+
+    @app.post("/api/settings/auth/github-tokens/connect")
+    async def api_connect_github_token(request: Request) -> dict[str, Any]:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        return {
+            "provider": state.connect_github_personal_access_token(
+                payload.get("personal_access_token"),
+                host=payload.get("host"),
+            )
+        }
+
+    @app.delete("/api/settings/auth/github-tokens/{token_id}")
     def api_disconnect_github_personal_access_token(token_id: str) -> dict[str, Any]:
         return {"provider": state.disconnect_github_personal_access_token(token_id)}
 
-    @app.get("/api/settings/auth/github/installations")
-    def api_list_github_installations() -> dict[str, Any]:
-        return state.list_github_app_installations()
+    @app.post("/api/settings/auth/github-tokens/disconnect")
+    def api_disconnect_github_personal_access_tokens() -> dict[str, Any]:
+        return {"provider": state.disconnect_github_personal_access_tokens()}
+
+    @app.post("/api/settings/auth/gitlab-tokens/connect")
+    async def api_connect_gitlab_token(request: Request) -> dict[str, Any]:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        return {
+            "provider": state.connect_gitlab_personal_access_token(
+                payload.get("personal_access_token"),
+                host=payload.get("host"),
+            )
+        }
+
+    @app.delete("/api/settings/auth/gitlab-tokens/{token_id}")
+    def api_disconnect_gitlab_personal_access_token(token_id: str) -> dict[str, Any]:
+        return {"provider": state.disconnect_gitlab_personal_access_token(token_id)}
+
+    @app.post("/api/settings/auth/gitlab-tokens/disconnect")
+    def api_disconnect_gitlab_personal_access_tokens() -> dict[str, Any]:
+        return {"provider": state.disconnect_gitlab_personal_access_tokens()}
 
     @app.post("/api/settings/auth/openai/title-test")
     async def api_test_openai_chat_title_generation(request: Request) -> dict[str, Any]:
@@ -9752,6 +10515,7 @@ def main(
         default_ro_mounts = _parse_mounts(_empty_list(payload.get("default_ro_mounts")), "default read-only mount")
         default_rw_mounts = _parse_mounts(_empty_list(payload.get("default_rw_mounts")), "default read-write mount")
         default_env_vars = _parse_env_vars(_empty_list(payload.get("default_env_vars")))
+        credential_binding = _normalize_project_credential_binding(payload.get("credential_binding"))
         if setup_script is not None:
             setup_script = str(setup_script).strip()
         if isinstance(branch, str):
@@ -9767,6 +10531,7 @@ def main(
             default_ro_mounts=default_ro_mounts,
             default_rw_mounts=default_rw_mounts,
             default_env_vars=default_env_vars,
+            credential_binding=credential_binding,
         )
         return {
             "project": project
@@ -9802,10 +10567,28 @@ def main(
             )
         if "default_env_vars" in payload:
             update["default_env_vars"] = _parse_env_vars(_empty_list(payload.get("default_env_vars")))
+        if "credential_binding" in payload:
+            update["credential_binding"] = _normalize_project_credential_binding(payload.get("credential_binding"))
         if not update:
             raise HTTPException(status_code=400, detail="No patch values provided.")
         project = await asyncio.to_thread(state.update_project, project_id, update)
         return {"project": project}
+
+    @app.get("/api/projects/{project_id}/credential-binding")
+    def api_project_credential_binding(project_id: str) -> dict[str, Any]:
+        return state.project_credential_binding_payload(project_id)
+
+    @app.post("/api/projects/{project_id}/credential-binding")
+    async def api_project_credential_binding_update(project_id: str, request: Request) -> dict[str, Any]:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        return state.attach_project_credentials(
+            project_id=project_id,
+            mode=payload.get("mode"),
+            credential_ids=payload.get("credential_ids"),
+            source="settings_api",
+        )
 
     @app.delete("/api/projects/{project_id}")
     def api_delete_project(project_id: str) -> None:
@@ -9986,6 +10769,113 @@ def main(
     def api_preview_chat_artifact(chat_id: str, artifact_id: str) -> FileResponse:
         artifact_path, media_type = state.resolve_chat_artifact_preview(chat_id, artifact_id)
         return FileResponse(path=str(artifact_path), media_type=media_type)
+
+    @app.get("/api/chats/{chat_id}/agent-tools/credentials")
+    def api_agent_tools_list_credentials(chat_id: str, request: Request) -> dict[str, Any]:
+        auth_header = str(request.headers.get("authorization") or "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
+        chat = state.chat(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        state._require_agent_tools_token(chat, token)
+        return state.agent_tools_credentials_list_payload(chat_id)
+
+    @app.post("/api/chats/{chat_id}/agent-tools/credentials/resolve")
+    async def api_agent_tools_resolve_credentials(chat_id: str, request: Request) -> dict[str, Any]:
+        auth_header = str(request.headers.get("authorization") or "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
+        chat = state.chat(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        state._require_agent_tools_token(chat, token)
+        payload = await request.json()
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        return state.resolve_agent_tools_credentials(
+            chat_id=chat_id,
+            mode=payload.get("mode"),
+            credential_ids=payload.get("credential_ids"),
+        )
+
+    @app.post("/api/chats/{chat_id}/agent-tools/project-binding")
+    async def api_agent_tools_attach_project_binding(chat_id: str, request: Request) -> dict[str, Any]:
+        auth_header = str(request.headers.get("authorization") or "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
+        chat = state.chat(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        state._require_agent_tools_token(chat, token)
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        return state.attach_agent_tools_project_credentials(
+            chat_id=chat_id,
+            mode=payload.get("mode"),
+            credential_ids=payload.get("credential_ids"),
+        )
+
+    @app.get("/api/agent-tools/sessions/{session_id}/credentials")
+    def api_agent_tools_session_list_credentials(session_id: str, request: Request) -> dict[str, Any]:
+        auth_header = str(request.headers.get("authorization") or "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
+        state.require_agent_tools_session_token(session_id, token)
+        return state.agent_tools_session_credentials_list_payload(session_id)
+
+    @app.post("/api/agent-tools/sessions/{session_id}/credentials/resolve")
+    async def api_agent_tools_session_resolve_credentials(session_id: str, request: Request) -> dict[str, Any]:
+        auth_header = str(request.headers.get("authorization") or "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
+        state.require_agent_tools_session_token(session_id, token)
+        payload = await request.json()
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        return state.resolve_agent_tools_session_credentials(
+            session_id=session_id,
+            mode=payload.get("mode"),
+            credential_ids=payload.get("credential_ids"),
+        )
+
+    @app.post("/api/agent-tools/sessions/{session_id}/project-binding")
+    async def api_agent_tools_session_attach_project_binding(session_id: str, request: Request) -> dict[str, Any]:
+        auth_header = str(request.headers.get("authorization") or "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
+        state.require_agent_tools_session_token(session_id, token)
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        return state.attach_agent_tools_session_project_credentials(
+            session_id=session_id,
+            mode=payload.get("mode"),
+            credential_ids=payload.get("credential_ids"),
+        )
 
     @app.get("/api/chats/{chat_id}/logs", response_class=PlainTextResponse)
     def api_chat_logs(chat_id: str) -> str:
