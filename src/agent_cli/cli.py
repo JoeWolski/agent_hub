@@ -36,6 +36,7 @@ AGENT_PROVIDER_GEMINI = "gemini"
 DEFAULT_CODEX_APPROVAL_POLICY = "never"
 DEFAULT_CODEX_SANDBOX_MODE = "danger-full-access"
 DEFAULT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
+DEFAULT_CLAUDE_MODEL = "opus"
 DEFAULT_GEMINI_APPROVAL_MODE = "yolo"
 GEMINI_CONTEXT_FILE_NAME = "GEMINI.md"
 SYSTEM_PROMPT_FILE_NAME = "SYSTEM_PROMPT.md"
@@ -195,6 +196,8 @@ def _shared_prompt_context_from_config(config_path: Path, *, core_system_prompt:
 def _claude_default_runtime_flags(*, explicit_args: Iterable[str], shared_prompt_context: str) -> list[str]:
     parsed_args = [str(arg) for arg in explicit_args]
     flags: list[str] = []
+    if not _has_cli_option(parsed_args, long_option="--model", short_option="-m"):
+        flags.extend(["--model", DEFAULT_CLAUDE_MODEL])
     if not _has_cli_option(parsed_args, long_option="--dangerously-skip-permissions") and not _has_cli_option(
         parsed_args, long_option="--permission-mode"
     ):
