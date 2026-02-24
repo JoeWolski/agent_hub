@@ -1630,6 +1630,7 @@ function HubApp() {
   const [pendingProjectBuilds, setPendingProjectBuilds] = useState({});
   const [pendingChatStarts, setPendingChatStarts] = useState({});
   const [pendingContainerRefreshes, setPendingContainerRefreshes] = useState({});
+  const [pendingProjectChatCreates, setPendingProjectChatCreates] = useState({});
   const [themePreference, setThemePreference] = useState(() => loadThemePreference());
   const [systemThemeIsDark, setSystemThemeIsDark] = useState(() => detectSystemPrefersDark());
   const [hubStateHydrated, setHubStateHydrated] = useState(false);
@@ -1696,6 +1697,7 @@ function HubApp() {
   const chatFirstSeenOrderRef = useRef(createFirstSeenOrderState());
   const autoConfigProjectOrderAliasByProjectIdRef = useRef(new Map());
   const chatOrderAliasByServerIdRef = useRef(new Map());
+  const projectChatCreateLocksRef = useRef(new Set());
   const chatFlexOuterModelCacheRef = useRef({ layoutJson: null, model: null });
   const chatFlexProjectModelCacheRef = useRef({
     layoutsByProjectId: {},
@@ -2661,39 +2663,52 @@ function HubApp() {
   }
 
   async function handleCreateChat(projectId, startSettings = null) {
-    const pendingCreatedAtMs = Date.now();
-    const uiId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-    const project = projectsById.get(projectId);
-    const selectedStartSettings = resolveProjectChatStartSettings(
-      projectId,
-      chatStartSettingsByProjectRef.current,
-      hubSettingsRef.current.defaultAgentType,
-      agentCapabilitiesRef.current,
-      startSettings
-    );
-    const { agentType, agentArgs } = buildChatStartConfig(selectedStartSettings, agentCapabilitiesRef.current);
-    const knownServerChatIds = (hubState.chats || [])
-      .filter((chat) => String(chat.project_id || "") === String(projectId))
-      .map((chat) => chat.id);
-    setPendingSessions((prev) => [...prev, {
-      ui_id: uiId,
-      project_id: projectId,
-      project_name: project?.name || "Unknown",
-      agent_type: agentType,
-      server_chat_id: "",
-      created_at_ms: pendingCreatedAtMs,
-      server_chat_id_set_at_ms: 0,
-      known_server_chat_ids: knownServerChatIds,
-      seen_on_server: false
-    }]);
-    setActiveTab("chats");
-    setOpenChats((prev) => ({ ...prev, [uiId]: true }));
-    setOpenChatDetails((prev) => ({ ...prev, [uiId]: false }));
-    setCollapsedProjectChats((prev) => ({ ...prev, [projectId]: false }));
+    const normalizedProjectId = String(projectId || "").trim();
+    if (!normalizedProjectId) {
+      setError("Project id is required to create a chat.");
+      return;
+    }
+    if (projectChatCreateLocksRef.current.has(normalizedProjectId)) {
+      return;
+    }
+    projectChatCreateLocksRef.current.add(normalizedProjectId);
+    setPendingProjectChatCreates((prev) => ({ ...prev, [normalizedProjectId]: Date.now() }));
+    let uiId = "";
     try {
-      const response = await fetchJson(`/api/projects/${projectId}/chats/start`, {
+      const pendingCreatedAtMs = Date.now();
+      uiId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+      const requestId = `chat-create-${uiId}`;
+      const project = projectsById.get(normalizedProjectId);
+      const selectedStartSettings = resolveProjectChatStartSettings(
+        normalizedProjectId,
+        chatStartSettingsByProjectRef.current,
+        hubSettingsRef.current.defaultAgentType,
+        agentCapabilitiesRef.current,
+        startSettings
+      );
+      const { agentType, agentArgs } = buildChatStartConfig(selectedStartSettings, agentCapabilitiesRef.current);
+      const knownServerChatIds = (hubState.chats || [])
+        .filter((chat) => String(chat.project_id || "") === normalizedProjectId)
+        .map((chat) => chat.id);
+      setPendingSessions((prev) => [...prev, {
+        ui_id: uiId,
+        project_id: normalizedProjectId,
+        project_name: project?.name || "Unknown",
+        agent_type: agentType,
+        server_chat_id: "",
+        created_at_ms: pendingCreatedAtMs,
+        server_chat_id_set_at_ms: 0,
+        known_server_chat_ids: knownServerChatIds,
+        seen_on_server: false
+      }]);
+      setActiveTab("chats");
+      setOpenChats((prev) => ({ ...prev, [uiId]: true }));
+      setOpenChatDetails((prev) => ({ ...prev, [uiId]: false }));
+      setCollapsedProjectChats((prev) => ({ ...prev, [normalizedProjectId]: false }));
+
+      const response = await fetchJson(`/api/projects/${normalizedProjectId}/chats/start`, {
         method: "POST",
-        body: JSON.stringify({ agent_type: agentType, agent_args: agentArgs })
+        body: JSON.stringify({ agent_type: agentType, agent_args: agentArgs, request_id: requestId })
       });
       const chatId = response?.chat?.id;
       if (!chatId) {
@@ -2718,9 +2733,21 @@ function HubApp() {
       setError("");
       refreshState().catch(() => {});
     } catch (err) {
-      removeOptimisticChatRow(uiId);
+      if (uiId) {
+        removeOptimisticChatRow(uiId);
+      }
       setError(err.message || String(err));
       refreshState().catch(() => {});
+    } finally {
+      projectChatCreateLocksRef.current.delete(normalizedProjectId);
+      setPendingProjectChatCreates((prev) => {
+        if (!prev[normalizedProjectId]) {
+          return prev;
+        }
+        const next = { ...prev };
+        delete next[normalizedProjectId];
+        return next;
+      });
     }
   }
 
@@ -4157,6 +4184,7 @@ function HubApp() {
     const buildStatus = String(project.build_status || "pending");
     const canStartChat = buildStatus === "ready";
     const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
+    const isCreatingChat = Boolean(pendingProjectChatCreates[project.id]);
     const projectRowsCollapsed = Boolean(collapsedProjectChats[project.id]);
     const projectStartSettings = normalizeChatStartSettings(
       chatStartSettingsByProject[project.id] || { agentType: hubSettings.defaultAgentType },
@@ -4240,7 +4268,7 @@ function HubApp() {
             <button
               type="button"
               className="btn-primary project-group-action"
-              disabled={!canStartChat && isBuilding}
+              disabled={isCreatingChat || (!canStartChat && isBuilding)}
               onClick={(event) => {
                 event.stopPropagation();
                 if (canStartChat) {
@@ -4251,7 +4279,11 @@ function HubApp() {
               }}
             >
               {canStartChat
-                ? "New chat"
+                ? (
+                  isCreatingChat
+                    ? <SpinnerLabel text="Starting chat..." />
+                    : "New chat"
+                )
                 : isBuilding
                   ? <SpinnerLabel text="Building image..." />
                   : "Build image"}
@@ -4328,6 +4360,7 @@ function HubApp() {
     const buildStatus = String(project.build_status || "pending");
     const canStartChat = buildStatus === "ready";
     const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
+    const isCreatingChat = Boolean(pendingProjectChatCreates[project.id]);
     const projectStartSettings = normalizeChatStartSettings(
       chatStartSettingsByProject[project.id] || { agentType: hubSettings.defaultAgentType },
       agentCapabilities
@@ -4392,7 +4425,7 @@ function HubApp() {
         <button
           type="button"
           className="btn-primary project-group-action chat-layout-project-control-button"
-          disabled={!canStartChat && isBuilding}
+          disabled={isCreatingChat || (!canStartChat && isBuilding)}
           onClick={() => {
             if (canStartChat) {
               handleCreateChat(project.id);
@@ -4402,7 +4435,11 @@ function HubApp() {
           }}
         >
           {canStartChat
-            ? "New chat"
+            ? (
+              isCreatingChat
+                ? <SpinnerLabel text="Starting chat..." />
+                : "New chat"
+            )
             : isBuilding
               ? <SpinnerLabel text="Building image..." />
               : "Build image"}
@@ -4812,6 +4849,7 @@ function HubApp() {
                 const statusInfo = projectStatusInfo(buildStatus);
                 const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
                 const canStartChat = buildStatus === "ready";
+                const isCreatingChat = Boolean(pendingProjectChatCreates[project.id]);
                 const isEditing = Boolean(editingProjects[project.id]);
                 const isStoredLogOpen = Boolean(openBuildLogs[project.id]);
                 const storedLogText = projectStaticLogs[project.id];
@@ -4903,11 +4941,15 @@ function HubApp() {
                           <button
                             type="button"
                             className="btn-primary project-collapsed-primary"
-                            disabled={!canStartChat && isBuilding}
+                            disabled={isCreatingChat || (!canStartChat && isBuilding)}
                             onClick={() => (canStartChat ? handleCreateChat(project.id) : handleBuildProject(project.id))}
                           >
                             {canStartChat
-                              ? "New chat"
+                              ? (
+                                isCreatingChat
+                                  ? <SpinnerLabel text="Starting chat..." />
+                                  : "New chat"
+                              )
                               : isBuilding
                                 ? <SpinnerLabel text="Building image..." />
                                 : "Build"}
