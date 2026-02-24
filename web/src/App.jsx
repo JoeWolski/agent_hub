@@ -891,7 +891,8 @@ function ChatTerminal({
   collapsed = false,
   tabs = [],
   activeTabId = "",
-  onTabSelect = null
+  onTabSelect = null,
+  onTabClose = null
 }) {
   const shellRef = useRef(null);
   const hostRef = useRef(null);
@@ -1105,22 +1106,41 @@ function ChatTerminal({
                 const tabId = String(tab?.id || "");
                 const tabLabel = String(tab?.label || tabId || "Chat");
                 const isSelected = tabId && tabId === String(activeTabId || "");
+                const canClose = typeof onTabClose === "function" && Boolean(tabId);
                 return (
-                  <button
+                  <div
                     key={`terminal-tab-${tabId || tabLabel}`}
-                    type="button"
-                    role="tab"
-                    className={`terminal-toolbar-tab ${isSelected ? "selected" : ""}`.trim()}
-                    aria-selected={isSelected}
-                    aria-label={tabLabel}
-                    onClick={() => {
-                      if (typeof onTabSelect === "function" && tabId) {
-                        onTabSelect(tabId);
-                      }
-                    }}
+                    className={`terminal-toolbar-tab-item ${isSelected ? "selected" : ""}`.trim()}
                   >
-                    {tabLabel}
-                  </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      className="terminal-toolbar-tab"
+                      aria-selected={isSelected}
+                      aria-label={tabLabel}
+                      onClick={() => {
+                        if (typeof onTabSelect === "function" && tabId) {
+                          onTabSelect(tabId);
+                        }
+                      }}
+                    >
+                      <span className="terminal-toolbar-tab-label">{tabLabel}</span>
+                    </button>
+                    {canClose ? (
+                      <button
+                        type="button"
+                        className="terminal-toolbar-tab-close"
+                        aria-label={`Close ${tabLabel}`}
+                        title={`Close ${tabLabel}`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onTabClose(tabId);
+                        }}
+                      >
+                        x
+                      </button>
+                    ) : null}
+                  </div>
                 );
               })}
             </div>
@@ -3528,6 +3548,29 @@ function HubApp() {
     setActiveTab("settings");
   }
 
+  function closeChatFromUi(chat) {
+    const chatUiId = String(chat?.id || "").trim();
+    if (!chatUiId) {
+      return;
+    }
+    if (!hasServerChat(chat)) {
+      setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chatUiId));
+      setOpenChats((prev) => {
+        const next = { ...prev };
+        delete next[chatUiId];
+        return next;
+      });
+      setOpenChatDetails((prev) => {
+        const next = { ...prev };
+        delete next[chatUiId];
+        return next;
+      });
+      setFullscreenChatId((current) => (current === chatUiId ? "" : current));
+      return;
+    }
+    handleDeleteChat(resolveServerChatId(chat), chatUiId);
+  }
+
   function renderChatCard(chat, options = {}) {
     const resolvedChatId = resolveServerChatId(chat);
     const chatHasServer = hasServerChat(chat);
@@ -3626,6 +3669,9 @@ function HubApp() {
     const activeTerminalTabId = String(options?.activeTerminalTabId || "");
     const onSelectTerminalTab = typeof options?.onSelectTerminalTab === "function"
       ? options.onSelectTerminalTab
+      : null;
+    const onCloseTerminalTab = typeof options?.onCloseTerminalTab === "function"
+      ? options.onCloseTerminalTab
       : null;
 
     const buildArtifactRenderInfo = (artifact) => {
@@ -3845,22 +3891,7 @@ function HubApp() {
           title={`Delete ${titleText}`}
           aria-label={`Delete ${titleText}`}
           onClick={() => {
-            if (!chatHasServer) {
-              setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chat.id));
-              setOpenChats((prev) => {
-                const next = { ...prev };
-                delete next[chat.id];
-                return next;
-              });
-              setOpenChatDetails((prev) => {
-                const next = { ...prev };
-                delete next[chat.id];
-                return next;
-              });
-              setFullscreenChatId((current) => (current === chat.id ? "" : current));
-              return;
-            }
-            handleDeleteChat(resolvedChatId, chat.id);
+            closeChatFromUi(chat);
           }}
         >
           <CloseIcon />
@@ -3934,6 +3965,7 @@ function HubApp() {
               tabs={terminalTabs}
               activeTabId={activeTerminalTabId}
               onTabSelect={onSelectTerminalTab}
+              onTabClose={onCloseTerminalTab}
             />
           ) : (
             <ChatTerminal
@@ -3950,6 +3982,7 @@ function HubApp() {
               tabs={terminalTabs}
               activeTabId={activeTerminalTabId}
               onTabSelect={onSelectTerminalTab}
+              onTabClose={onCloseTerminalTab}
             />
           )}
 
@@ -4298,6 +4331,31 @@ function HubApp() {
       id: String(chat.id || ""),
       label: String(chat.display_name || chat.name || "Chat")
     }));
+    const closeProjectTerminalTab = (chatIdToClose) => {
+      const targetTabId = String(chatIdToClose || "");
+      if (!targetTabId) {
+        return;
+      }
+      const closingIndex = projectChats.findIndex((chat) => String(chat.id || "") === targetTabId);
+      if (closingIndex < 0) {
+        return;
+      }
+      const closingChat = projectChats[closingIndex];
+      if (targetTabId === selectedChatId) {
+        const nextActiveChat = projectChats[closingIndex + 1] || projectChats[closingIndex - 1] || null;
+        const nextActiveChatId = String(nextActiveChat?.id || "");
+        setActiveProjectTerminalTabByProjectId((prev) => {
+          const next = { ...(prev || {}) };
+          if (nextActiveChatId) {
+            next[project.id] = nextActiveChatId;
+          } else {
+            delete next[project.id];
+          }
+          return next;
+        });
+      }
+      closeChatFromUi(closingChat);
+    };
     if (!selectedChat) {
       return <div className="empty">No chats yet for this project.</div>;
     }
@@ -4312,7 +4370,8 @@ function HubApp() {
                 ...(prev || {}),
                 [project.id]: String(nextChatId || "")
               }));
-            }
+            },
+            onCloseTerminalTab: closeProjectTerminalTab
           })}
         </div>
       </div>
