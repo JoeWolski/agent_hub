@@ -1725,6 +1725,11 @@ function HubApp() {
   const chatFirstSeenOrderRef = useRef(createFirstSeenOrderState());
   const autoConfigProjectOrderAliasByProjectIdRef = useRef(new Map());
   const chatOrderAliasByServerIdRef = useRef(new Map());
+  const chatFlexOuterModelCacheRef = useRef({ layoutJson: null, model: null });
+  const chatFlexProjectModelCacheRef = useRef({
+    layoutsByProjectId: {},
+    modelsByProjectId: {}
+  });
   const hubSettings = useMemo(
     () => normalizeHubSettings(hubState.settings, agentCapabilities),
     [hubState.settings, agentCapabilities]
@@ -3218,26 +3223,49 @@ function HubApp() {
       !chatFlexOuterLayoutReconciledJson.layout ||
       typeof chatFlexOuterLayoutReconciledJson.layout !== "object"
     ) {
+      chatFlexOuterModelCacheRef.current = { layoutJson: null, model: null };
       return null;
     }
+    const cachedOuterModel = chatFlexOuterModelCacheRef.current;
+    if (
+      cachedOuterModel.model &&
+      layoutJsonEquals(cachedOuterModel.layoutJson || null, chatFlexOuterLayoutReconciledJson || null)
+    ) {
+      return cachedOuterModel.model;
+    }
     try {
-      return Model.fromJson(chatFlexOuterLayoutReconciledJson);
+      const parsedModel = Model.fromJson(chatFlexOuterLayoutReconciledJson);
+      chatFlexOuterModelCacheRef.current = {
+        layoutJson: chatFlexOuterLayoutReconciledJson,
+        model: parsedModel
+      };
+      return parsedModel;
     } catch (err) {
       console.error("Failed to parse outer flex layout model.", err);
+      chatFlexOuterModelCacheRef.current = { layoutJson: null, model: null };
       return null;
     }
   }, [chatFlexOuterLayoutReconciledJson]);
-  const chatFlexProjectModelsByProjectId = useMemo(
-    () =>
-      buildProjectChatFlexModels(
-        chatFlexProjectLayoutsReconciledByProjectId,
-        (projectLayoutJson) => Model.fromJson(projectLayoutJson),
-        (projectId, err) => {
-          console.error(`Failed to parse project chat flex layout model for ${projectId}.`, err);
-        }
-      ),
-    [chatFlexProjectLayoutsReconciledByProjectId]
-  );
+  const chatFlexProjectModelsByProjectId = useMemo(() => {
+    const cachedProjectModels = chatFlexProjectModelCacheRef.current;
+    const nextProjectModels = buildProjectChatFlexModels(
+      chatFlexProjectLayoutsReconciledByProjectId,
+      (projectLayoutJson) => Model.fromJson(projectLayoutJson),
+      (projectId, err) => {
+        console.error(`Failed to parse project chat flex layout model for ${projectId}.`, err);
+      },
+      {
+        previousLayoutsByProjectId: cachedProjectModels.layoutsByProjectId,
+        previousModelsByProjectId: cachedProjectModels.modelsByProjectId,
+        areLayoutsEqual: layoutJsonEquals
+      }
+    );
+    chatFlexProjectModelCacheRef.current = {
+      layoutsByProjectId: chatFlexProjectLayoutsReconciledByProjectId,
+      modelsByProjectId: nextProjectModels
+    };
+    return nextProjectModels;
+  }, [chatFlexProjectLayoutsReconciledByProjectId]);
   const chatFlexLayoutThemeClass = useMemo(
     () => `flexlayout__theme_${resolveEffectiveTheme(themePreference)}`,
     [themePreference]

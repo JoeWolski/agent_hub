@@ -61,3 +61,49 @@ test("buildProjectChatFlexModels reports parse failures and continues", () => {
   assert.deepEqual(parseErrors, [{ projectId: "bad", message: "cannot parse invalid model" }]);
   assert.deepEqual(parsed, { good: { ok: true } });
 });
+
+test("buildProjectChatFlexModels reuses previous models when layouts are unchanged", () => {
+  const previousModel = { from: "cached" };
+  let parseCallCount = 0;
+  const parsed = buildProjectChatFlexModels(
+    {
+      alpha: { layout: { type: "row", children: [] } }
+    },
+    () => {
+      parseCallCount += 1;
+      return { from: "parsed" };
+    },
+    () => {},
+    {
+      previousLayoutsByProjectId: {
+        alpha: { layout: { type: "row", children: [] } }
+      },
+      previousModelsByProjectId: {
+        alpha: previousModel
+      }
+    }
+  );
+
+  assert.equal(parseCallCount, 0);
+  assert.equal(parsed.alpha, previousModel);
+});
+
+test("buildProjectChatFlexModels reparses when project layout changes", () => {
+  const parsed = buildProjectChatFlexModels(
+    {
+      alpha: { layout: { type: "row", children: [{ type: "tabset" }] } }
+    },
+    () => ({ from: "parsed" }),
+    () => {},
+    {
+      previousLayoutsByProjectId: {
+        alpha: { layout: { type: "row", children: [] } }
+      },
+      previousModelsByProjectId: {
+        alpha: { from: "cached" }
+      }
+    }
+  );
+
+  assert.deepEqual(parsed, { alpha: { from: "parsed" } });
+});

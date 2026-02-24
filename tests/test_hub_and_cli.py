@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 import json
 import os
 import queue
@@ -6772,6 +6773,40 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         self.assertEqual(post_response.json(), discovery_payload)
         read_capabilities.assert_called_once_with()
         start_discovery.assert_called_once_with()
+
+    def test_terminal_websocket_disconnect_during_backlog_send_detaches_listener(self) -> None:
+        app = self._build_app()
+        websocket_route = next(
+            (route for route in app.routes if getattr(route, "path", "") == "/api/chats/{chat_id}/terminal"),
+            None,
+        )
+        self.assertIsNotNone(websocket_route)
+        endpoint = websocket_route.endpoint
+        listener: queue.Queue[str | None] = queue.Queue(maxsize=1)
+
+        class DisconnectingWebSocket:
+            async def accept(self) -> None:
+                return None
+
+            async def send_text(self, _data: str) -> None:
+                raise hub_server.WebSocketDisconnect(code=1006)
+
+        with patch.object(
+            hub_server.HubState,
+            "chat",
+            return_value={"id": "chat-1"},
+        ), patch.object(
+            hub_server.HubState,
+            "attach_terminal",
+            return_value=(listener, "existing backlog"),
+        ), patch.object(
+            hub_server.HubState,
+            "detach_terminal",
+        ) as detach_terminal:
+            asyncio.run(endpoint(chat_id="chat-1", websocket=DisconnectingWebSocket()))
+
+        detach_terminal.assert_called_once_with("chat-1", listener)
+        self.assertIsNone(listener.get_nowait())
 
 
 class DockerEntrypointTests(unittest.TestCase):
