@@ -41,6 +41,7 @@ import { chatTerminalSocketStore } from "./chatTerminalSocketStore";
 import { terminalThemeForAppTheme } from "./theme";
 import {
   markPendingAutoConfigProjectFailed,
+  markPendingAutoConfigProjectCancelled,
   projectRowFromPendingAutoConfig,
   removePendingAutoConfigProject
 } from "./autoConfigProjects";
@@ -74,6 +75,7 @@ const CHAT_FLEX_PROJECT_LAYOUT_STORAGE_KEY = "agent_hub_chat_flexlayout_project_
 const CHAT_TERMINAL_COLLAPSE_STORAGE_KEY = "agent_hub_chat_terminal_collapse_v1";
 const DEFAULT_BASE_IMAGE_TAG = "ubuntu:24.04";
 const DEFAULT_AGENT_TYPE = "codex";
+const AUTO_CONFIG_CANCELLED_ERROR_TEXT = "Auto-configure was cancelled by user.";
 const DEFAULT_HUB_SETTINGS = {
   defaultAgentType: DEFAULT_AGENT_TYPE,
   chatLayoutEngine: DEFAULT_CHAT_LAYOUT_ENGINE
@@ -690,6 +692,10 @@ function SpinnerLabel({ text }) {
       <span>{text}</span>
     </>
   );
+}
+
+function isAutoConfigCancelledError(message) {
+  return /auto-configure was cancelled by user/i.test(String(message || ""));
 }
 
 async function fetchJson(url, options = {}) {
@@ -1613,6 +1619,7 @@ function HubApp() {
   const [pendingChatStarts, setPendingChatStarts] = useState({});
   const [pendingContainerRefreshes, setPendingContainerRefreshes] = useState({});
   const [pendingProjectChatCreates, setPendingProjectChatCreates] = useState({});
+  const [pendingAutoConfigCancels, setPendingAutoConfigCancels] = useState({});
   const [themePreference, setThemePreference] = useState(() => loadThemePreference());
   const [systemThemeIsDark, setSystemThemeIsDark] = useState(() => detectSystemPrefersDark());
   const [hubStateHydrated, setHubStateHydrated] = useState(false);
@@ -2595,13 +2602,70 @@ function HubApp() {
       refreshState().catch(() => {});
     } catch (err) {
       const message = err.message || String(err);
-      setPendingAutoConfigProjects((prev) => markPendingAutoConfigProjectFailed(prev, pendingProjectId, message));
+      if (isAutoConfigCancelledError(message)) {
+        setPendingAutoConfigProjects((prev) => markPendingAutoConfigProjectCancelled(
+          prev,
+          pendingProjectId,
+          AUTO_CONFIG_CANCELLED_ERROR_TEXT
+        ));
+        setError("");
+      } else {
+        setPendingAutoConfigProjects((prev) => markPendingAutoConfigProjectFailed(prev, pendingProjectId, message));
+      }
+      setPendingAutoConfigCancels((prev) => {
+        const next = { ...prev };
+        delete next[pendingProjectId];
+        return next;
+      });
       refreshState().catch(() => {});
     }
   }
 
   function handleDeletePendingAutoConfigProject(projectId) {
+    const normalizedProjectId = String(projectId || "");
+    if (!normalizedProjectId) {
+      return;
+    }
+    setPendingAutoConfigCancels((prev) => {
+      const next = { ...prev };
+      delete next[normalizedProjectId];
+      return next;
+    });
     setPendingAutoConfigProjects((prev) => removePendingAutoConfigProject(prev, projectId));
+  }
+
+  async function handleCancelPendingAutoConfigProject(projectId) {
+    const normalizedProjectId = String(projectId || "");
+    if (!normalizedProjectId) {
+      return;
+    }
+    setPendingAutoConfigCancels((prev) => ({ ...prev, [normalizedProjectId]: true }));
+    setError("");
+    try {
+      const response = await fetchJson("/api/projects/auto-configure/cancel", {
+        method: "POST",
+        body: JSON.stringify({ request_id: normalizedProjectId })
+      });
+      if (!response?.cancelled) {
+        setError(response?.active
+          ? "Unable to cancel the auto-configure request right now."
+          : "Auto-configure request not found.");
+        return;
+      }
+      setPendingAutoConfigProjects((prev) => markPendingAutoConfigProjectCancelled(
+        prev,
+        normalizedProjectId,
+        AUTO_CONFIG_CANCELLED_ERROR_TEXT
+      ));
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setPendingAutoConfigCancels((prev) => {
+        const next = { ...prev };
+        delete next[normalizedProjectId];
+        return next;
+      });
+    }
   }
 
   async function handleCreateProject(event) {
@@ -4866,7 +4930,14 @@ function HubApp() {
               {projectsForList.map((project) => {
                 if (project.is_auto_config_pending) {
                   const isFailed = String(project.build_status || "") === "failed";
-                  const statusLabel = isFailed ? "Auto configure failed" : "Auto configuring";
+                  const isCancelled = String(project.auto_config_status || "") === "cancelled";
+                  const isCancelling = Boolean(pendingAutoConfigCancels[project.id]);
+                  const statusLabel = isCancelled
+                    ? "Auto configure cancelled"
+                    : isFailed ? "Auto configure failed" : "Auto configuring";
+                  const showAutoConfigMeta = isCancelled
+                    ? "Auto configure cancelled. You can still save or edit the recommendation once generated."
+                    : "Running temporary analysis chat, then creating a configured project entry.";
                   return (
                     <article className="card project-card" key={project.id}>
                       <div className="project-head">
@@ -4882,7 +4953,7 @@ function HubApp() {
                         </span>
                       </div>
                       <div className="meta auto-config-meta">
-                        Running temporary analysis chat, then creating a configured project entry.
+                        {showAutoConfigMeta}
                       </div>
                       <ProjectBuildTerminal
                         title="Temporary analysis chat"
@@ -4894,19 +4965,32 @@ function HubApp() {
                       {isFailed ? (
                         <>
                           <div className="meta build-error">
-                            {project.build_error || "Auto configure failed before project creation completed."}
-                          </div>
-                          <div className="actions project-collapsed-actions">
-                            <button
-                              type="button"
-                              className="btn-danger project-collapsed-delete"
-                              onClick={() => handleDeletePendingAutoConfigProject(project.id)}
-                            >
-                              Delete project
-                            </button>
+                            {isCancelled
+                              ? (project.build_error || AUTO_CONFIG_CANCELLED_ERROR_TEXT)
+                              : (project.build_error || "Auto configure failed before project creation completed.")}
                           </div>
                         </>
                       ) : null}
+                      <div className="actions project-collapsed-actions">
+                        {isFailed ? (
+                          <button
+                            type="button"
+                            className="btn-danger project-collapsed-delete"
+                            onClick={() => handleDeletePendingAutoConfigProject(project.id)}
+                          >
+                            Delete project
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn-secondary project-collapsed-primary"
+                            onClick={() => handleCancelPendingAutoConfigProject(project.id)}
+                            disabled={isCancelling}
+                          >
+                            {isCancelling ? <SpinnerLabel text="Canceling..." /> : "Cancel"}
+                          </button>
+                        </>
+                      </div>
                     </article>
                   );
                 }
