@@ -47,7 +47,7 @@ DEFAULT_RUNTIME_COLORTERM = "truecolor"
 GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
 GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
 AGENT_HUB_SECRETS_DIR_NAME = "secrets"
-AGENT_HUB_GITHUB_CREDENTIALS_FILE_NAME = "github_credentials"
+AGENT_HUB_GIT_CREDENTIALS_DIR_NAME = "git_credentials"
 GIT_CREDENTIAL_DEFAULT_SCHEME = "https"
 GIT_CREDENTIAL_ALLOWED_SCHEMES = {"http", "https"}
 RUNTIME_IMAGE_BUILD_LOCK_DIR = Path(tempfile.gettempdir()) / "agent-cli-image-build-locks"
@@ -300,8 +300,8 @@ def _default_agent_hub_data_dir() -> Path:
     return Path.home() / ".local" / "share" / "agent-hub"
 
 
-def _default_agent_hub_github_credentials_file() -> Path:
-    return _default_agent_hub_data_dir() / AGENT_HUB_SECRETS_DIR_NAME / AGENT_HUB_GITHUB_CREDENTIALS_FILE_NAME
+def _default_agent_hub_git_credentials_dir() -> Path:
+    return _default_agent_hub_data_dir() / AGENT_HUB_SECRETS_DIR_NAME / AGENT_HUB_GIT_CREDENTIALS_DIR_NAME
 
 
 def _split_host_port(host: str) -> tuple[str, int | None]:
@@ -348,22 +348,41 @@ def _parse_git_credential_store_host(credential_line: str) -> tuple[str, str] | 
         return None
 
 
-def _discover_agent_hub_github_credentials() -> tuple[Path | None, str, str]:
-    credentials_path = _default_agent_hub_github_credentials_file()
-    if not credentials_path.is_file():
+def _discover_agent_hub_git_credentials() -> tuple[Path | None, str, str]:
+    credentials_dir = _default_agent_hub_git_credentials_dir()
+    if not credentials_dir.is_dir():
         return None, "", ""
 
+    candidates: list[Path] = []
     try:
-        with credentials_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                parsed = _parse_git_credential_store_host(line)
-                if parsed is None:
-                    continue
-                host, scheme = parsed
-                return credentials_path.resolve(), host, scheme
-    except (OSError, UnicodeError):
+        for path in credentials_dir.iterdir():
+            if not path.is_file():
+                continue
+            candidates.append(path)
+    except OSError:
+        return None, "", ""
+    if not candidates:
         return None, "", ""
 
+    def _sort_key(path: Path) -> tuple[float, str]:
+        try:
+            mtime = float(path.stat().st_mtime)
+        except OSError:
+            mtime = 0.0
+        return (mtime, path.name)
+
+    candidates.sort(key=_sort_key, reverse=True)
+    for credentials_path in candidates:
+        try:
+            with credentials_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    parsed = _parse_git_credential_store_host(line)
+                    if parsed is None:
+                        continue
+                    host, scheme = parsed
+                    return credentials_path.resolve(), host, scheme
+        except (OSError, UnicodeError):
+            continue
     return None, "", ""
 
 
@@ -1095,7 +1114,7 @@ def main(
         git_credential_scheme_value = _normalize_git_credential_scheme(git_credential_scheme)
 
     if git_credential_path is None and not git_credential_host_value:
-        discovered_path, discovered_host, discovered_scheme = _discover_agent_hub_github_credentials()
+        discovered_path, discovered_host, discovered_scheme = _discover_agent_hub_git_credentials()
         if discovered_path is not None and discovered_host:
             git_credential_path = discovered_path
             git_credential_host_value = discovered_host
