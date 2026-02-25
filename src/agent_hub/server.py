@@ -2830,18 +2830,24 @@ def _parse_json_object_from_text(raw_text: Any) -> dict[str, Any]:
         without_fence = re.sub(r"\s*```\s*$", "", without_fence)
         if without_fence.strip():
             candidates.append(without_fence.strip())
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        candidates.append(text[start : end + 1].strip())
 
     for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
+        candidate_text = str(candidate or "").strip()
+        if not candidate_text:
             continue
-        if isinstance(parsed, dict):
-            return parsed
+        idx = 0
+        while True:
+            start = candidate_text.find("{", idx)
+            if start < 0:
+                break
+            try:
+                parsed, _end = json.JSONDecoder().raw_decode(candidate_text, start)
+            except json.JSONDecodeError:
+                idx = start + 1
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+            idx = start + 1
     raise ValueError("invalid json object")
 
 

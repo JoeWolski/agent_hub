@@ -4662,6 +4662,15 @@ Gemini CLI
         self.assertEqual(payload["base_image_mode"], "tag")
         self.assertEqual(payload["base_image_value"], "ubuntu:22.04")
 
+    def test_parse_json_object_from_text_skips_traffic_and_parses_first_object(self) -> None:
+        payload = hub_server._parse_json_object_from_text(
+            "{\n  \"base_image_mode\": \"tag\",\n  \"base_image_value\": \"ubuntu:22.04\"\n}\n"
+            "tokens used\n16,579\n"
+            "{\n  \"base_image_mode\": \"repo_path\",\n  \"base_image_value\": \"docker/development/Dockerfile\"\n}"
+        )
+        self.assertEqual(payload["base_image_mode"], "tag")
+        self.assertEqual(payload["base_image_value"], "ubuntu:22.04")
+
     def test_normalize_auto_config_recommendation_adds_apt_update_and_cache_mount(self) -> None:
         workspace = self.tmp_path / "workspace-cache"
         workspace.mkdir(parents=True, exist_ok=True)
