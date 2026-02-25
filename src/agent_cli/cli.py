@@ -1180,6 +1180,13 @@ def _snapshot_runtime_image_for_provider(snapshot_tag: str, agent_provider: str)
     return f"agent-runtime-{_sanitize_tag_component(agent_provider)}-{_short_hash(snapshot_tag)}"
 
 
+def _snapshot_setup_runtime_image_for_snapshot(snapshot_tag: str) -> str:
+    normalized_snapshot_tag = str(snapshot_tag or "").strip()
+    if not normalized_snapshot_tag:
+        raise click.ClickException("Snapshot tag is required to resolve setup runtime image.")
+    return f"agent-runtime-setup-{_short_hash(normalized_snapshot_tag)}"
+
+
 def _runtime_image_build_lock_path(target_image: str) -> Path:
     digest = hashlib.sha256(str(target_image or "").encode("utf-8")).hexdigest()
     return RUNTIME_IMAGE_BUILD_LOCK_DIR / f"{digest}.lock"
@@ -1504,6 +1511,13 @@ def _resolve_base_image(
     default=False,
     help="Pass --no-alt-screen to codex when launching the agent.",
 )
+@click.option(
+    "--tty/--no-tty",
+    "allocate_tty",
+    default=True,
+    show_default=True,
+    help="Allocate a pseudo-TTY for docker run.",
+)
 @click.option("--resume", is_flag=True, default=False, help="Resume last session")
 @click.argument("container_args", nargs=-1)
 def main(
@@ -1538,6 +1552,7 @@ def main(
     snapshot_image_tag: str | None,
     prepare_snapshot_only: bool,
     no_alt_screen: bool,
+    allocate_tty: bool,
     resume: bool,
     container_args: tuple[str, ...],
 ) -> None:
@@ -1839,6 +1854,7 @@ def main(
 
     runtime_image = _default_runtime_image_for_provider(selected_agent_provider)
     if snapshot_tag:
+        setup_runtime_image = _snapshot_setup_runtime_image_for_snapshot(snapshot_tag)
         should_build_snapshot = not cached_snapshot_exists
         if should_build_snapshot:
             click.echo(
@@ -1849,7 +1865,7 @@ def main(
                 _validate_rw_mount(host_path, container_path, runtime_uid=uid, runtime_gid=gid)
             _ensure_runtime_image_built_if_missing(
                 base_image=ensure_selected_base_image(),
-                target_image=DEFAULT_SETUP_RUNTIME_IMAGE,
+                target_image=setup_runtime_image,
                 agent_provider=AGENT_PROVIDER_NONE,
             )
             script = (setup_script or "").strip() or ":"
@@ -1867,7 +1883,7 @@ def main(
                 "--entrypoint",
                 "bash",
                 *run_args,
-                DEFAULT_SETUP_RUNTIME_IMAGE,
+                setup_runtime_image,
                 "-lc",
                 setup_bootstrap_script,
             ]
@@ -1970,7 +1986,7 @@ def main(
             "run",
             "--rm",
             "-i",
-            "-t",
+            *(["-t"] if allocate_tty else []),
             "--tmpfs",
             TMP_DIR_TMPFS_SPEC,
             *runtime_run_args,
