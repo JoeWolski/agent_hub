@@ -6734,92 +6734,20 @@ class HubState:
 
                 recommendation: dict[str, Any] = {}
                 chat_result: dict[str, Any] = {}
-                retry_feedback = ""
-                for attempt in range(1, AUTO_CONFIG_BUILD_MAX_ATTEMPTS + 1):
-                    emit_auto_config_log(
-                        f"\nAuto-config recommendation attempt {attempt}/{AUTO_CONFIG_BUILD_MAX_ATTEMPTS}...\n"
-                    )
-                    if retry_feedback:
-                        chat_result = self._run_temporary_auto_config_chat(
-                            workspace,
-                            normalized_repo_url,
-                            resolved_branch,
-                            agent_type=resolved_agent_type,
-                            agent_args=normalized_agent_args,
-                            on_output=emit_auto_config_log if normalized_request_id else None,
-                            retry_feedback=retry_feedback,
-                            request_id=normalized_request_id,
-                        )
-                    else:
-                        chat_result = self._run_temporary_auto_config_chat(
-                            workspace,
-                            normalized_repo_url,
-                            resolved_branch,
-                            agent_type=resolved_agent_type,
-                            agent_args=normalized_agent_args,
-                            on_output=emit_auto_config_log if normalized_request_id else None,
-                            request_id=normalized_request_id,
-                        )
-                    recommendation = self._normalize_auto_config_recommendation(chat_result.get("payload") or {}, workspace)
-                    recommendation = self._apply_auto_config_repository_hints(recommendation, workspace)
-                    recommendation = self._normalize_auto_config_recommendation(recommendation, workspace)
-                    emit_auto_config_log(
-                        "Validating recommendation by building setup snapshot image...\n"
-                    )
-                    build_result = self._attempt_auto_config_recommendation_build(
-                        workspace,
-                        normalized_repo_url,
-                        resolved_branch,
-                        recommendation,
-                        attempt=attempt,
-                        on_output=emit_auto_config_log if normalized_request_id else None,
-                    )
-                    if build_result.get("ok"):
-                        snapshot_tag = str(build_result.get("snapshot_tag") or "").strip()
-                        if snapshot_tag:
-                            emit_auto_config_log(
-                                "Build validation passed for recommended settings "
-                                f"(snapshot: {snapshot_tag}).\n"
-                            )
-                        else:
-                            emit_auto_config_log("Build validation passed for recommended settings.\n")
-                        break
-
-                    failure_summary = str(build_result.get("summary") or "Snapshot build failed.")
-                    failing_command = str(build_result.get("failing_command") or "").strip()
-                    build_log_excerpt = str(build_result.get("build_log_excerpt") or "").strip()
-                    emit_auto_config_log(
-                        f"Build validation failed on attempt {attempt}/{AUTO_CONFIG_BUILD_MAX_ATTEMPTS}: "
-                        f"{failure_summary}\n"
-                    )
-                    if failing_command:
-                        emit_auto_config_log(f"Failing command: {failing_command}\n")
-                    if attempt >= AUTO_CONFIG_BUILD_MAX_ATTEMPTS:
-                        detail_lines = [
-                            f"Auto-configure could not produce a buildable setup after {AUTO_CONFIG_BUILD_MAX_ATTEMPTS} attempts.",
-                            f"Issue summary: {failure_summary}",
-                        ]
-                        if failing_command:
-                            detail_lines.append(f"Failing command: {failing_command}")
-                        if build_log_excerpt:
-                            detail_lines.extend(["Build log:", build_log_excerpt])
-                        failure_detail = "\n".join(detail_lines)
-                        emit_auto_config_log("\nAuto-config retry budget exhausted.\n")
-                        emit_auto_config_log(f"{failure_detail}\n")
-                        raise HTTPException(status_code=422, detail=failure_detail)
-
-                    retry_feedback_lines = [
-                        f"Attempt {attempt} of {AUTO_CONFIG_BUILD_MAX_ATTEMPTS} failed.",
-                        f"Failure summary: {failure_summary}",
-                    ]
-                    if failing_command:
-                        retry_feedback_lines.append(f"Failing command: {failing_command}")
-                    if build_log_excerpt:
-                        retry_feedback_lines.extend(["Build log excerpt:", build_log_excerpt])
-                    retry_feedback = "\n".join(retry_feedback_lines)
-                    emit_auto_config_log(
-                        "Retrying temporary analysis chat with build failure feedback.\n"
-                    )
+                emit_auto_config_log("Running temporary analysis chat...\n")
+                chat_result = self._run_temporary_auto_config_chat(
+                    workspace,
+                    normalized_repo_url,
+                    resolved_branch,
+                    agent_type=resolved_agent_type,
+                    agent_args=normalized_agent_args,
+                    on_output=emit_auto_config_log if normalized_request_id else None,
+                    request_id=normalized_request_id,
+                )
+                recommendation = self._normalize_auto_config_recommendation(chat_result.get("payload") or {}, workspace)
+                recommendation = self._apply_auto_config_repository_hints(recommendation, workspace)
+                recommendation = self._normalize_auto_config_recommendation(recommendation, workspace)
+                emit_auto_config_log("Auto-config recommendation discovery completed.\n")
         except HTTPException as exc:
             detail = str(exc.detail or f"HTTP {exc.status_code}")
             emit_auto_config_log(f"\nAuto-config failed: {detail}\n")
