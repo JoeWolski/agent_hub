@@ -7310,7 +7310,10 @@ class HubState:
             script_path=AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH,
         )
 
-        ext = ".json" if isinstance(agent_provider, agent_providers.ClaudeProvider) else ".toml"
+        ext = ".json" if isinstance(
+            agent_provider,
+            (agent_providers.ClaudeProvider, agent_providers.GeminiProvider),
+        ) else ".toml"
         runtime_config_path = self.chat_runtime_configs_dir / f"{chat_id}{ext}"
         _write_private_env_file(runtime_config_path, merged_text)
         return runtime_config_path
