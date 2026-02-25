@@ -3,6 +3,12 @@ Inspect the checked-out repository and recommend the exact project setup inputs 
 Run this process in read-only mode and do not execute build, test, packaging, or install commands.
 Prioritize project-provided development containers and CI Docker definitions over custom setup.
 
+Speed-first behavior:
+- Prefer fast, container-first discovery (devcontainer, docker-compose, CI Dockerfiles).
+- If a strong container signal is found, avoid broad extra discovery unless needed for unresolved bootstrap commands.
+- Do not impose hard file-count or command-count limits, but keep exploration minimal and deterministic.
+- If a previous build failure context is provided, make only the smallest targeted fix required by that context.
+
 Agent Hub project configuration semantics:
 - base_image_mode: 'tag' or 'repo_path'
   - 'tag': base_image_value is a Docker image tag.
@@ -25,6 +31,7 @@ Requirements:
 3) If no development container is provided, include only the minimal packages needed to fully develop the project.
 4) If setup installs apt packages, include `apt-get update` before apt installs unless an existing project container explicitly preserves apt lists and already includes the required packages.
 5) Inspect build tooling for deferred toolchain downloads and include the smallest build/bootstrap commands to fetch toolchains.
+   Focus bootstrap detection on explicit files such as `make.sh`, `env.sh`, `install_system_dependancies.sh`, and scripts with names like `bootstrap`, `setup`, or `ci`.
 6) Do not include compiler-cache mounts in default_ro_mounts/default_rw_mounts.
    - Agent Hub infers ccache/sccache mounts from build/toolchain signals in repository files.
 7) Do not include Docker daemon socket mounts (for example `/var/run/docker.sock`).
