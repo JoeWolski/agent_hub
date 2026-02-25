@@ -2774,6 +2774,45 @@ Gemini CLI
         self.assertEqual(captured["agent_args"], ["--model", hub_server.DEFAULT_CLAUDE_MODEL])
         self.assertEqual(result["id"], "chat-created")
 
+    def test_create_and_start_chat_drops_explicit_default_codex_model(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        captured: dict[str, object] = {}
+
+        def fake_create(
+            _: hub_server.HubState,
+            project_id: str,
+            profile: str | None,
+            ro_mounts: list[str],
+            rw_mounts: list[str],
+            env_vars: list[str],
+            agent_args: list[str] | None = None,
+            agent_type: str | None = None,
+        ) -> dict[str, str]:
+            del project_id, profile, ro_mounts, rw_mounts, env_vars
+            captured["agent_args"] = list(agent_args or [])
+            captured["agent_type"] = str(agent_type or "")
+            return {"id": "chat-created"}
+
+        with patch.object(hub_server.HubState, "create_chat", fake_create), patch.object(
+            hub_server.HubState, "start_chat", return_value={"id": "chat-created", "status": "running"}
+        ):
+            self.state.create_and_start_chat(project["id"], agent_type="codex", agent_args=["--model", "default"])
+
+        self.assertEqual(captured["agent_type"], "codex")
+        self.assertEqual(captured["agent_args"], [])
+
+        captured.clear()
+        with patch.object(hub_server.HubState, "create_chat", fake_create), patch.object(
+            hub_server.HubState, "start_chat", return_value={"id": "chat-created", "status": "running"}
+        ):
+            self.state.create_and_start_chat(project["id"], agent_type="codex", agent_args=["--model", "gpt-5.3-codex"])
+
+        self.assertEqual(captured["agent_args"], ["--model", "gpt-5.3-codex"])
+
     def test_create_and_start_chat_uses_configured_default_agent_type(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",

@@ -89,6 +89,22 @@ test("buildChatStartConfig includes codex model and reasoning flags", () => {
   });
 });
 
+test("buildChatStartConfig does not pass default codex model flag", () => {
+  const payload = buildChatStartConfig(
+    {
+      agentType: "codex",
+      model: "default",
+      reasoning: "default"
+    },
+    TEST_CAPABILITIES
+  );
+
+  assert.deepEqual(payload, {
+    agentType: "codex",
+    agentArgs: []
+  });
+});
+
 test("non-codex agents ignore reasoning mode and normalize invalid model selections", () => {
   const normalized = normalizeChatStartSettings(
     {

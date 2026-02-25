@@ -618,9 +618,55 @@ def _has_cli_option(args: list[str], *, long_option: str, short_option: str | No
     return any(_cli_arg_matches_option(str(arg), long_option=long_option, short_option=short_option) for arg in args)
 
 
+def _strip_explicit_codex_default_model(agent_args: list[str]) -> list[str]:
+    normalized_args = [str(arg) for arg in agent_args]
+    filtered: list[str] = []
+    skip_next = False
+    for index, arg in enumerate(normalized_args):
+        if skip_next:
+            skip_next = False
+            continue
+
+        if arg == "--model":
+            next_value = str(normalized_args[index + 1]).strip().lower() if index + 1 < len(normalized_args) else ""
+            if next_value != "default":
+                filtered.append(arg)
+            skip_next = index + 1 < len(normalized_args)
+            if not skip_next:
+                continue
+            continue
+
+        if arg.startswith("--model="):
+            _, _, value = arg.partition("=")
+            if str(value).strip().lower() != "default":
+                filtered.append(arg)
+            continue
+
+        if arg == "-m":
+            next_value = str(normalized_args[index + 1]).strip().lower() if index + 1 < len(normalized_args) else ""
+            if next_value != "default":
+                filtered.append(arg)
+            skip_next = index + 1 < len(normalized_args)
+            if not skip_next:
+                continue
+            continue
+
+        if arg.startswith("-m="):
+            _, _, value = arg.partition("=")
+            if str(value).strip().lower() != "default":
+                filtered.append(arg)
+            continue
+
+        filtered.append(arg)
+
+    return filtered
+
+
 def _apply_default_model_for_agent(agent_type: str, agent_args: list[str]) -> list[str]:
     normalized_args = [str(arg) for arg in agent_args if str(arg).strip()]
     if agent_type != AGENT_TYPE_CLAUDE:
+        if agent_type == AGENT_TYPE_CODEX:
+            return _strip_explicit_codex_default_model(normalized_args)
         return normalized_args
     if _has_cli_option(normalized_args, long_option="--model", short_option="-m"):
         return normalized_args
