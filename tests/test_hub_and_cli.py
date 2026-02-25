@@ -5354,6 +5354,18 @@ Gemini CLI
         self.assertEqual(temporary_chat.call_count, hub_server.AUTO_CONFIG_BUILD_MAX_ATTEMPTS)
         self.assertEqual(build_attempt.call_count, hub_server.AUTO_CONFIG_BUILD_MAX_ATTEMPTS)
 
+    def test_codex_exec_error_message_full_returns_complete_error_line(self) -> None:
+        long_error_line = (
+            "Command failed with exit code 1: docker run --rm -i -t --tmpfs /tmp:mode=1777,exec "
+            "--init --user 1002:1007 --gpus all --workdir /workspace/agent_hub --volume "
+            "/home/joew/.local/share/agent-hub/agent-hub-auto-config-eceu5-aaaaaaaa-bbbbbbbb-cccccccccccccccccccc"
+        )
+        detail = hub_server._codex_exec_error_message_full(
+            f"analysis output\n{long_error_line}"
+        )
+        self.assertEqual(detail, long_error_line)
+        self.assertNotIn("…", detail)
+
     def test_apply_auto_config_repository_hints_prefers_ci_dockerfile_and_make_target(self) -> None:
         workspace = self.tmp_path / "workspace-hints"
         (workspace / "ci" / "x86_docker").mkdir(parents=True, exist_ok=True)
