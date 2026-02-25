@@ -43,6 +43,7 @@ yarn-error.log*
 .env.*
 .python-version
 .codex-hub/
+tmp/
 *.log
 
 # Editor / OS noise

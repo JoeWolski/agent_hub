@@ -5678,6 +5678,8 @@ class CliEnvVarTests(unittest.TestCase):
         )
         self.assertIn("When a requested implementation fails, fail fast with a hard error.", prompt_content)
         self.assertIn("Do not swallow, mask, or ignore errors with permissive operators", prompt_content)
+        self.assertIn("under `/workspace/tmp`.", prompt_content)
+        self.assertNotIn("under `/tmp`.", prompt_content)
 
     def test_parse_env_var_valid(self) -> None:
         self.assertEqual(image_cli._parse_env_var("FOO=bar", "--env-var"), "FOO=bar")
