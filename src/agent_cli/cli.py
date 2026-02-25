@@ -63,6 +63,8 @@ AGENT_TOOLS_CHAT_ID_ENV = "AGENT_HUB_AGENT_TOOLS_CHAT_ID"
 AGENT_TOOLS_TOKEN_HEADER = "x-agent-hub-agent-tools-token"
 AGENT_TOOLS_MCP_RUNTIME_DIR_NAME = "agent_hub"
 AGENT_TOOLS_MCP_RUNTIME_FILE_NAME = "agent_tools_mcp.py"
+RECURSIVE_WORKSPACE_CHMOD_ENABLED = "1"
+RECURSIVE_WORKSPACE_CHMOD_DISABLED = "0"
 AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH = str(
     PurePosixPath(DEFAULT_CONTAINER_HOME)
     / ".codex"
@@ -1235,10 +1237,21 @@ def _runtime_image_build_lock(target_image: str) -> Iterator[None]:
         lock_handle.close()
 
 
-def _build_runtime_image(*, base_image: str, target_image: str, agent_provider: str) -> None:
+def _build_runtime_image(
+    *,
+    base_image: str,
+    target_image: str,
+    agent_provider: str,
+    recursive_workspace_chmod: bool = True,
+) -> None:
     click.echo(
         f"Building runtime image '{target_image}' from {DEFAULT_DOCKERFILE} "
         f"(base={base_image}, provider={agent_provider})"
+    )
+    recursive_workspace_chmod_value = (
+        RECURSIVE_WORKSPACE_CHMOD_ENABLED
+        if recursive_workspace_chmod
+        else RECURSIVE_WORKSPACE_CHMOD_DISABLED
     )
     _run(
         [
@@ -1250,6 +1263,8 @@ def _build_runtime_image(*, base_image: str, target_image: str, agent_provider: 
             f"BASE_IMAGE={base_image}",
             "--build-arg",
             f"AGENT_PROVIDER={agent_provider}",
+            "--build-arg",
+            f"RECURSIVE_WORKSPACE_CHMOD={recursive_workspace_chmod_value}",
             "-t",
             target_image,
             str(_repo_root()),
@@ -1258,7 +1273,13 @@ def _build_runtime_image(*, base_image: str, target_image: str, agent_provider: 
     )
 
 
-def _ensure_runtime_image_built_if_missing(*, base_image: str, target_image: str, agent_provider: str) -> None:
+def _ensure_runtime_image_built_if_missing(
+    *,
+    base_image: str,
+    target_image: str,
+    agent_provider: str,
+    recursive_workspace_chmod: bool = True,
+) -> None:
     if _docker_image_exists(target_image):
         return
     with _runtime_image_build_lock(target_image):
@@ -1268,6 +1289,7 @@ def _ensure_runtime_image_built_if_missing(*, base_image: str, target_image: str
             base_image=base_image,
             target_image=target_image,
             agent_provider=agent_provider,
+            recursive_workspace_chmod=recursive_workspace_chmod,
         )
 
 
@@ -1884,6 +1906,7 @@ def main(
                 base_image=ensure_selected_base_image(),
                 target_image=setup_runtime_image,
                 agent_provider=AGENT_PROVIDER_NONE,
+                recursive_workspace_chmod=True,
             )
             script = (setup_script or "").strip() or ":"
             setup_bootstrap_script = _build_snapshot_setup_shell_script(script)
@@ -1939,6 +1962,7 @@ def main(
                 base_image=snapshot_tag,
                 target_image=provider_snapshot_runtime_image,
                 agent_provider=selected_agent_provider,
+                recursive_workspace_chmod=False,
             )
             runtime_image = provider_snapshot_runtime_image
     elif prepare_snapshot_only:
@@ -1948,6 +1972,7 @@ def main(
             base_image=ensure_selected_base_image(),
             target_image=runtime_image,
             agent_provider=selected_agent_provider,
+            recursive_workspace_chmod=True,
         )
 
     if prepare_snapshot_only:

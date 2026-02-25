@@ -5916,11 +5916,16 @@ class CliEnvVarTests(unittest.TestCase):
     def test_agent_cli_dockerfile_precreates_workspace_config_dir_for_runtime_mounts(self) -> None:
         content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
 
+        self.assertIn("ARG RECURSIVE_WORKSPACE_CHMOD=1", content)
         self.assertIn("/workspace/.config", content)
         self.assertIn("/workspace/tmp", content)
+        self.assertIn(
+            'if [ "${RECURSIVE_WORKSPACE_CHMOD}" = "1" ]; then chmod -R 777 /workspace; fi',
+            content,
+        )
         self.assertLess(
             content.index("/workspace/.config"),
-            content.index("chmod -R 0777 /workspace"),
+            content.index('if [ "${RECURSIVE_WORKSPACE_CHMOD}" = "1" ]; then chmod -R 777 /workspace; fi'),
         )
 
     def test_agent_hub_dockerfile_uses_build_only_uv_project_environment(self) -> None:
@@ -6158,6 +6163,7 @@ class CliEnvVarTests(unittest.TestCase):
             assert runtime_build_cmd is not None
             self.assertIn("BASE_IMAGE=ubuntu:24.04", runtime_build_cmd)
             self.assertIn("AGENT_PROVIDER=none", runtime_build_cmd)
+            self.assertIn("RECURSIVE_WORKSPACE_CHMOD=1", runtime_build_cmd)
             setup_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
             self.assertIsNotNone(setup_cmd)
             assert setup_cmd is not None
@@ -7417,6 +7423,7 @@ class CliEnvVarTests(unittest.TestCase):
             assert build_cmd is not None
             self.assertIn(f"BASE_IMAGE={snapshot_tag}", build_cmd)
             self.assertIn("AGENT_PROVIDER=claude", build_cmd)
+            self.assertIn("RECURSIVE_WORKSPACE_CHMOD=0", build_cmd)
             run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
@@ -7474,6 +7481,7 @@ class CliEnvVarTests(unittest.TestCase):
             assert build_cmd is not None
             self.assertIn(f"BASE_IMAGE={snapshot_tag}", build_cmd)
             self.assertIn("AGENT_PROVIDER=gemini", build_cmd)
+            self.assertIn("RECURSIVE_WORKSPACE_CHMOD=0", build_cmd)
             run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
@@ -7494,10 +7502,17 @@ class CliEnvVarTests(unittest.TestCase):
             with lock:
                 return bool(image_ready["value"])
 
-        def fake_build_runtime_image(*, base_image: str, target_image: str, agent_provider: str) -> None:
+        def fake_build_runtime_image(
+            *,
+            base_image: str,
+            target_image: str,
+            agent_provider: str,
+            recursive_workspace_chmod: bool,
+        ) -> None:
             self.assertEqual(base_image, "snapshot:test")
             self.assertEqual(target_image, "agent-runtime-claude-test")
             self.assertEqual(agent_provider, image_cli.AGENT_PROVIDER_CLAUDE)
+            self.assertTrue(recursive_workspace_chmod)
             with lock:
                 build_calls.append(target_image)
             build_started.set()
