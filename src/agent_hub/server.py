@@ -2730,6 +2730,19 @@ def _codex_exec_error_message(output_text: str) -> str:
     return _short_summary(lines[-1], max_words=30, max_chars=220)
 
 
+def _codex_exec_error_message_full(output_text: str) -> str:
+    cleaned = ANSI_ESCAPE_RE.sub("", str(output_text or "")).replace("\r", "\n")
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if not lines:
+        return "Unknown error."
+    for line in reversed(lines):
+        if line.lower().startswith("error:"):
+            detail = line.split(":", 1)[1].strip()
+            if detail:
+                return detail
+    return lines[-1]
+
+
 def _codex_generate_chat_title(
     host_agent_home: Path,
     host_codex_dir: Path,
@@ -6543,7 +6556,7 @@ class HubState:
                 if self._is_auto_config_request_cancelled(normalized_request_id):
                     emit("\nAuto-config chat was cancelled by user.\n")
                     raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR)
-                detail = _codex_exec_error_message(output_text)
+                detail = _codex_exec_error_message_full(output_text)
                 raise HTTPException(status_code=502, detail=f"Temporary auto-config chat failed: {detail}")
 
             try:
