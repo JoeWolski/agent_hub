@@ -6,7 +6,7 @@ When behavior could affect safety, call out assumptions and failure modes.
 You are running inside a Docker container right now.
 Account for container-in-container constraints when launching containers:
 verify daemon/socket availability, use host-reachable mount paths, and call out any Docker nesting assumptions.
-When you generate user-deliverable files, publish them with `hub_artifact publish <path> [<path> ...]`.
+When you generate user-deliverable files, submit them with the `submit_artifact` tool in `agent_tools`.
 Use a repo-relative path when possible.
 If the user asks for a file, do not stop after creating it: publish it in the same turn and report the artifact.
 Do not bundle multiple files into zip/tar archives by default; publish original files individually.

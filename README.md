@@ -18,7 +18,7 @@ Codex and Claude web apps are strong hosted experiences. Agent Hub is for cases 
 - Mount local repos, logs, datasets, caches, and credentials directly into runtime containers.
 - Use deterministic setup snapshots (`setup script + image tag`) so new chats start from a known environment.
 - Keep chat execution isolated (one workspace + process per chat).
-- Publish files from inside the container with `hub_artifact`, then preview/download them in the hub UI with prompt-linked history.
+- Submit files from inside the container with the `submit_artifact` `agent_tools` MCP tool, then preview/download them in the hub UI with prompt-linked history.
 
 If you need strict runtime control and local data locality, this is a better fit than browser-only Codex/Claude workflows.
 
@@ -83,12 +83,12 @@ Important flags for quickstart:
 
 No manual artifact wiring is required for `agent_hub` chats:
 
-- `agent_hub` injects `AGENT_HUB_ARTIFACTS_URL` and `AGENT_HUB_ARTIFACT_TOKEN` into each chat runtime.
+- `agent_hub` injects `AGENT_HUB_AGENT_TOOLS_URL` and `AGENT_HUB_AGENT_TOOLS_TOKEN` into each chat runtime.
 - `agent_hub` passes its config file into each runtime as `~/.codex/config.toml` for Codex.
 - `agent_cli` loads shared core instructions from `SYSTEM_PROMPT.md`.
 - `agent_cli` injects those instructions into Codex via CLI config override, appends them to Claude via `--append-system-prompt`, and syncs the same shared context into Gemini's `~/.gemini/GEMINI.md`.
 - `agent_cli` appends project-doc bootstrap hints (from `config/agent.config.toml`) to the same shared prompt context for all providers.
-- The default `SYSTEM_PROMPT.md` already includes instructions telling the agent to publish requested deliverable files with `hub_artifact publish <path> [<path> ...]`.
+- The default `SYSTEM_PROMPT.md` already includes instructions telling the agent to publish requested deliverable files with the `submit_artifact` tool in `agent_tools`.
 
 ### Optional: install launchers in `~/.local/bin`
 
@@ -234,34 +234,34 @@ Common startup flags:
 - `--log-level`: hub logging verbosity.
 - `--reload`: dev reload mode.
 
-## `hub_artifact` (detailed)
+## `submit_artifact` (detailed)
 
-`hub_artifact` is the in-container uploader used by running chats:
+`submit_artifact` is provided by the `agent_tools` MCP server in each hub-launched chat.
 
-```bash
-hub_artifact publish <path> [<path> ...]
-```
+Typical single-file usage from the agent:
 
-Single-file display name override:
+- tool: `submit_artifact`
+- args: `{"path":"report.md","name":"Final Report"}`
 
-```bash
-hub_artifact publish report.md --name "Final Report"
-```
+Typical batch usage:
+
+- tool: `submit_artifact`
+- args: `{"paths":["outputs/*.png","logs/run.log"]}`
 
 Behavior:
 
-- Accepts files and flat directories (direct files only).
+- Accepts files, glob patterns, and flat directories (direct files only).
 - Rejects subdirectories.
-- Retries with exponential backoff.
-- Retries only failed files and does not re-upload files that already succeeded.
-- Returns per-file publish output and aggregate progress for large batches.
+- Retries failed files with exponential backoff.
+- Retries only failed files and does not resubmit files that already succeeded.
+- Uploads artifact contents into hub-managed storage so frontend download links remain valid if container files later move or are deleted.
 
 Environment requirements:
 
-- `AGENT_HUB_ARTIFACTS_URL`
-- `AGENT_HUB_ARTIFACT_TOKEN`
+- `AGENT_HUB_AGENT_TOOLS_URL`
+- `AGENT_HUB_AGENT_TOOLS_TOKEN`
 
-These are injected automatically when the chat was launched by `agent_hub`.
+These are injected automatically when the chat is launched by `agent_hub`.
 
 ## Docker-in-Docker notes
 

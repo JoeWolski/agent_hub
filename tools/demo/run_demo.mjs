@@ -527,9 +527,9 @@ function normalizeRealPath(value) {
   }
 }
 
-async function resolveArtifactTokenForWorkspace(workspacePath) {
+async function resolveAgentToolsTokenForWorkspace(workspacePath) {
   const normalizedWorkspace = normalizeRealPath(workspacePath);
-  logStep(`Resolving artifact token for workspace ${workspacePath}`);
+  logStep(`Resolving agent_tools token for workspace ${workspacePath}`);
   return waitFor(
     async () => {
       const list = runMaybe("docker", ["ps", "--format", "{{.ID}}"]);
@@ -567,7 +567,7 @@ async function resolveArtifactTokenForWorkspace(workspacePath) {
           continue;
         }
         const envList = Array.isArray(container?.Config?.Env) ? container.Config.Env : [];
-        const tokenEntry = envList.find((entry) => String(entry).startsWith("AGENT_HUB_ARTIFACT_TOKEN="));
+        const tokenEntry = envList.find((entry) => String(entry).startsWith("AGENT_HUB_AGENT_TOOLS_TOKEN="));
         if (!tokenEntry) {
           continue;
         }
@@ -581,7 +581,7 @@ async function resolveArtifactTokenForWorkspace(workspacePath) {
     {
       timeoutMs: 180_000,
       intervalMs: 1000,
-      label: `artifact token for workspace ${workspacePath}`
+      label: `agent_tools token for workspace ${workspacePath}`
     }
   );
 }
@@ -633,20 +633,37 @@ function createFakeArtifacts(workspacePath) {
   return [fakeImage, fakeView, fakeVideo];
 }
 
-async function publishArtifactsForChat({ baseUrl, chatId, workspacePath, repoRootPath }) {
-  const token = await resolveArtifactTokenForWorkspace(workspacePath);
-  const files = createFakeArtifacts(workspacePath);
-  logStep(`Publishing artifacts via hub_artifact (${files.map((file) => path.basename(file)).join(", ")})`);
-  const hubArtifact = path.join(repoRootPath, "docker", "agent_cli", "hub_artifact");
-  const artifactsUrl = `${baseUrl}/api/chats/${chatId}/artifacts/publish`;
-  runChecked("bash", [hubArtifact, "publish", ...files], {
-    cwd: repoRootPath,
-    env: envWithDisplay("", {
-      AGENT_HUB_ARTIFACTS_URL: artifactsUrl,
-      AGENT_HUB_ARTIFACT_TOKEN: token,
-      HUB_ARTIFACT_RETRY_DELAY_BASE_SEC: "0"
+async function submitArtifactForChat({ baseUrl, chatId, token, filePath, name = "" }) {
+  const response = await fetch(`${baseUrl}/api/chats/${chatId}/agent-tools/artifacts/submit`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${token}`,
+      "x-agent-hub-agent-tools-token": token
+    },
+    body: JSON.stringify({
+      path: filePath,
+      ...(name ? { name } : {})
     })
   });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`Artifact submit failed for ${filePath}: HTTP ${response.status} ${detail}`);
+  }
+  const payload = await response.json();
+  if (!payload || typeof payload !== "object" || !payload.artifact) {
+    throw new Error(`Artifact submit response was missing artifact payload for ${filePath}`);
+  }
+  return payload.artifact;
+}
+
+async function publishArtifactsForChat({ baseUrl, chatId, workspacePath }) {
+  const token = await resolveAgentToolsTokenForWorkspace(workspacePath);
+  const files = createFakeArtifacts(workspacePath);
+  logStep(`Submitting artifacts via agent_tools.submit_artifact (${files.map((file) => path.basename(file)).join(", ")})`);
+  for (const filePath of files) {
+    await submitArtifactForChat({ baseUrl, chatId, token, filePath });
+  }
   return files;
 }
 

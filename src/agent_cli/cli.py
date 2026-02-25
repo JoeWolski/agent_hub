@@ -721,26 +721,37 @@ def _start_agent_tools_runtime_bridge(
 
             def do_POST(self) -> None:  # noqa: N802
                 path = urllib.parse.urlsplit(self.path).path
-                if path not in {"/credentials/resolve", "/project-binding"}:
+                if path not in {"/credentials/resolve", "/project-binding", "/artifacts/submit"}:
                     self._send_json(404, {"detail": "Not found."})
                     return
                 try:
                     self._authorize()
                     payload = self._read_payload()
-                    mode = payload.get("mode")
-                    credential_ids = payload.get("credential_ids")
                     if path == "/credentials/resolve":
+                        mode = payload.get("mode")
+                        credential_ids = payload.get("credential_ids")
                         response = hub_state.resolve_agent_tools_session_credentials(
                             session_id=session_id,
                             mode=mode,
                             credential_ids=credential_ids,
                         )
-                    else:
+                    elif path == "/project-binding":
+                        mode = payload.get("mode")
+                        credential_ids = payload.get("credential_ids")
                         response = hub_state.attach_agent_tools_session_project_credentials(
                             session_id=session_id,
                             mode=mode,
                             credential_ids=credential_ids,
                         )
+                    else:
+                        response = {
+                            "artifact": hub_state.submit_session_artifact(
+                                session_id=session_id,
+                                token=self._request_token(),
+                                submitted_path=payload.get("path"),
+                                name=payload.get("name"),
+                            )
+                        }
                 except Exception as exc:
                     status_code, detail = self._http_detail(exc)
                     self._send_json(status_code, {"detail": detail})
@@ -792,7 +803,13 @@ def _start_agent_tools_runtime_bridge(
         if session_id:
             sessions_lock = getattr(hub_state, "_agent_tools_sessions_lock", None)
             sessions = getattr(hub_state, "_agent_tools_sessions", None)
-            if sessions_lock is not None and isinstance(sessions, dict):
+            remove_session = getattr(hub_state, "_remove_agent_tools_session", None)
+            if callable(remove_session):
+                try:
+                    remove_session(session_id)
+                except Exception:
+                    pass
+            elif sessions_lock is not None and isinstance(sessions, dict):
                 try:
                     with sessions_lock:
                         sessions.pop(session_id, None)
