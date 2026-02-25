@@ -434,6 +434,23 @@ function envRowsFromArray(entries) {
   return rows;
 }
 
+function isSensitiveEnvVarKey(key) {
+  return String(key || "").trim().toUpperCase() === "GH_TOKEN";
+}
+
+function redactedProjectEnvEntry(entry) {
+  const raw = String(entry || "");
+  const idx = raw.indexOf("=");
+  if (idx < 0) {
+    return raw;
+  }
+  const key = raw.slice(0, idx);
+  if (!isSensitiveEnvVarKey(key)) {
+    return raw;
+  }
+  return `${key}=********`;
+}
+
 function buildMountPayload(rows) {
   const roMounts = [];
   const rwMounts = [];
@@ -1310,6 +1327,7 @@ function EnvVarEditor({ rows, onChange }) {
               placeholder="KEY"
             />
             <input
+              type={isSensitiveEnvVarKey(row.key) ? "password" : "text"}
               value={row.value}
               onChange={(event) => updateRow(index, { value: event.target.value })}
               placeholder="VALUE"
@@ -5236,7 +5254,7 @@ function HubApp() {
                         <summary className="details-summary">Default environment variables ({defaultEnvCount})</summary>
                         <div className="details-list">
                           {defaultEnvVars.map((entry, idx) => (
-                            <div className="meta" key={`env-${project.id}-${idx}`}>{entry}</div>
+                            <div className="meta" key={`env-${project.id}-${idx}`}>{redactedProjectEnvEntry(entry)}</div>
                           ))}
                         </div>
                       </details>
