@@ -88,6 +88,7 @@
 ## Git safety
 
 - This repository uses a rebase-based workflow.
+- Use branch names in the format `<username>/<feature-name>` (for example: `JoeWolski/fix-build-regression`).
 - Keep each branch as a single commit at all times; amend or squash instead of stacking multiple commits.
 - If you find a feature branch contains multiple commits, collapse it to a single effective commit and use a sensible commit message that describes the resulting change.
 - Never use merges for branch updates or integration; rebase onto the latest default remote branch instead.

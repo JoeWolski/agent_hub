@@ -1735,6 +1735,7 @@ function HubApp() {
   const capabilitiesRefreshInFlightRef = useRef(false);
   const capabilitiesRefreshQueuedRef = useRef(false);
   const githubSetupResolutionRef = useRef("");
+  const projectDraftsRef = useRef({});
   const projectFirstSeenOrderRef = useRef(createFirstSeenOrderState());
   const chatFirstSeenOrderRef = useRef(createFirstSeenOrderState());
   const chatOrderAliasByServerIdRef = useRef(new Map());
@@ -2465,11 +2466,26 @@ function HubApp() {
     setCreateForm((prev) => ({ ...prev, ...patch }));
   }
 
+  function setProjectDraft(projectId, nextDraft) {
+    const normalizedProjectId = String(projectId || "").trim();
+    if (!normalizedProjectId) {
+      return;
+    }
+    const sanitizedDraft = { ...(nextDraft || {}) };
+    setProjectDrafts((prev) => ({ ...prev, [normalizedProjectId]: sanitizedDraft }));
+    projectDraftsRef.current = { ...projectDraftsRef.current, [normalizedProjectId]: sanitizedDraft };
+  }
+
   function updateProjectDraft(projectId, patch) {
-    setProjectDrafts((prev) => ({
-      ...prev,
-      [projectId]: { ...prev[projectId], ...patch }
-    }));
+    const normalizedProjectId = String(projectId || "").trim();
+    if (!normalizedProjectId) {
+      return;
+    }
+    const currentDraft = {
+      ...(projectDraftsRef.current[normalizedProjectId] || projectDrafts[normalizedProjectId] || {}),
+      ...(patch || {})
+    };
+    setProjectDraft(normalizedProjectId, currentDraft);
   }
 
   function updateProjectChatStartSettings(projectId, patch) {
@@ -2814,8 +2830,12 @@ function HubApp() {
     }
   }
 
-  async function persistProjectSettings(projectId) {
-    const draft = projectDrafts[projectId];
+  async function persistProjectSettings(projectId, draftOverride = null) {
+    const normalizedProjectId = String(projectId || "").trim();
+    if (!normalizedProjectId) {
+      throw new Error("Project id is required.");
+    }
+    const draft = draftOverride || projectDraftsRef.current[normalizedProjectId] || projectDrafts[normalizedProjectId];
     if (!draft) {
       throw new Error("Project draft is missing.");
     }
@@ -2836,18 +2856,18 @@ function HubApp() {
   }
 
   function handleEditProject(project) {
-    setProjectDrafts((prev) => ({
-      ...prev,
-      [project.id]: projectDraftFromProject(project)
-    }));
+    if (!project?.id) {
+      return;
+    }
+    setProjectDraft(project.id, projectDraftFromProject(project));
     setEditingProjects((prev) => ({ ...prev, [project.id]: true }));
   }
 
   function handleCancelProjectEdit(project) {
-    setProjectDrafts((prev) => ({
-      ...prev,
-      [project.id]: projectDraftFromProject(project)
-    }));
+    if (!project?.id) {
+      return;
+    }
+    setProjectDraft(project.id, projectDraftFromProject(project));
     setEditingProjects((prev) => ({ ...prev, [project.id]: false }));
   }
 
@@ -3040,13 +3060,20 @@ function HubApp() {
   }
 
   async function handleBuildProject(projectId) {
-    markProjectBuilding(projectId);
+    const normalizedProjectId = String(projectId || "").trim();
+    if (!normalizedProjectId) {
+      setError("Project id is required.");
+      return;
+    }
+    const project = projectsById.get(normalizedProjectId);
+    const draft = projectDraftsRef.current[normalizedProjectId] || projectDrafts[normalizedProjectId];
+    markProjectBuilding(normalizedProjectId);
     try {
-      await persistProjectSettings(projectId);
-      setEditingProjects((prev) => ({ ...prev, [projectId]: false }));
+      await persistProjectSettings(normalizedProjectId, draft || (project ? projectDraftFromProject(project) : null));
+      setEditingProjects((prev) => ({ ...prev, [normalizedProjectId]: false }));
       setPendingProjectBuilds((prev) => {
         const next = { ...prev };
-        delete next[projectId];
+        delete next[normalizedProjectId];
         return next;
       });
       setError("");
@@ -3054,7 +3081,7 @@ function HubApp() {
     } catch (err) {
       setPendingProjectBuilds((prev) => {
         const next = { ...prev };
-        delete next[projectId];
+        delete next[normalizedProjectId];
         return next;
       });
       setError(err.message || String(err));
