@@ -6253,6 +6253,71 @@ class CliEnvVarTests(unittest.TestCase):
             prompt_index = claude_args.index("--append-system-prompt")
             self.assertEqual(claude_args[prompt_index + 1], "manual system prompt")
 
+    def test_claude_resume_includes_runtime_flags_and_no_alt_screen(self) -> None:
+        from agent_cli import providers as agent_providers
+        provider = agent_providers.ClaudeProvider()
+        runtime_flags = ["--dangerously-skip-permissions", "--model", "opus", "--no-alt-screen"]
+        resume_cmd = provider.resume_shell_command(no_alt_screen=True, runtime_flags=runtime_flags)
+        self.assertIn("--dangerously-skip-permissions", resume_cmd)
+        self.assertIn("--model opus", resume_cmd)
+        self.assertIn("--no-alt-screen", resume_cmd)
+        self.assertIn("--continue", resume_cmd)
+
+    def test_gemini_resume_includes_runtime_flags_and_no_alt_screen(self) -> None:
+        from agent_cli import providers as agent_providers
+        provider = agent_providers.GeminiProvider()
+        runtime_flags = ["--yolo", "--no-sandbox", "--no-alt-screen"]
+        resume_cmd = provider.resume_shell_command(no_alt_screen=True, runtime_flags=runtime_flags)
+        self.assertIn("--yolo", resume_cmd)
+        self.assertIn("--no-sandbox", resume_cmd)
+        self.assertIn("--no-alt-screen", resume_cmd)
+        self.assertIn("--resume", resume_cmd)
+
+    def test_claude_runtime_flags_include_permission_mode_and_no_alt_screen(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-command",
+                        "claude",
+                        "--no-alt-screen",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            image_index = run_cmd.index(image_cli.CLAUDE_RUNTIME_IMAGE)
+            claude_args = run_cmd[image_index + 2 :]
+            self.assertIn("--permission-mode", claude_args)
+            self.assertIn("bypassPermissions", claude_args)
+            self.assertIn("--no-alt-screen", claude_args)
+
     def test_gemini_agent_command_uses_gemini_runtime_image(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

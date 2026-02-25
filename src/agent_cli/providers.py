@@ -170,6 +170,8 @@ class ClaudeProvider(AgentProvider):
 
         if not has_cli_option(parsed_args, long_option="--model", short_option="-m"):
             flags.extend(["--model", "opus"])
+        if not has_cli_option(parsed_args, long_option="--permission-mode"):
+            flags.extend(["--permission-mode", "bypassPermissions"])
         if not has_cli_option(parsed_args, long_option="--dangerously-skip-permissions"):
             flags.append("--dangerously-skip-permissions")
 
@@ -178,6 +180,9 @@ class ClaudeProvider(AgentProvider):
         )
         if shared_prompt_context and not has_explicit_system_prompt:
             flags.extend(["--append-system-prompt", shared_prompt_context])
+
+        if no_alt_screen:
+            flags.append("--no-alt-screen")
 
         return flags
 
@@ -189,8 +194,7 @@ class ClaudeProvider(AgentProvider):
     ) -> str:
         import shlex
         command_parts = ["claude"]
-        if no_alt_screen:
-            command_parts.append("--no-alt-screen")
+        command_parts.extend(str(flag) for flag in runtime_flags)
         resolved = " ".join(shlex.quote(part) for part in command_parts)
         return f"if {resolved} --continue; then :; else exec {resolved}; fi"
 
@@ -245,6 +249,10 @@ class GeminiProvider(AgentProvider):
             flags.append("--yolo")
         if not has_cli_option(parsed_args, long_option="--no-sandbox"):
             flags.append("--no-sandbox")
+
+        if no_alt_screen:
+            flags.append("--no-alt-screen")
+
         return flags
 
     def resume_shell_command(
@@ -255,8 +263,7 @@ class GeminiProvider(AgentProvider):
     ) -> str:
         import shlex
         command_parts = ["gemini"]
-        if no_alt_screen:
-            command_parts.append("--no-alt-screen")
+        command_parts.extend(str(flag) for flag in runtime_flags)
         resolved = " ".join(shlex.quote(part) for part in command_parts)
         return f"if {resolved} --resume; then :; else exec {resolved}; fi"
 
