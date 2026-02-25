@@ -1,6 +1,7 @@
 ARG BASE_IMAGE=ubuntu:24.04
 FROM ${BASE_IMAGE}
 ARG AGENT_PROVIDER=codex
+ARG RECURSIVE_WORKSPACE_CHMOD=1
 
 USER root
 
@@ -45,7 +46,7 @@ RUN if ! id -u agent >/dev/null 2>&1; then \
  && chmod 1777 /tmp \
  && mkdir -p /workspace/.cache/uv /workspace/.codex /workspace/.config /workspace/tmp \
  && chmod 777 /workspace/tmp \
- && chmod -R 777 /workspace
+ && if [ "${RECURSIVE_WORKSPACE_CHMOD}" = "1" ]; then chmod -R 777 /workspace; fi
 
 COPY docker/agent_cli/docker-entrypoint.py /usr/local/bin/docker-entrypoint.py
 RUN chmod +x /usr/local/bin/docker-entrypoint.py
