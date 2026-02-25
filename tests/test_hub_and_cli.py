@@ -5920,6 +5920,29 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn('AGENT_HUB_AGENT_TOOLS_PROJECT_ID = "project-test"', runtime_text)
             self.assertIn('AGENT_HUB_AGENT_TOOLS_CHAT_ID = "chat-test"', runtime_text)
 
+    def test_build_agent_tools_runtime_config_preserves_tui_animations_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = tmp_path / "agent.config.toml"
+            host_codex_dir = tmp_path / ".codex"
+            host_codex_dir.mkdir(parents=True, exist_ok=True)
+            config.write_text("model = 'test'\n\n[tui]\nanimations = false\n", encoding="utf-8")
+
+            runtime_config = image_cli._build_agent_tools_runtime_config(
+                config_path=config,
+                host_codex_dir=host_codex_dir,
+                agent_tools_env={
+                    "AGENT_HUB_AGENT_TOOLS_URL": "http://host.docker.internal:48123",
+                    "AGENT_HUB_AGENT_TOOLS_TOKEN": "test-token",
+                },
+                agent_provider=image_cli.agent_providers.CodexProvider(),
+                container_home="/workspace",
+            )
+
+            runtime_text = runtime_config.read_text(encoding="utf-8")
+            self.assertIn("[tui]", runtime_text)
+            self.assertIn("animations = false", runtime_text)
+
     def test_agent_cli_default_run_mounts_runtime_agent_tools_config_and_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
