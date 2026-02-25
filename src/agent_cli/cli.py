@@ -517,9 +517,9 @@ def _build_agent_tools_runtime_config(
     if not agent_tools_token:
         raise click.ClickException(f"Missing required {AGENT_TOOLS_TOKEN_ENV} for agent_tools MCP runtime config.")
 
-    container_home = str(PurePosixPath(agent_provider.get_mcp_config_mount_target("/")).parent.parent)
+    normalized_container_home = str(container_home or "").strip() or DEFAULT_CONTAINER_HOME
     mcp_script_path = str(
-        PurePosixPath(container_home)
+        PurePosixPath(normalized_container_home)
         / ".codex"
         / AGENT_TOOLS_MCP_RUNTIME_DIR_NAME
         / AGENT_TOOLS_MCP_RUNTIME_FILE_NAME
@@ -1802,7 +1802,7 @@ def main(
     try:
         runtime_bridge = _start_agent_tools_runtime_bridge(
             project_path=project_path,
-            host_codex_dir=host_agent_home / f".{agent_provider.name}",
+            host_codex_dir=host_codex_dir,
             config_path=config_path,
             system_prompt_path=system_prompt_path,
             parsed_env_vars=parsed_env_vars,
@@ -1811,11 +1811,27 @@ def main(
         )
         if runtime_bridge is not None:
             runtime_run_args = list(run_args)
-            if config_mount_entry in runtime_run_args and isinstance(agent_provider, agent_providers.CodexProvider):
-                mount_index = runtime_run_args.index(config_mount_entry)
-                runtime_run_args[mount_index] = f"{runtime_bridge.runtime_config_path}:{mcp_config_mount_target}"
-            else:
-                runtime_run_args.extend(["--volume", f"{runtime_bridge.runtime_config_path}:{mcp_config_mount_target}"])
+            runtime_mount = f"{runtime_bridge.runtime_config_path}:{mcp_config_mount_target}"
+            mcp_mount_target = agent_provider.get_mcp_config_mount_target(container_home_path)
+
+            replaced_mount = False
+            for index in range(len(runtime_run_args) - 1):
+                if runtime_run_args[index] != "--volume":
+                    continue
+                current_mount = str(runtime_run_args[index + 1])
+                # Docker mount syntax here is host:container[:mode]; host paths are absolute POSIX paths.
+                parts = current_mount.split(":")
+                if len(parts) < 2:
+                    continue
+                current_target = parts[1]
+                if current_target != mcp_mount_target:
+                    continue
+                runtime_run_args[index + 1] = runtime_mount
+                replaced_mount = True
+                break
+
+            if not replaced_mount:
+                runtime_run_args.extend(["--volume", runtime_mount])
             for runtime_env in runtime_bridge.env_vars:
                 runtime_run_args.extend(["--env", runtime_env])
 

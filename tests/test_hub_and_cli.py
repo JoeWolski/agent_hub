@@ -5915,10 +5915,47 @@ class CliEnvVarTests(unittest.TestCase):
 
             runtime_text = runtime_config.read_text(encoding="utf-8")
             self.assertIn("[mcp_servers.agent_tools.env]", runtime_text)
+            self.assertIn('args = ["/workspace/.codex/agent_hub/agent_tools_mcp.py"]', runtime_text)
             self.assertIn('AGENT_HUB_AGENT_TOOLS_URL = "http://host.docker.internal:48123"', runtime_text)
             self.assertIn('AGENT_HUB_AGENT_TOOLS_TOKEN = "test-token"', runtime_text)
             self.assertIn('AGENT_HUB_AGENT_TOOLS_PROJECT_ID = "project-test"', runtime_text)
             self.assertIn('AGENT_HUB_AGENT_TOOLS_CHAT_ID = "chat-test"', runtime_text)
+
+    def test_build_agent_tools_runtime_config_for_claude_uses_codex_mcp_script_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = tmp_path / "agent.config.toml"
+            host_codex_dir = tmp_path / ".codex"
+            host_codex_dir.mkdir(parents=True, exist_ok=True)
+            config.write_text("{\"test\":true}\n", encoding="utf-8")
+
+            runtime_config = image_cli._build_agent_tools_runtime_config(
+                config_path=config,
+                host_codex_dir=host_codex_dir,
+                agent_tools_env={
+                    "AGENT_HUB_AGENT_TOOLS_URL": "http://host.docker.internal:48123",
+                    "AGENT_HUB_AGENT_TOOLS_TOKEN": "test-token",
+                    "AGENT_HUB_AGENT_TOOLS_PROJECT_ID": "project-test",
+                    "AGENT_HUB_AGENT_TOOLS_CHAT_ID": "chat-test",
+                },
+                agent_provider=image_cli.agent_providers.ClaudeProvider(),
+                container_home="/workspace",
+            )
+
+            self.assertEqual(runtime_config.suffix, ".json")
+            runtime_text = runtime_config.read_text(encoding="utf-8")
+            parsed = json.loads(runtime_text)
+            mcp_server = parsed["mcpServers"]["agent_tools"]
+            self.assertEqual(mcp_server["command"], "python3")
+            self.assertEqual(mcp_server["args"], ["/workspace/.codex/agent_hub/agent_tools_mcp.py"])
+            self.assertEqual(
+                mcp_server["env"]["AGENT_HUB_AGENT_TOOLS_URL"],
+                "http://host.docker.internal:48123",
+            )
+            self.assertEqual(
+                mcp_server["env"]["AGENT_HUB_AGENT_TOOLS_TOKEN"],
+                "test-token",
+            )
 
     def test_build_agent_tools_runtime_config_preserves_tui_animations_false(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5926,7 +5963,7 @@ class CliEnvVarTests(unittest.TestCase):
             config = tmp_path / "agent.config.toml"
             host_codex_dir = tmp_path / ".codex"
             host_codex_dir.mkdir(parents=True, exist_ok=True)
-            config.write_text("model = 'test'\n\n[tui]\nanimations = false\n", encoding="utf-8")
+            config.write_text("model = 'test'\\n\\n[tui]\\nanimations = false\\n", encoding="utf-8")
 
             runtime_config = image_cli._build_agent_tools_runtime_config(
                 config_path=config,
@@ -5942,6 +5979,52 @@ class CliEnvVarTests(unittest.TestCase):
             runtime_text = runtime_config.read_text(encoding="utf-8")
             self.assertIn("[tui]", runtime_text)
             self.assertIn("animations = false", runtime_text)
+
+    def test_agent_cli_runtime_bridge_uses_codex_home_for_all_agent_providers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+            agent_home = tmp_path / "agent-home"
+
+            captured_paths: list[Path] = []
+
+            def fake_start_agent_tools_runtime_bridge(**kwargs: object) -> None:
+                captured_paths.append(Path(str(kwargs["host_codex_dir"])))
+                return None
+
+            runner = CliRunner()
+            for agent_command in ("codex", "claude", "gemini"):
+                with self.subTest(agent_command=agent_command):
+                    with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                        "agent_cli.cli._read_openai_api_key", return_value=None
+                    ), patch(
+                        "agent_cli.cli._build_runtime_image", return_value=None
+                    ), patch(
+                        "agent_cli.cli._start_agent_tools_runtime_bridge",
+                        side_effect=fake_start_agent_tools_runtime_bridge,
+                    ), patch(
+                        "agent_cli.cli._run", return_value=None
+                    ):
+                        result = runner.invoke(
+                            image_cli.main,
+                            [
+                                "--project",
+                                str(project),
+                                "--config-file",
+                                str(config),
+                                "--agent-home-path",
+                                str(agent_home),
+                                "--agent-command",
+                                agent_command,
+                            ],
+                        )
+
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertTrue(captured_paths, msg=f"runtime bridge was not called for {agent_command}")
+                    self.assertEqual(captured_paths[-1], (agent_home / ".codex").resolve())
 
     def test_agent_cli_default_run_mounts_runtime_agent_tools_config_and_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6007,6 +6090,80 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("AGENT_HUB_AGENT_TOOLS_TOKEN=test-token", run_cmd)
             self.assertIn("AGENT_HUB_AGENT_TOOLS_PROJECT_ID=", run_cmd)
             self.assertIn("AGENT_HUB_AGENT_TOOLS_CHAT_ID=agent_cli:test-session", run_cmd)
+            self.assertTrue(fake_bridge.closed)
+
+    def test_agent_cli_claude_runtime_bridge_replaces_default_claude_json_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            runtime_config = tmp_path / "runtime-agent-tools.json"
+            agent_home = tmp_path / "agent-home"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+            runtime_config.write_text("{}", encoding="utf-8")
+
+            class FakeBridge:
+                def __init__(self, runtime_path: Path):
+                    self.runtime_config_path = runtime_path
+                    self.env_vars = [
+                        "AGENT_HUB_AGENT_TOOLS_URL=http://host.docker.internal:48123",
+                        "AGENT_HUB_AGENT_TOOLS_TOKEN=test-token",
+                    ]
+                    self.closed = False
+
+                def close(self) -> None:
+                    self.closed = True
+
+            fake_bridge = FakeBridge(runtime_config)
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._start_agent_tools_runtime_bridge",
+                return_value=fake_bridge,
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-home-path",
+                        str(agent_home),
+                        "--agent-command",
+                        "claude",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+
+            runtime_mount = f"{runtime_config}:{image_cli.DEFAULT_CONTAINER_HOME}/.claude.json:ro"
+            default_mount = f"{(agent_home / '.claude.json').resolve()}:{image_cli.DEFAULT_CONTAINER_HOME}/.claude.json"
+
+            self.assertIn(runtime_mount, run_cmd)
+            self.assertNotIn(default_mount, run_cmd)
+            claude_json_mounts = [
+                str(entry)
+                for entry in run_cmd
+                if str(entry).endswith(f":{image_cli.DEFAULT_CONTAINER_HOME}/.claude.json")
+                or str(entry).endswith(f":{image_cli.DEFAULT_CONTAINER_HOME}/.claude.json:ro")
+            ]
+            self.assertEqual(claude_json_mounts, [runtime_mount])
             self.assertTrue(fake_bridge.closed)
 
     def test_no_alt_screen_flag_passes_through_to_codex_command(self) -> None:
