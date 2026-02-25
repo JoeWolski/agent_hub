@@ -998,8 +998,10 @@ def _run_logged(
     on_output: Callable[[str], None] | None = None,
 ) -> subprocess.CompletedProcess:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    command_line = " ".join(cmd)
+    start_time = time.monotonic()
     with log_path.open("a", encoding="utf-8", errors="ignore") as log_file:
-        start_line = f"$ {' '.join(cmd)}\n"
+        start_line = f"$ {command_line}\n"
         log_file.write(start_line)
         log_file.flush()
         if on_output is not None:
@@ -1023,13 +1025,30 @@ def _run_logged(
                     on_output(line)
             stdout.close()
         result = process.wait()
+        elapsed_ms = int((time.monotonic() - start_time) * 1000)
+        completion_line = f"$ exit_code={result} (elapsed_ms={elapsed_ms})\n"
+        log_file.write(completion_line)
         log_file.write("\n")
         log_file.flush()
         if on_output is not None:
+            on_output(completion_line)
             on_output("\n")
     completed = subprocess.CompletedProcess(cmd, result, "", "")
     if check and completed.returncode != 0:
+        command_name = command_line.split(" ", 1)[0] if command_line else "<unknown>"
+        LOGGER.warning(
+            "Command failed (snapshot task): command=%s exit_code=%s elapsed_ms=%s",
+            command_name,
+            completed.returncode,
+            elapsed_ms,
+        )
         raise HTTPException(status_code=400, detail=f"Command failed ({cmd[0]}) with exit code {completed.returncode}")
+    LOGGER.debug(
+        "Command completed (snapshot task): command=%s exit_code=%s elapsed_ms=%s",
+        command_line.split(" ", 1)[0] if command_line else "<unknown>",
+        completed.returncode,
+        elapsed_ms,
+    )
     return completed
 
 
@@ -8807,6 +8826,7 @@ class HubState:
 
         try:
             snapshot_tag = self._prepare_project_snapshot_for_project(project_copy, log_path=log_path)
+            LOGGER.debug("Project build snapshot command succeeded for project=%s snapshot=%s", project_id, snapshot_tag)
         except Exception as exc:
             state = self.load()
             current = state["projects"].get(project_id)

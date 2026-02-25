@@ -3619,6 +3619,73 @@ Gemini CLI
         self.assertNotIn("--base-docker-context", cmd)
         self.assertNotIn("--base-dockerfile", cmd)
 
+    def test_build_project_snapshot_fails_when_snapshot_command_fails(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://github.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+            base_image_mode="repo_path",
+            base_image_value="docker/base",
+        )
+
+        def failing_snapshot(*_args, **_kwargs) -> str:
+            raise HTTPException(status_code=400, detail="Command failed (uv) with exit code 1")
+
+        with patch.object(
+            hub_server.HubState,
+            "_prepare_project_snapshot_for_project",
+            side_effect=failing_snapshot,
+        ), patch("agent_hub.server._docker_image_exists", return_value=True) as image_exists:
+            result = self.state._build_project_snapshot(project["id"])
+            image_exists.assert_not_called()
+
+        refreshed = self.state.load()["projects"][project["id"]]
+        self.assertEqual(result["build_status"], "failed")
+        self.assertEqual(refreshed["build_status"], "failed")
+        self.assertEqual(refreshed["build_error"], "Command failed (uv) with exit code 1")
+
+    def test_run_logged_records_exit_status_in_build_log(self) -> None:
+        class FakeProcess:
+            def __init__(self, lines: list[str], returncode: int) -> None:
+                self.stdout = io.StringIO("".join(lines))
+                self.returncode = returncode
+
+            def wait(self) -> int:
+                return self.returncode
+
+        log_path = self.tmp_path / "run_logged.log"
+
+        with patch("agent_hub.server.subprocess.Popen", return_value=FakeProcess(["hello output\n"], 0)):
+            hub_server._run_logged(["uv", "run", "agent_hub"], log_path=log_path, check=True)
+
+        contents = log_path.read_text(encoding="utf-8")
+        self.assertIn("$ uv run agent_hub", contents)
+        self.assertIn("hello output", contents)
+        self.assertIn("$ exit_code=0", contents)
+
+    def test_run_logged_raises_and_logs_non_zero_exit(self) -> None:
+        class FakeProcess:
+            def __init__(self, lines: list[str], returncode: int) -> None:
+                self.stdout = io.StringIO("".join(lines))
+                self.returncode = returncode
+
+            def wait(self) -> int:
+                return self.returncode
+
+        log_path = self.tmp_path / "run_logged_failure.log"
+
+        with patch("agent_hub.server.subprocess.Popen", return_value=FakeProcess(["error line\n"], 7)), patch.object(
+            hub_server,
+            "LOGGER",
+        ) as fake_logger:
+            with self.assertRaises(HTTPException) as context:
+                hub_server._run_logged(["uv", "run", "agent_hub"], log_path=log_path, check=True)
+
+        contents = log_path.read_text(encoding="utf-8")
+        self.assertIn("$ exit_code=7", contents)
+        self.assertEqual(str(context.exception.detail), "Command failed (uv) with exit code 7")
+        self.assertTrue(fake_logger.warning.called)
+
     def test_delete_path_retries_after_permission_repair(self) -> None:
         path = self.tmp_path / "workspace-delete"
         path.mkdir(parents=True, exist_ok=True)
