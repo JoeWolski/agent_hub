@@ -1633,9 +1633,12 @@ def main(
             ),
         ]
 
-    config_mount_target = f"{container_home_path}/.codex/config.toml:ro"
-    mcp_config_mount_target = agent_provider.get_mcp_config_mount_target(container_home_path) + ":ro"
-    config_mount_entry = f"{config_path}:{config_mount_target}"
+    runtime_config_path = host_agent_home / f".{agent_provider.name}" / PurePosixPath(agent_provider.get_mcp_config_mount_target("/")).name
+    try:
+        _write_private_text_file(runtime_config_path, config_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise click.ClickException(f"Failed to materialize config to {runtime_config_path}: {exc}")
+
     run_args = [
         "--init",
         "--user",
@@ -1653,13 +1656,9 @@ def main(
         "--volume",
         f"{host_claude_dir}:{container_home_path}/.claude",
         "--volume",
-        f"{host_claude_json_file}:{container_home_path}/.claude.json",
-        "--volume",
         f"{host_claude_config_dir}:{container_home_path}/.config/claude",
         "--volume",
         f"{host_gemini_dir}:{container_home_path}/.gemini",
-        "--volume",
-        config_mount_entry,
         "--env",
         f"LOCAL_UMASK={local_umask}",
         "--env",
@@ -1810,12 +1809,9 @@ def main(
             container_home=container_home_path,
         )
         if runtime_bridge is not None:
-            runtime_run_args = list(run_args)
-            if config_mount_entry in runtime_run_args and isinstance(agent_provider, agent_providers.CodexProvider):
-                mount_index = runtime_run_args.index(config_mount_entry)
-                runtime_run_args[mount_index] = f"{runtime_bridge.runtime_config_path}:{mcp_config_mount_target}"
-            else:
-                runtime_run_args.extend(["--volume", f"{runtime_bridge.runtime_config_path}:{mcp_config_mount_target}"])
+            # The runtime bridge has already materialized the config file into the persistent directory
+            # (host_agent_home / .<provider> / <config_file_name>).
+            # Since the whole directory is mounted, we just need to add the environment variables.
             for runtime_env in runtime_bridge.env_vars:
                 runtime_run_args.extend(["--env", runtime_env])
 
