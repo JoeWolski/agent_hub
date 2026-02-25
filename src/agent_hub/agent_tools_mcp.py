@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import glob
 import json
 import os
 import sys
+import time
 import traceback
 import urllib.error
-import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
+
+SUBMIT_ARTIFACT_MAX_ATTEMPTS_ENV = "AGENT_TOOLS_SUBMIT_ARTIFACT_MAX_ATTEMPTS"
+SUBMIT_ARTIFACT_RETRY_DELAY_BASE_SEC_ENV = "AGENT_TOOLS_SUBMIT_ARTIFACT_RETRY_DELAY_BASE_SEC"
+SUBMIT_ARTIFACT_RETRY_DELAY_MAX_SEC_ENV = "AGENT_TOOLS_SUBMIT_ARTIFACT_RETRY_DELAY_MAX_SEC"
 
 TOOL_LIST = [
     {
@@ -60,6 +66,25 @@ TOOL_LIST = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "submit_artifact",
+        "description": (
+            "Submit one or more artifact files to Agent Hub for durable download links. "
+            "Accepts individual files, glob patterns, or flat directories."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "paths": {"type": "array", "items": {"type": "string"}},
+                "name": {"type": "string"},
+                "max_attempts": {"type": "integer"},
+                "retry_delay_base_sec": {"type": "integer"},
+                "retry_delay_max_sec": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -81,11 +106,12 @@ def _agent_tools_token() -> str:
 def _api_request(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
     base_url = _agent_tools_base_url()
     url = f"{base_url}{path}"
+    token = _agent_tools_token()
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "x-agent-hub-agent-tools-token": _agent_tools_token(),
-        "Authorization": f"Bearer {_agent_tools_token()}",
+        "x-agent-hub-agent-tools-token": token,
+        "Authorization": f"Bearer {token}",
         "User-Agent": "agent-tools-mcp/1.0",
     }
     data = None
@@ -125,6 +151,169 @@ def _tool_error(message: str) -> dict[str, Any]:
     }
 
 
+def _positive_int(value: Any, *, field_name: str, minimum: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{field_name} must be an integer >= {minimum}.") from exc
+    if parsed < minimum:
+        raise RuntimeError(f"{field_name} must be an integer >= {minimum}.")
+    return parsed
+
+
+def _non_negative_int(value: Any, *, field_name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{field_name} must be an integer >= 0.") from exc
+    if parsed < 0:
+        raise RuntimeError(f"{field_name} must be an integer >= 0.")
+    return parsed
+
+
+def _submitted_artifact_paths(arguments: dict[str, Any]) -> list[str]:
+    submitted: list[str] = []
+    raw_path = arguments.get("path")
+    if raw_path is not None:
+        normalized = str(raw_path).strip()
+        if normalized:
+            submitted.append(normalized)
+
+    raw_paths = arguments.get("paths")
+    if raw_paths is not None and not isinstance(raw_paths, list):
+        raise RuntimeError("paths must be an array of strings.")
+    if isinstance(raw_paths, list):
+        for index, value in enumerate(raw_paths):
+            if not isinstance(value, str):
+                raise RuntimeError(f"paths[{index}] must be a string.")
+            normalized = value.strip()
+            if normalized:
+                submitted.append(normalized)
+
+    if not submitted:
+        raise RuntimeError("submit_artifact requires at least one path via path or paths.")
+    return submitted
+
+
+def _expand_artifact_file_paths(submitted_paths: list[str]) -> list[Path]:
+    upload_paths: list[Path] = []
+    for submitted in submitted_paths:
+        candidates = [submitted]
+        if any(char in submitted for char in "*?["):
+            matches = sorted(glob.glob(submitted))
+            if not matches:
+                raise RuntimeError(f"Artifact file not found: {submitted}")
+            candidates = matches
+
+        for raw_candidate in candidates:
+            candidate = Path(raw_candidate).expanduser()
+            if candidate.is_dir():
+                entries = sorted(candidate.iterdir(), key=lambda item: item.name)
+                for entry in entries:
+                    if entry.is_dir():
+                        raise RuntimeError(f"Subdirectories are not supported for artifact submit: {entry}")
+                    if not entry.is_file():
+                        raise RuntimeError(f"Artifact path is not a regular file: {entry}")
+                    upload_paths.append(entry.resolve())
+                continue
+
+            if not candidate.exists():
+                raise RuntimeError(f"Artifact file not found: {raw_candidate}")
+            if not candidate.is_file():
+                raise RuntimeError(f"Artifact path is not a regular file: {raw_candidate}")
+            upload_paths.append(candidate.resolve())
+
+    if not upload_paths:
+        raise RuntimeError("No files found to submit.")
+    return upload_paths
+
+
+def _submit_artifact_path(path: Path, *, name: str = "") -> dict[str, Any]:
+    payload: dict[str, Any] = {"path": str(path)}
+    if name:
+        payload["name"] = name
+    response = _api_request("/artifacts/submit", method="POST", payload=payload)
+    artifact_payload = response.get("artifact") if isinstance(response, dict) else None
+    if not isinstance(artifact_payload, dict):
+        raise RuntimeError(f"agent_tools artifact submit response missing artifact payload for {path}")
+    return artifact_payload
+
+
+def _retry_delay_seconds(attempt: int, base_delay_seconds: int, max_delay_seconds: int) -> int:
+    if base_delay_seconds <= 0:
+        return 0
+    scaled = base_delay_seconds * (2 ** max(0, attempt - 1))
+    return min(max_delay_seconds, scaled)
+
+
+def _submit_artifacts(arguments: dict[str, Any]) -> dict[str, Any]:
+    submitted_paths = _submitted_artifact_paths(arguments)
+    upload_paths = _expand_artifact_file_paths(submitted_paths)
+    submitted_name = str(arguments.get("name") or "").strip()
+    if submitted_name and len(upload_paths) != 1:
+        raise RuntimeError("--name can only be used when submitting exactly one file.")
+
+    max_attempts = _positive_int(
+        arguments.get("max_attempts", os.environ.get(SUBMIT_ARTIFACT_MAX_ATTEMPTS_ENV, "8")),
+        field_name="max_attempts",
+        minimum=1,
+    )
+    retry_delay_base_sec = _non_negative_int(
+        arguments.get("retry_delay_base_sec", os.environ.get(SUBMIT_ARTIFACT_RETRY_DELAY_BASE_SEC_ENV, "1")),
+        field_name="retry_delay_base_sec",
+    )
+    retry_delay_max_sec = _non_negative_int(
+        arguments.get("retry_delay_max_sec", os.environ.get(SUBMIT_ARTIFACT_RETRY_DELAY_MAX_SEC_ENV, "30")),
+        field_name="retry_delay_max_sec",
+    )
+
+    submitted_artifacts: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+
+    for path in upload_paths:
+        per_file_name = submitted_name if len(upload_paths) == 1 else ""
+        last_error = ""
+        for attempt in range(1, max_attempts + 1):
+            try:
+                artifact_payload = _submit_artifact_path(path, name=per_file_name)
+                submitted_artifacts.append(artifact_payload)
+                last_error = ""
+                break
+            except Exception as exc:  # pragma: no cover - error branches are tested via higher-level outcomes.
+                last_error = str(exc)
+                if attempt >= max_attempts:
+                    break
+                delay_seconds = _retry_delay_seconds(attempt, retry_delay_base_sec, retry_delay_max_sec)
+                if delay_seconds > 0:
+                    time.sleep(delay_seconds)
+
+        if last_error:
+            failures.append(
+                {
+                    "path": str(path),
+                    "error": last_error,
+                }
+            )
+
+    result = {
+        "artifacts": submitted_artifacts,
+        "processed_count": len(upload_paths),
+        "succeeded_count": len(submitted_artifacts),
+        "failed_count": len(failures),
+        "failed_paths": [entry["path"] for entry in failures],
+    }
+    if failures:
+        failure_payload = json.dumps(
+            {
+                "failed_count": len(failures),
+                "failures": failures,
+            },
+            sort_keys=True,
+        )
+        raise RuntimeError(f"submit_artifact failed: {failure_payload}")
+    return result
+
+
 def _handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name == "credentials_list":
         payload = _api_request("/credentials", method="GET")
@@ -142,6 +331,9 @@ def _handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             "credential_ids": arguments.get("credential_ids") or [],
         }
         payload = _api_request("/project-binding", method="POST", payload=body)
+        return _tool_response(payload)
+    if name == "submit_artifact":
+        payload = _submit_artifacts(arguments)
         return _tool_response(payload)
     return _tool_error(f"Unsupported tool: {name}")
 
@@ -235,4 +427,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

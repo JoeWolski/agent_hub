@@ -22,7 +22,7 @@ config_file="${AGENT_HUB_CONFIG_FILE:-${shared_root}/config/agent.config.toml}"
 home_dir="${AGENT_HUB_HOME:-${shared_root}/home}"
 host="${AGENT_HUB_HOST:-0.0.0.0}"
 port="${AGENT_HUB_PORT:-8765}"
-artifact_base_url="${AGENT_HUB_ARTIFACT_PUBLISH_BASE_URL:-http://host.docker.internal:${port}}"
+artifact_base_url="${AGENT_ARTIFACT_PUBLISH_BASE_URL:-http://host.docker.internal:${port}}"
 frontend_build="${AGENT_HUB_FRONTEND_BUILD:-0}"
 
 mkdir -p "${data_dir}" "$(dirname "${config_file}")" "${home_dir}"

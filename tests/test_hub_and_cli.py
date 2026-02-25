@@ -34,6 +34,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import agent_hub.server as hub_server
+import agent_hub.agent_tools_mcp as agent_tools_mcp
 import agent_cli.cli as image_cli
 
 
@@ -176,6 +177,12 @@ class HubStateTests(unittest.TestCase):
             return str(session.state)
 
     def tearDown(self) -> None:
+        state_obj = getattr(self, "state", None)
+        if state_obj is not None:
+            startup_thread = getattr(state_obj, "_startup_reconcile_thread", None)
+            if startup_thread is not None and startup_thread.is_alive():
+                startup_thread.join(timeout=2.0)
+        self.state = None  # type: ignore[assignment]
         self.github_env_patcher.stop()
         self.snapshot_patcher.stop()
         self.schedule_patcher.stop()
@@ -2052,10 +2059,10 @@ Gemini CLI
         self.assertIn("FOO=bar", cmd)
         self.assertIn("EMPTY=", cmd)
         self.assertIn(
-            f"AGENT_HUB_ARTIFACTS_URL=http://host.docker.internal:{hub_server.DEFAULT_PORT}/api/chats/{chat['id']}/artifacts/publish",
+            f"AGENT_ARTIFACTS_URL=http://host.docker.internal:{hub_server.DEFAULT_PORT}/api/chats/{chat['id']}/artifacts/publish",
             cmd,
         )
-        self.assertIn("AGENT_HUB_ARTIFACT_TOKEN=artifact-token-test", cmd)
+        self.assertIn("AGENT_ARTIFACT_TOKEN=artifact-token-test", cmd)
         self.assertIn("--snapshot-image-tag", cmd)
         self.assertIn(self.state._project_setup_snapshot_tag(project), cmd)
         self.assertIn("--", cmd)
@@ -2675,7 +2682,7 @@ Gemini CLI
             self.state.start_chat(chat["id"])
 
         self.assertIn(
-            f"AGENT_HUB_ARTIFACTS_URL=http://172.17.0.4:8765/hub/api/chats/{chat['id']}/artifacts/publish",
+            f"AGENT_ARTIFACTS_URL=http://172.17.0.4:8765/hub/api/chats/{chat['id']}/artifacts/publish",
             captured["cmd"],
         )
         self.assertIn("--system-prompt-file", captured["cmd"])
@@ -2773,6 +2780,8 @@ Gemini CLI
             listed[0]["preview_url"],
             f"/api/chats/{chat['id']}/artifacts/{artifact['id']}/preview",
         )
+        stored_artifact = self.state.load()["chats"][chat["id"]]["artifacts"][0]
+        self.assertTrue(str(stored_artifact.get("storage_relative_path") or ""))
 
         payload = self.state.state_payload()
         chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
@@ -2811,8 +2820,46 @@ Gemini CLI
             name="plot output",
         )
         preview_path, media_type = self.state.resolve_chat_artifact_preview(chat["id"], artifact["id"])
-        self.assertEqual(preview_path, artifact_file.resolve())
+        self.assertTrue(str(preview_path).startswith(str(self.state.artifacts_dir.resolve())))
+        self.assertTrue(preview_path.exists())
         self.assertEqual(media_type, "image/png")
+
+    def test_submit_chat_artifact_persists_copy_after_workspace_file_is_deleted(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        workspace = self.state.chat_workdir(chat["id"])
+        workspace.mkdir(parents=True, exist_ok=True)
+        artifact_file = workspace / "results.log"
+        artifact_file.write_text("steady-state output\n", encoding="utf-8")
+
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["agent_tools_token_hash"] = hub_server._hash_agent_tools_token("agent-tools-token")
+        state_data["chats"][chat["id"]]["agent_tools_token_issued_at"] = "2026-02-21T00:00:00Z"
+        self.state.save(state_data)
+
+        artifact = self.state.submit_chat_artifact(
+            chat_id=chat["id"],
+            token="agent-tools-token",
+            submitted_path="results.log",
+            name="Run Output",
+        )
+        artifact_file.unlink()
+
+        download_path, filename, media_type = self.state.resolve_chat_artifact_download(chat["id"], artifact["id"])
+        self.assertTrue(str(download_path).startswith(str(self.state.artifacts_dir.resolve())))
+        self.assertEqual(filename, "Run Output")
+        self.assertEqual(media_type, "application/octet-stream")
+        self.assertEqual(download_path.read_text(encoding="utf-8"), "steady-state output\n")
 
     def test_record_chat_title_prompt_archives_current_artifacts_by_previous_prompt(self) -> None:
         project = self.state.add_project(
@@ -3325,6 +3372,9 @@ Gemini CLI
         chat_workspace.mkdir(parents=True, exist_ok=True)
         project_workspace.mkdir(parents=True, exist_ok=True)
         self.state.chat_log(chat["id"]).write_text("log", encoding="utf-8")
+        chat_artifact_root = self.state.chat_artifacts_dir / chat["id"]
+        chat_artifact_root.mkdir(parents=True, exist_ok=True)
+        (chat_artifact_root / "artifact.txt").write_text("payload", encoding="utf-8")
 
         state_before = self.state.load()
         state_before["projects"][project["id"]]["setup_snapshot_image"] = "project-snapshot"
@@ -3346,9 +3396,16 @@ Gemini CLI
         self.assertTrue(self.state.chat_dir.exists())
         self.assertTrue(self.state.project_dir.exists())
         self.assertTrue(self.state.log_dir.exists())
+        self.assertTrue(self.state.artifacts_dir.exists())
         self.assertEqual(list(self.state.chat_dir.iterdir()), [])
         self.assertEqual(list(self.state.project_dir.iterdir()), [])
         self.assertEqual(list(self.state.log_dir.iterdir()), [])
+        self.assertEqual(
+            sorted(self.state.artifacts_dir.iterdir()),
+            sorted([self.state.chat_artifacts_dir, self.state.session_artifacts_dir]),
+        )
+        self.assertEqual(list(self.state.chat_artifacts_dir.iterdir()), [])
+        self.assertEqual(list(self.state.session_artifacts_dir.iterdir()), [])
 
         docker_rm.assert_called_once()
         prefixes, tags = docker_rm.call_args[0]
@@ -4022,7 +4079,7 @@ Gemini CLI
         )
         self.state.chat_log(chat["id"]).write_text(
             (
-                "• Ran hub_artifact publish empty_test_files/*\n"
+                "• Ran submit_artifact for empty_test_files/*\n"
                 "  └ Artifact published: test.bash (/api/chats/test/artifacts/a/download)\n"
                 "    Artifact published: test.bat (/api/chats/test/artifacts/b/download)\n"
                 "    … +113 lines\n"
@@ -4033,7 +4090,7 @@ Gemini CLI
                 "\n"
                 "• Created 113 empty test files under empty_test_files/ (named like test.<ext>, spanning common code, config, doc, data, media, and archive extensions).\n"
                 "\n"
-                "  Published artifacts: 113/113 succeeded via hub_artifact publish empty_test_files/*.\n"
+                "  Published artifacts: 113/113 succeeded via submit_artifact for empty_test_files/*.\n"
                 "\n"
                 "› Explain this codebase\n"
             ),
@@ -4240,7 +4297,7 @@ Gemini CLI
             (
                 "• Files are generated under example_files/common_extensions (155 files total).\n"
                 "\n"
-                "• Ran hub_artifact publish example_files/common_extensions\n"
+                "• Ran submit_artifact for example_files/common_extensions\n"
                 "  └ Artifact published: Dockerfile (/api/chats/test/artifacts/a/download)\n"
                 "    Artifact upload progress: 155/155 processed; 155 succeeded; 0 failed.\n"
                 "    Published 155 artifacts.\n"
@@ -5575,330 +5632,196 @@ Gemini CLI
         self.assertIn(stopped_chat["id"], post["chats"])
 
 
-class HubArtifactCommandTests(unittest.TestCase):
+class AgentToolsSubmitArtifactToolTests(unittest.TestCase):
     @staticmethod
-    def _temporary_exec_dir() -> tempfile.TemporaryDirectory[str]:
-        # Some containerized test environments mount /tmp with noexec.
-        return tempfile.TemporaryDirectory(dir=ROOT)
+    def _artifact_payload(path_value: str, name_value: str = "") -> dict[str, Any]:
+        resolved = Path(path_value)
+        artifact_name = name_value or resolved.name or "artifact"
+        return {
+            "artifact": {
+                "id": f"artifact-{artifact_name}",
+                "name": artifact_name,
+                "relative_path": path_value,
+                "download_url": f"/download/{artifact_name}",
+            }
+        }
 
-    def _make_fake_curl(self, fake_bin: Path) -> Path:
-        fake_bin.mkdir(parents=True, exist_ok=True)
-        curl_script = fake_bin / "curl"
-        curl_script.write_text(
-            """#!/usr/bin/env bash
-set -euo pipefail
-
-payload=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --data)
-      payload="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-
-if [[ -z "${payload}" ]]; then
-  echo "missing --data payload" >&2
-  exit 2
-fi
-
-printf '%s\\n' "${payload}" >> "${HUB_ARTIFACT_CURL_LOG:?}"
-
-python3 - "${payload}" <<'PY'
-import json
-import os
-import sys
-from pathlib import Path
-
-body = json.loads(sys.argv[1])
-path = str(body.get("path") or "")
-fail_once_path = str(os.environ.get("HUB_ARTIFACT_FAIL_ONCE_PATH") or "")
-fail_once_marker = str(os.environ.get("HUB_ARTIFACT_FAIL_ONCE_MARKER") or "")
-always_fail_path = str(os.environ.get("HUB_ARTIFACT_ALWAYS_FAIL_PATH") or "")
-
-if always_fail_path and path == always_fail_path:
-    print(f"simulated upload failure for {path}", file=sys.stderr)
-    sys.exit(75)
-
-if fail_once_path and path == fail_once_path and fail_once_marker:
-    marker = Path(fail_once_marker)
-    if not marker.exists():
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("failed-once", encoding="utf-8")
-        print(f"simulated transient upload failure for {path}", file=sys.stderr)
-        sys.exit(75)
-
-name = str(body.get("name") or Path(path).name or "artifact")
-print(json.dumps({
-    "artifact": {
-        "name": name,
-        "relative_path": path,
-        "download_url": f"/download/{name}",
-    }
-}))
-PY
-""",
-            encoding="utf-8",
-        )
-        curl_script.chmod(0o755)
-        return curl_script
-
-    def _run_publish(self, *args: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["bash", str(ROOT / "docker" / "agent_cli" / "hub_artifact"), "publish", *args],
-            cwd=ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-    def test_hub_artifact_publish_accepts_file_list(self) -> None:
-        with self._temporary_exec_dir() as tmp:
+    def test_submit_artifact_accepts_file_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             file_one = tmp_path / "a.txt"
             file_two = tmp_path / "b.txt"
             file_one.write_text("a", encoding="utf-8")
             file_two.write_text("b", encoding="utf-8")
+            captured_payloads: list[dict[str, Any]] = []
 
-            fake_bin = tmp_path / "fake-bin"
-            self._make_fake_curl(fake_bin)
-            curl_log = tmp_path / "curl.log"
+            def fake_api(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+                self.assertEqual(path, "/artifacts/submit")
+                self.assertEqual(method, "POST")
+                assert payload is not None
+                captured_payloads.append(dict(payload))
+                return self._artifact_payload(str(payload["path"]), str(payload.get("name") or ""))
 
-            env = os.environ.copy()
-            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
-            env["HUB_ARTIFACT_CURL_LOG"] = str(curl_log)
-            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
-            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
-            env["HUB_ARTIFACT_DISABLE_RETRIES"] = "1"
+            with patch("agent_hub.agent_tools_mcp._api_request", side_effect=fake_api):
+                result = agent_tools_mcp._submit_artifacts(
+                    {
+                        "paths": [str(file_one), str(file_two)],
+                        "max_attempts": 1,
+                        "retry_delay_base_sec": 0,
+                        "retry_delay_max_sec": 0,
+                    }
+                )
 
-            result = self._run_publish(str(file_one), str(file_two), env=env)
-            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
-            self.assertIn("Artifact published: a.txt", result.stdout)
-            self.assertIn("Artifact published: b.txt", result.stdout)
-            self.assertIn("Published 2 artifacts.", result.stdout)
+            self.assertEqual(result["processed_count"], 2)
+            self.assertEqual(result["succeeded_count"], 2)
+            self.assertEqual(result["failed_count"], 0)
+            self.assertEqual(captured_payloads[0]["path"], str(file_one.resolve()))
+            self.assertEqual(captured_payloads[1]["path"], str(file_two.resolve()))
+            self.assertNotIn("name", captured_payloads[0])
+            self.assertNotIn("name", captured_payloads[1])
 
-            payloads = [json.loads(line) for line in curl_log.read_text(encoding="utf-8").splitlines() if line.strip()]
-            self.assertEqual(len(payloads), 2)
-            self.assertEqual(payloads[0]["path"], str(file_one))
-            self.assertEqual(payloads[1]["path"], str(file_two))
-            self.assertNotIn("name", payloads[0])
-            self.assertNotIn("name", payloads[1])
-
-    def test_hub_artifact_publish_accepts_directory_and_rejects_subdirectories(self) -> None:
-        with self._temporary_exec_dir() as tmp:
+    def test_submit_artifact_accepts_directory_and_rejects_subdirectories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            fake_bin = tmp_path / "fake-bin"
-            self._make_fake_curl(fake_bin)
-
-            env = os.environ.copy()
-            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
-            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
-            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
-            env["HUB_ARTIFACT_DISABLE_RETRIES"] = "1"
-
             flat_dir = tmp_path / "flat"
             flat_dir.mkdir(parents=True, exist_ok=True)
             (flat_dir / "z.txt").write_text("z", encoding="utf-8")
             (flat_dir / "a.txt").write_text("a", encoding="utf-8")
-            flat_log = tmp_path / "flat.log"
-            env["HUB_ARTIFACT_CURL_LOG"] = str(flat_log)
+            submitted_paths: list[str] = []
 
-            ok_result = self._run_publish(str(flat_dir), env=env)
-            self.assertEqual(ok_result.returncode, 0, msg=ok_result.stderr or ok_result.stdout)
-            payloads = [json.loads(line) for line in flat_log.read_text(encoding="utf-8").splitlines() if line.strip()]
-            self.assertEqual(len(payloads), 2)
-            self.assertEqual(payloads[0]["path"], str(flat_dir / "a.txt"))
-            self.assertEqual(payloads[1]["path"], str(flat_dir / "z.txt"))
+            def fake_api(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+                self.assertEqual(path, "/artifacts/submit")
+                self.assertEqual(method, "POST")
+                assert payload is not None
+                submitted_paths.append(str(payload.get("path") or ""))
+                return self._artifact_payload(str(payload["path"]), str(payload.get("name") or ""))
+
+            with patch("agent_hub.agent_tools_mcp._api_request", side_effect=fake_api):
+                result = agent_tools_mcp._submit_artifacts(
+                    {"paths": [str(flat_dir)], "max_attempts": 1, "retry_delay_base_sec": 0, "retry_delay_max_sec": 0}
+                )
+
+            self.assertEqual(result["processed_count"], 2)
+            self.assertEqual(submitted_paths, [str((flat_dir / "a.txt").resolve()), str((flat_dir / "z.txt").resolve())])
 
             nested_dir = tmp_path / "nested"
             nested_dir.mkdir(parents=True, exist_ok=True)
-            (nested_dir / "keep.txt").write_text("k", encoding="utf-8")
+            (nested_dir / "keep.txt").write_text("keep", encoding="utf-8")
             (nested_dir / "child").mkdir(parents=True, exist_ok=True)
-            nested_log = tmp_path / "nested.log"
-            env["HUB_ARTIFACT_CURL_LOG"] = str(nested_log)
+            with self.assertRaises(RuntimeError) as ctx:
+                agent_tools_mcp._submit_artifacts({"paths": [str(nested_dir)]})
+            self.assertIn("Subdirectories are not supported for artifact submit", str(ctx.exception))
 
-            fail_result = self._run_publish(str(nested_dir), env=env)
-            self.assertNotEqual(fail_result.returncode, 0)
-            self.assertIn("Subdirectories are not supported for artifact publish", fail_result.stderr)
-            self.assertFalse(nested_log.exists())
-
-    def test_hub_artifact_publish_rejects_name_for_multiple_files(self) -> None:
-        with self._temporary_exec_dir() as tmp:
+    def test_submit_artifact_rejects_name_for_multiple_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             file_one = tmp_path / "a.txt"
             file_two = tmp_path / "b.txt"
             file_one.write_text("a", encoding="utf-8")
             file_two.write_text("b", encoding="utf-8")
-            fake_bin = tmp_path / "fake-bin"
-            self._make_fake_curl(fake_bin)
+            with self.assertRaises(RuntimeError) as ctx:
+                agent_tools_mcp._submit_artifacts(
+                    {
+                        "paths": [str(file_one), str(file_two)],
+                        "name": "Combined",
+                    }
+                )
+            self.assertIn("--name can only be used when submitting exactly one file.", str(ctx.exception))
 
-            env = os.environ.copy()
-            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
-            env["HUB_ARTIFACT_CURL_LOG"] = str(tmp_path / "curl.log")
-            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
-            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
-            env["HUB_ARTIFACT_DISABLE_RETRIES"] = "1"
-
-            result = self._run_publish(str(file_one), str(file_two), "--name", "Combined", env=env)
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("--name can only be used when publishing exactly one file.", result.stderr)
-
-    def test_hub_artifact_publish_accepts_archive_files(self) -> None:
-        with self._temporary_exec_dir() as tmp:
-            tmp_path = Path(tmp)
-            archive_file = tmp_path / "bundle.zip"
-            archive_file.write_text("zip payload", encoding="utf-8")
-            fake_bin = tmp_path / "fake-bin"
-            self._make_fake_curl(fake_bin)
-
-            env = os.environ.copy()
-            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
-            env["HUB_ARTIFACT_CURL_LOG"] = str(tmp_path / "curl.log")
-            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
-            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
-            env["HUB_ARTIFACT_DISABLE_RETRIES"] = "1"
-
-            result = self._run_publish(str(archive_file), env=env)
-            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
-            self.assertIn("Artifact published: bundle.zip", result.stdout)
-            payloads = [json.loads(line) for line in Path(env["HUB_ARTIFACT_CURL_LOG"]).read_text(encoding="utf-8").splitlines() if line.strip()]
-            self.assertEqual(len(payloads), 1)
-            self.assertEqual(payloads[0]["path"], str(archive_file))
-
-    def test_hub_artifact_publish_retries_only_failed_paths(self) -> None:
-        with self._temporary_exec_dir() as tmp:
+    def test_submit_artifact_retries_only_failed_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             file_one = tmp_path / "a.txt"
             file_two = tmp_path / "b.txt"
             file_one.write_text("a", encoding="utf-8")
             file_two.write_text("b", encoding="utf-8")
-            fake_bin = tmp_path / "fake-bin"
-            self._make_fake_curl(fake_bin)
-            curl_log = tmp_path / "curl.log"
+            call_counts: dict[str, int] = {str(file_one.resolve()): 0, str(file_two.resolve()): 0}
 
-            env = os.environ.copy()
-            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
-            env["HUB_ARTIFACT_CURL_LOG"] = str(curl_log)
-            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
-            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
-            env["HUB_ARTIFACT_MAX_ATTEMPTS"] = "2"
-            env["HUB_ARTIFACT_RETRY_DELAY_BASE_SEC"] = "0"
-            env["HUB_ARTIFACT_FAIL_ONCE_PATH"] = str(file_two)
-            env["HUB_ARTIFACT_FAIL_ONCE_MARKER"] = str(tmp_path / "failed-once.marker")
+            def fake_api(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+                self.assertEqual(path, "/artifacts/submit")
+                self.assertEqual(method, "POST")
+                assert payload is not None
+                normalized_path = str(payload.get("path") or "")
+                call_counts[normalized_path] = call_counts.get(normalized_path, 0) + 1
+                if normalized_path == str(file_two.resolve()) and call_counts[normalized_path] == 1:
+                    raise RuntimeError("simulated transient failure")
+                return self._artifact_payload(normalized_path, str(payload.get("name") or ""))
 
-            result = self._run_publish(str(file_one), str(file_two), env=env)
-            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
-            self.assertIn(f"Retrying artifact publish (2/2): {file_two}", result.stderr)
+            with patch("agent_hub.agent_tools_mcp._api_request", side_effect=fake_api):
+                result = agent_tools_mcp._submit_artifacts(
+                    {
+                        "paths": [str(file_one), str(file_two)],
+                        "max_attempts": 2,
+                        "retry_delay_base_sec": 0,
+                        "retry_delay_max_sec": 0,
+                    }
+                )
 
-            payloads = [json.loads(line) for line in curl_log.read_text(encoding="utf-8").splitlines() if line.strip()]
-            uploaded_paths = [payload["path"] for payload in payloads]
-            self.assertEqual(uploaded_paths.count(str(file_one)), 1)
-            self.assertEqual(uploaded_paths.count(str(file_two)), 2)
-            self.assertEqual(uploaded_paths[0], str(file_one))
+            self.assertEqual(result["failed_count"], 0)
+            self.assertEqual(call_counts[str(file_one.resolve())], 1)
+            self.assertEqual(call_counts[str(file_two.resolve())], 2)
 
-    def test_hub_artifact_publish_disable_retries_forces_single_attempt(self) -> None:
-        with self._temporary_exec_dir() as tmp:
+    def test_submit_artifact_reports_failed_paths_after_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             file_one = tmp_path / "a.txt"
             file_two = tmp_path / "b.txt"
             file_one.write_text("a", encoding="utf-8")
             file_two.write_text("b", encoding="utf-8")
-            fake_bin = tmp_path / "fake-bin"
-            self._make_fake_curl(fake_bin)
-            curl_log = tmp_path / "curl.log"
+            call_counts: dict[str, int] = {str(file_one.resolve()): 0, str(file_two.resolve()): 0}
 
-            env = os.environ.copy()
-            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
-            env["HUB_ARTIFACT_CURL_LOG"] = str(curl_log)
-            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
-            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
-            env["HUB_ARTIFACT_MAX_ATTEMPTS"] = "9"
-            env["HUB_ARTIFACT_DISABLE_RETRIES"] = "1"
-            env["HUB_ARTIFACT_ALWAYS_FAIL_PATH"] = str(file_two)
+            def fake_api(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+                self.assertEqual(path, "/artifacts/submit")
+                self.assertEqual(method, "POST")
+                assert payload is not None
+                normalized_path = str(payload.get("path") or "")
+                call_counts[normalized_path] = call_counts.get(normalized_path, 0) + 1
+                if normalized_path == str(file_two.resolve()):
+                    raise RuntimeError(f"simulated upload failure for {normalized_path}")
+                return self._artifact_payload(normalized_path, str(payload.get("name") or ""))
 
-            result = self._run_publish(str(file_one), str(file_two), env=env)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(f"Artifact publish failed after 1 attempt(s): {file_two}", result.stderr)
-            self.assertNotIn("Retrying artifact publish", result.stderr)
+            with patch("agent_hub.agent_tools_mcp._api_request", side_effect=fake_api):
+                with self.assertRaises(RuntimeError) as ctx:
+                    agent_tools_mcp._submit_artifacts(
+                        {
+                            "paths": [str(file_one), str(file_two)],
+                            "max_attempts": 2,
+                            "retry_delay_base_sec": 0,
+                            "retry_delay_max_sec": 0,
+                        }
+                    )
 
-            payloads = [json.loads(line) for line in curl_log.read_text(encoding="utf-8").splitlines() if line.strip()]
-            uploaded_paths = [payload["path"] for payload in payloads]
-            self.assertEqual(uploaded_paths.count(str(file_one)), 1)
-            self.assertEqual(uploaded_paths.count(str(file_two)), 1)
+            self.assertIn("submit_artifact failed", str(ctx.exception))
+            self.assertIn(str(file_two.resolve()), str(ctx.exception))
+            self.assertEqual(call_counts[str(file_one.resolve())], 1)
+            self.assertEqual(call_counts[str(file_two.resolve())], 2)
 
-    def test_hub_artifact_publish_reports_failed_paths_after_retries(self) -> None:
-        with self._temporary_exec_dir() as tmp:
+    def test_handle_tool_call_submit_artifact_returns_structured_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            file_one = tmp_path / "a.txt"
-            file_two = tmp_path / "b.txt"
-            file_one.write_text("a", encoding="utf-8")
-            file_two.write_text("b", encoding="utf-8")
-            fake_bin = tmp_path / "fake-bin"
-            self._make_fake_curl(fake_bin)
-            curl_log = tmp_path / "curl.log"
+            report_file = tmp_path / "report.md"
+            report_file.write_text("report body", encoding="utf-8")
 
-            env = os.environ.copy()
-            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
-            env["HUB_ARTIFACT_CURL_LOG"] = str(curl_log)
-            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
-            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
-            env["HUB_ARTIFACT_MAX_ATTEMPTS"] = "2"
-            env["HUB_ARTIFACT_RETRY_DELAY_BASE_SEC"] = "0"
-            env["HUB_ARTIFACT_ALWAYS_FAIL_PATH"] = str(file_two)
+            with patch(
+                "agent_hub.agent_tools_mcp._api_request",
+                return_value=self._artifact_payload(str(report_file.resolve()), "Final Report"),
+            ):
+                response = agent_tools_mcp._handle_tool_call(
+                    "submit_artifact",
+                    {
+                        "path": str(report_file),
+                        "name": "Final Report",
+                        "max_attempts": 1,
+                        "retry_delay_base_sec": 0,
+                        "retry_delay_max_sec": 0,
+                    },
+                )
 
-            result = self._run_publish(str(file_one), str(file_two), env=env)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(f"Artifact publish failed after 2 attempt(s): {file_two}", result.stderr)
-            self.assertIn("Failed to publish 1 artifact(s):", result.stderr)
-            self.assertIn(f"  - {file_two}", result.stderr)
-            self.assertIn("Artifact published: a.txt", result.stdout)
-
-            payloads = [json.loads(line) for line in curl_log.read_text(encoding="utf-8").splitlines() if line.strip()]
-            uploaded_paths = [payload["path"] for payload in payloads]
-            self.assertEqual(uploaded_paths.count(str(file_one)), 1)
-            self.assertEqual(uploaded_paths.count(str(file_two)), 2)
-
-    def test_hub_artifact_publish_handles_large_file_batch(self) -> None:
-        with self._temporary_exec_dir() as tmp:
-            tmp_path = Path(tmp)
-            files = []
-            file_count = 60
-            for index in range(file_count):
-                path = tmp_path / f"file-{index:03d}.txt"
-                path.write_text(f"payload-{index}\n", encoding="utf-8")
-                files.append(path)
-
-            fake_bin = tmp_path / "fake-bin"
-            self._make_fake_curl(fake_bin)
-            curl_log = tmp_path / "curl.log"
-
-            env = os.environ.copy()
-            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
-            env["HUB_ARTIFACT_CURL_LOG"] = str(curl_log)
-            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
-            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
-            env["HUB_ARTIFACT_PROGRESS_EVERY"] = "20"
-            env["HUB_ARTIFACT_RETRY_DELAY_BASE_SEC"] = "0"
-            env["HUB_ARTIFACT_MAX_ATTEMPTS"] = "3"
-            env["HUB_ARTIFACT_FAIL_ONCE_PATH"] = str(files[37])
-            env["HUB_ARTIFACT_FAIL_ONCE_MARKER"] = str(tmp_path / "failed-once.marker")
-
-            result = self._run_publish(*[str(path) for path in files], env=env)
-            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
-            self.assertIn(f"Published {file_count} artifacts.", result.stdout)
-            self.assertIn(f"Artifact upload progress: {file_count}/{file_count} processed;", result.stderr)
-
-            payloads = [json.loads(line) for line in curl_log.read_text(encoding="utf-8").splitlines() if line.strip()]
-            uploaded_paths = [payload["path"] for payload in payloads]
-            self.assertEqual(uploaded_paths.count(str(files[37])), 2)
-            self.assertEqual(len(payloads), file_count + 1)
-            self.assertEqual(uploaded_paths.count(str(files[0])), 1)
-            self.assertEqual(uploaded_paths.count(str(files[-1])), 1)
+            self.assertFalse(response["isError"])
+            structured = response["structuredContent"]
+            self.assertEqual(structured["processed_count"], 1)
+            self.assertEqual(structured["succeeded_count"], 1)
+            self.assertEqual(structured["failed_count"], 0)
 
 
 class CliEnvVarTests(unittest.TestCase):
@@ -6075,7 +5998,7 @@ class CliEnvVarTests(unittest.TestCase):
         self.assertNotIn("\ndeveloper_instructions = \"\"\"\n", content)
         self.assertNotIn("\ninstructions = \"\"\"\n", content)
         self.assertIn("SYSTEM_PROMPT.md", content)
-        self.assertIn("hub_artifact publish <path> [<path> ...]", prompt_content)
+        self.assertIn("`submit_artifact` tool in `agent_tools`", prompt_content)
         self.assertIn("If the user asks for a file", prompt_content)
         self.assertIn(
             "Do not introduce fallback implementation paths unless the user explicitly requests fallback behavior",

@@ -48,8 +48,7 @@ RUN if ! id -u agent >/dev/null 2>&1; then \
  && chmod -R 777 /workspace
 
 COPY docker/agent_cli/docker-entrypoint.py /usr/local/bin/docker-entrypoint.py
-COPY docker/agent_cli/hub_artifact /usr/local/bin/hub_artifact
-RUN chmod +x /usr/local/bin/docker-entrypoint.py /usr/local/bin/hub_artifact
+RUN chmod +x /usr/local/bin/docker-entrypoint.py
 
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]

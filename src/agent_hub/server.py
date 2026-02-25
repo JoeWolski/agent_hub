@@ -103,7 +103,7 @@ AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH = str(
     / AGENT_TOOLS_MCP_RUNTIME_FILE_NAME
 )
 TMP_DIR_TMPFS_SPEC = "/tmp:mode=1777,exec"
-ARTIFACT_PUBLISH_BASE_URL_ENV = "AGENT_HUB_ARTIFACT_BASE_URL"
+ARTIFACT_PUBLISH_BASE_URL_ENV = "AGENT_ARTIFACT_BASE_URL"
 DEFAULT_ARTIFACT_PUBLISH_HOST = "host.docker.internal"
 TERMINAL_QUEUE_MAX = 256
 HUB_EVENT_QUEUE_MAX = 512
@@ -318,9 +318,12 @@ AUTO_CONFIG_CACHE_SIGNAL_FILENAMES = {
 SNAPSHOT_AGENT_CLI_RUNTIME_INPUT_FILES = (
     "docker/agent_cli/Dockerfile",
     "docker/agent_cli/docker-entrypoint.py",
-    "docker/agent_cli/hub_artifact",
+    "src/agent_hub/agent_tools_mcp.py",
     "src/agent_cli/cli.py",
 )
+ARTIFACT_STORAGE_DIR_NAME = "artifacts"
+ARTIFACT_STORAGE_CHAT_DIR_NAME = "chats"
+ARTIFACT_STORAGE_SESSION_DIR_NAME = "agent_tools_sessions"
 AUTO_CONFIG_CACHE_SIGNAL_SUFFIXES = {
     ".cmake",
     ".mk",
@@ -2527,6 +2530,7 @@ def _normalize_chat_artifacts(raw_artifacts: Any) -> list[dict[str, Any]]:
         relative_path = _coerce_artifact_relative_path(raw_artifact.get("relative_path"))
         if not artifact_id or not relative_path:
             continue
+        storage_relative_path = _coerce_artifact_relative_path(raw_artifact.get("storage_relative_path"))
         size_raw = raw_artifact.get("size_bytes")
         try:
             size_bytes = int(size_raw)
@@ -2539,6 +2543,7 @@ def _normalize_chat_artifacts(raw_artifacts: Any) -> list[dict[str, Any]]:
                 "id": artifact_id,
                 "name": _normalize_artifact_name(raw_artifact.get("name"), fallback=Path(relative_path).name),
                 "relative_path": relative_path,
+                "storage_relative_path": storage_relative_path,
                 "size_bytes": size_bytes,
                 "created_at": str(raw_artifact.get("created_at") or ""),
             }
@@ -3399,6 +3404,9 @@ class HubState:
         self.project_dir = self.data_dir / "projects"
         self.chat_dir = self.data_dir / "chats"
         self.log_dir = self.data_dir / "logs"
+        self.artifacts_dir = self.data_dir / ARTIFACT_STORAGE_DIR_NAME
+        self.chat_artifacts_dir = self.artifacts_dir / ARTIFACT_STORAGE_CHAT_DIR_NAME
+        self.session_artifacts_dir = self.artifacts_dir / ARTIFACT_STORAGE_SESSION_DIR_NAME
         self.secrets_dir = self.data_dir / SECRETS_DIR_NAME
         self.chat_runtime_configs_dir = self.data_dir / CHAT_RUNTIME_CONFIGS_DIR_NAME
         self.openai_credentials_file = self.secrets_dir / OPENAI_CREDENTIALS_FILE_NAME
@@ -3442,6 +3450,9 @@ class HubState:
         self.project_dir.mkdir(parents=True, exist_ok=True)
         self.chat_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self.chat_artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self.session_artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.secrets_dir.mkdir(parents=True, exist_ok=True)
         self.chat_runtime_configs_dir.mkdir(parents=True, exist_ok=True)
         self.git_credentials_dir.mkdir(parents=True, exist_ok=True)
@@ -6353,9 +6364,9 @@ class HubState:
             cmd.append("--prepare-snapshot-only")
 
         if artifacts_url:
-            cmd.extend(["--env-var", f"AGENT_HUB_ARTIFACTS_URL={artifacts_url}"])
+            cmd.extend(["--env-var", f"AGENT_ARTIFACTS_URL={artifacts_url}"])
         if artifacts_token:
-            cmd.extend(["--env-var", f"AGENT_HUB_ARTIFACT_TOKEN={artifacts_token}"])
+            cmd.extend(["--env-var", f"AGENT_ARTIFACT_TOKEN={artifacts_token}"])
 
         cmd.extend(["--env-var", f"{AGENT_TOOLS_URL_ENV}={agent_tools_url}"])
         cmd.extend(["--env-var", f"{AGENT_TOOLS_TOKEN_ENV}={agent_tools_token}"])
@@ -6475,8 +6486,7 @@ class HubState:
                 runtime_config_file.unlink()
             except OSError:
                 pass
-            with self._agent_tools_sessions_lock:
-                self._agent_tools_sessions.pop(session_id, None)
+            self._remove_agent_tools_session(session_id)
             raise HTTPException(status_code=502, detail=f"Temporary auto-config chat failed to start: {exc}") from exc
 
         output_chunks: list[str] = []
@@ -6546,8 +6556,7 @@ class HubState:
                 runtime_config_file.unlink()
             except OSError:
                 pass
-            with self._agent_tools_sessions_lock:
-                self._agent_tools_sessions.pop(session_id, None)
+            self._remove_agent_tools_session(session_id)
 
     def auto_configure_project(
         self,
@@ -7769,6 +7778,16 @@ class HubState:
             raise HTTPException(status_code=404, detail="agent_tools session not found.")
         return dict(session)
 
+    def _remove_agent_tools_session(self, session_id: Any) -> None:
+        normalized_session_id = str(session_id or "").strip()
+        if not normalized_session_id:
+            return
+        with self._agent_tools_sessions_lock:
+            self._agent_tools_sessions.pop(normalized_session_id, None)
+        session_artifact_root = self._session_artifact_storage_root(normalized_session_id)
+        if session_artifact_root.exists():
+            self._delete_path(session_artifact_root)
+
     def require_agent_tools_session_token(self, session_id: str, token: Any) -> dict[str, Any]:
         session = self._agent_tools_session(session_id)
         expected_hash = str(session.get("token_hash") or "")
@@ -7910,6 +7929,178 @@ class HubState:
         artifacts = _normalize_chat_artifacts(chat.get("artifacts"))
         return [self._chat_artifact_public_payload(chat_id, artifact) for artifact in reversed(artifacts)]
 
+    def _chat_artifact_storage_root(self, chat_id: str) -> Path:
+        return self.chat_artifacts_dir / str(chat_id)
+
+    def _session_artifact_storage_root(self, session_id: str) -> Path:
+        return self.session_artifacts_dir / str(session_id)
+
+    def _persist_artifact_file_copy(
+        self,
+        *,
+        source_file: Path,
+        storage_root: Path,
+        artifact_id: str,
+        relative_path: str,
+    ) -> tuple[str, int]:
+        storage_entry_name = _normalize_artifact_name("", fallback=Path(relative_path).name)
+        artifact_storage_dir = storage_root / artifact_id
+        if artifact_storage_dir.exists():
+            self._delete_path(artifact_storage_dir)
+        try:
+            artifact_storage_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to create artifact storage directory: {artifact_storage_dir}",
+            ) from exc
+
+        destination = artifact_storage_dir / storage_entry_name
+        temporary_destination = artifact_storage_dir / f".{storage_entry_name}.tmp-{uuid.uuid4().hex}"
+        try:
+            with source_file.open("rb") as src_handle, temporary_destination.open("wb") as dst_handle:
+                shutil.copyfileobj(src_handle, dst_handle, length=1024 * 1024)
+            os.replace(temporary_destination, destination)
+            size_bytes = int(destination.stat().st_size)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to persist artifact file copy: {source_file}") from exc
+        finally:
+            if temporary_destination.exists():
+                try:
+                    temporary_destination.unlink()
+                except OSError:
+                    pass
+
+        try:
+            storage_relative = destination.resolve().relative_to(self.artifacts_dir.resolve()).as_posix()
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail="Artifact storage path escaped managed directory.") from exc
+        normalized_storage_relative = _coerce_artifact_relative_path(storage_relative)
+        if not normalized_storage_relative:
+            raise HTTPException(status_code=500, detail="Artifact storage path is invalid.")
+        return normalized_storage_relative, size_bytes
+
+    def _upsert_chat_artifact_from_file(
+        self,
+        *,
+        state: dict[str, Any],
+        chat_id: str,
+        chat: dict[str, Any],
+        file_path: Path,
+        relative_path: str,
+        name: Any = None,
+    ) -> dict[str, Any]:
+        now = _iso_now()
+        artifacts = _normalize_chat_artifacts(chat.get("artifacts"))
+        normalized_name = _normalize_artifact_name(name, fallback=file_path.name)
+
+        existing_index = -1
+        for index, artifact in enumerate(artifacts):
+            if str(artifact.get("relative_path") or "") == relative_path:
+                existing_index = index
+                break
+
+        artifact_id = (
+            str(artifacts[existing_index].get("id") or "") or uuid.uuid4().hex
+            if existing_index >= 0
+            else uuid.uuid4().hex
+        )
+        storage_relative_path, persisted_size_bytes = self._persist_artifact_file_copy(
+            source_file=file_path,
+            storage_root=self._chat_artifact_storage_root(chat_id),
+            artifact_id=artifact_id,
+            relative_path=relative_path,
+        )
+        stored_artifact = {
+            "id": artifact_id,
+            "name": normalized_name,
+            "relative_path": relative_path,
+            "storage_relative_path": storage_relative_path,
+            "size_bytes": int(persisted_size_bytes),
+            "created_at": now,
+        }
+
+        if existing_index >= 0:
+            artifacts[existing_index] = stored_artifact
+        else:
+            artifacts.append(stored_artifact)
+            if len(artifacts) > CHAT_ARTIFACTS_MAX_ITEMS:
+                artifacts = artifacts[-CHAT_ARTIFACTS_MAX_ITEMS:]
+
+        current_ids = _normalize_chat_current_artifact_ids(chat.get("artifact_current_ids"), artifacts)
+        if artifact_id and artifact_id not in current_ids:
+            current_ids.append(artifact_id)
+        if len(current_ids) > CHAT_ARTIFACTS_MAX_ITEMS:
+            current_ids = current_ids[-CHAT_ARTIFACTS_MAX_ITEMS:]
+
+        chat["artifacts"] = artifacts
+        chat["artifact_current_ids"] = current_ids
+        chat["artifact_prompt_history"] = _normalize_chat_artifact_prompt_history(chat.get("artifact_prompt_history"))
+        chat["updated_at"] = now
+        state["chats"][chat_id] = chat
+        return stored_artifact
+
+    def _upsert_session_artifact_from_file(
+        self,
+        *,
+        session_id: str,
+        session: dict[str, Any],
+        file_path: Path,
+        relative_path: str,
+        name: Any = None,
+    ) -> dict[str, Any]:
+        now = _iso_now()
+        artifacts = _normalize_chat_artifacts(session.get("artifacts"))
+        normalized_name = _normalize_artifact_name(name, fallback=file_path.name)
+
+        existing_index = -1
+        for index, artifact in enumerate(artifacts):
+            if str(artifact.get("relative_path") or "") == relative_path:
+                existing_index = index
+                break
+
+        artifact_id = (
+            str(artifacts[existing_index].get("id") or "") or uuid.uuid4().hex
+            if existing_index >= 0
+            else uuid.uuid4().hex
+        )
+        storage_relative_path, persisted_size_bytes = self._persist_artifact_file_copy(
+            source_file=file_path,
+            storage_root=self._session_artifact_storage_root(session_id),
+            artifact_id=artifact_id,
+            relative_path=relative_path,
+        )
+        stored_artifact = {
+            "id": artifact_id,
+            "name": normalized_name,
+            "relative_path": relative_path,
+            "storage_relative_path": storage_relative_path,
+            "size_bytes": int(persisted_size_bytes),
+            "created_at": now,
+        }
+
+        if existing_index >= 0:
+            artifacts[existing_index] = stored_artifact
+        else:
+            artifacts.append(stored_artifact)
+            if len(artifacts) > CHAT_ARTIFACTS_MAX_ITEMS:
+                artifacts = artifacts[-CHAT_ARTIFACTS_MAX_ITEMS:]
+
+        current_ids = _normalize_chat_current_artifact_ids(session.get("artifact_current_ids"), artifacts)
+        if artifact_id and artifact_id not in current_ids:
+            current_ids.append(artifact_id)
+        if len(current_ids) > CHAT_ARTIFACTS_MAX_ITEMS:
+            current_ids = current_ids[-CHAT_ARTIFACTS_MAX_ITEMS:]
+
+        with self._agent_tools_sessions_lock:
+            active_session = self._agent_tools_sessions.get(session_id)
+            if active_session is not None:
+                active_session["artifacts"] = artifacts
+                active_session["artifact_current_ids"] = current_ids
+                self._agent_tools_sessions[session_id] = active_session
+
+        return stored_artifact
+
     def publish_chat_artifact(
         self,
         chat_id: str,
@@ -7924,52 +8115,40 @@ class HubState:
         self._require_artifact_publish_token(chat, token)
 
         file_path, relative_path = self._resolve_chat_artifact_file(chat_id, submitted_path)
-        file_stat = file_path.stat()
-        now = _iso_now()
-        artifacts = _normalize_chat_artifacts(chat.get("artifacts"))
-        normalized_name = _normalize_artifact_name(name, fallback=file_path.name)
-
-        existing_index = -1
-        for index, artifact in enumerate(artifacts):
-            if str(artifact.get("relative_path") or "") == relative_path:
-                existing_index = index
-                break
-
-        if existing_index >= 0:
-            artifact_id = str(artifacts[existing_index].get("id") or "") or uuid.uuid4().hex
-            artifacts[existing_index] = {
-                "id": artifact_id,
-                "name": normalized_name,
-                "relative_path": relative_path,
-                "size_bytes": int(file_stat.st_size),
-                "created_at": now,
-            }
-            stored_artifact = artifacts[existing_index]
-        else:
-            stored_artifact = {
-                "id": uuid.uuid4().hex,
-                "name": normalized_name,
-                "relative_path": relative_path,
-                "size_bytes": int(file_stat.st_size),
-                "created_at": now,
-            }
-            artifacts.append(stored_artifact)
-            if len(artifacts) > CHAT_ARTIFACTS_MAX_ITEMS:
-                artifacts = artifacts[-CHAT_ARTIFACTS_MAX_ITEMS:]
-
-        current_ids = _normalize_chat_current_artifact_ids(chat.get("artifact_current_ids"), artifacts)
-        stored_artifact_id = str(stored_artifact.get("id") or "")
-        if stored_artifact_id and stored_artifact_id not in current_ids:
-            current_ids.append(stored_artifact_id)
-        if len(current_ids) > CHAT_ARTIFACTS_MAX_ITEMS:
-            current_ids = current_ids[-CHAT_ARTIFACTS_MAX_ITEMS:]
-
-        chat["artifacts"] = artifacts
-        chat["artifact_current_ids"] = current_ids
-        chat["artifact_prompt_history"] = _normalize_chat_artifact_prompt_history(chat.get("artifact_prompt_history"))
-        chat["updated_at"] = now
-        state["chats"][chat_id] = chat
+        stored_artifact = self._upsert_chat_artifact_from_file(
+            state=state,
+            chat_id=chat_id,
+            chat=chat,
+            file_path=file_path,
+            relative_path=relative_path,
+            name=name,
+        )
         self.save(state, reason="chat_artifact_published")
+        return self._chat_artifact_public_payload(chat_id, stored_artifact)
+
+    def submit_chat_artifact(
+        self,
+        chat_id: str,
+        token: Any,
+        submitted_path: Any,
+        name: Any = None,
+    ) -> dict[str, Any]:
+        state = self.load()
+        chat = state["chats"].get(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        self._require_agent_tools_token(chat, token)
+
+        file_path, relative_path = self._resolve_chat_artifact_file(chat_id, submitted_path)
+        stored_artifact = self._upsert_chat_artifact_from_file(
+            state=state,
+            chat_id=chat_id,
+            chat=chat,
+            file_path=file_path,
+            relative_path=relative_path,
+            name=name,
+        )
+        self.save(state, reason="chat_artifact_submitted")
         return self._chat_artifact_public_payload(chat_id, stored_artifact)
 
     def publish_session_artifact(
@@ -7987,53 +8166,35 @@ class HubState:
             raise HTTPException(status_code=409, detail="Session workspace is unavailable.")
 
         file_path, relative_path = self._resolve_artifact_file_in_workspace(workspace, submitted_path)
-        file_stat = file_path.stat()
-        now = _iso_now()
-        artifacts = _normalize_chat_artifacts(session.get("artifacts"))
-        normalized_name = _normalize_artifact_name(name, fallback=file_path.name)
+        stored_artifact = self._upsert_session_artifact_from_file(
+            session_id=session_id,
+            session=session,
+            file_path=file_path,
+            relative_path=relative_path,
+            name=name,
+        )
+        return self._session_artifact_public_payload(session_id, stored_artifact)
 
-        existing_index = -1
-        for index, artifact in enumerate(artifacts):
-            if str(artifact.get("relative_path") or "") == relative_path:
-                existing_index = index
-                break
+    def submit_session_artifact(
+        self,
+        session_id: str,
+        token: Any,
+        submitted_path: Any,
+        name: Any = None,
+    ) -> dict[str, Any]:
+        session = self.require_agent_tools_session_token(session_id, token)
+        workspace = Path(str(session.get("workspace") or "")).resolve()
+        if not workspace or not workspace.exists():
+            raise HTTPException(status_code=409, detail="Session workspace is unavailable.")
 
-        if existing_index >= 0:
-            artifact_id = str(artifacts[existing_index].get("id") or "") or uuid.uuid4().hex
-            artifacts[existing_index] = {
-                "id": artifact_id,
-                "name": normalized_name,
-                "relative_path": relative_path,
-                "size_bytes": int(file_stat.st_size),
-                "created_at": now,
-            }
-            stored_artifact = artifacts[existing_index]
-        else:
-            stored_artifact = {
-                "id": uuid.uuid4().hex,
-                "name": normalized_name,
-                "relative_path": relative_path,
-                "size_bytes": int(file_stat.st_size),
-                "created_at": now,
-            }
-            artifacts.append(stored_artifact)
-            if len(artifacts) > CHAT_ARTIFACTS_MAX_ITEMS:
-                artifacts = artifacts[-CHAT_ARTIFACTS_MAX_ITEMS:]
-
-        current_ids = _normalize_chat_current_artifact_ids(session.get("artifact_current_ids"), artifacts)
-        stored_artifact_id = str(stored_artifact.get("id") or "")
-        if stored_artifact_id and stored_artifact_id not in current_ids:
-            current_ids.append(stored_artifact_id)
-        if len(current_ids) > CHAT_ARTIFACTS_MAX_ITEMS:
-            current_ids = current_ids[-CHAT_ARTIFACTS_MAX_ITEMS:]
-
-        with self._agent_tools_sessions_lock:
-            active_session = self._agent_tools_sessions.get(session_id)
-            if active_session is not None:
-                active_session["artifacts"] = artifacts
-                active_session["artifact_current_ids"] = current_ids
-                self._agent_tools_sessions[session_id] = active_session
-
+        file_path, relative_path = self._resolve_artifact_file_in_workspace(workspace, submitted_path)
+        stored_artifact = self._upsert_session_artifact_from_file(
+            session_id=session_id,
+            session=session,
+            file_path=file_path,
+            relative_path=relative_path,
+            name=name,
+        )
         return self._session_artifact_public_payload(session_id, stored_artifact)
 
     def _resolve_artifact_file_in_workspace(self, workspace: Path, submitted_path: Any) -> tuple[Path, str]:
@@ -8079,6 +8240,20 @@ class HubState:
     def _session_artifact_preview_url(self, session_id: str, artifact_id: str) -> str:
         return f"/api/agent-tools/sessions/{session_id}/artifacts/{artifact_id}/preview"
 
+    def _resolve_persisted_artifact_path(self, artifact: dict[str, Any]) -> Path | None:
+        storage_relative_path = _coerce_artifact_relative_path(artifact.get("storage_relative_path"))
+        if not storage_relative_path:
+            return None
+        artifacts_root = self.artifacts_dir.resolve()
+        resolved = (artifacts_root / storage_relative_path).resolve()
+        try:
+            resolved.relative_to(artifacts_root)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Artifact path is invalid.") from exc
+        if not resolved.exists() or not resolved.is_file():
+            return None
+        return resolved
+
     def resolve_session_artifact_download(self, session_id: str, artifact_id: str) -> tuple[Path, str, str]:
         session = self._agent_tools_session(session_id)
         normalized_artifact_id = str(artifact_id or "").strip()
@@ -8090,17 +8265,19 @@ class HubState:
         if match is None:
             raise HTTPException(status_code=404, detail="Artifact not found.")
 
-        workspace = Path(str(session.get("workspace") or "")).resolve()
-        if not workspace or not workspace.exists():
-            raise HTTPException(status_code=409, detail="Session workspace is unavailable.")
+        resolved = self._resolve_persisted_artifact_path(match)
+        if resolved is None:
+            workspace = Path(str(session.get("workspace") or "")).resolve()
+            if not workspace or not workspace.exists():
+                raise HTTPException(status_code=409, detail="Session workspace is unavailable.")
 
-        resolved = (workspace / str(match.get("relative_path") or "")).resolve()
-        try:
-            resolved.relative_to(workspace)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Artifact path is invalid.") from exc
-        if not resolved.exists() or not resolved.is_file():
-            raise HTTPException(status_code=404, detail="Artifact file is no longer available.")
+            resolved = (workspace / str(match.get("relative_path") or "")).resolve()
+            try:
+                resolved.relative_to(workspace)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Artifact path is invalid.") from exc
+            if not resolved.exists() or not resolved.is_file():
+                raise HTTPException(status_code=404, detail="Artifact file is no longer available.")
 
         filename = _normalize_artifact_name(match.get("name"), fallback=resolved.name)
         media_type = (
@@ -8129,14 +8306,16 @@ class HubState:
         if match is None:
             raise HTTPException(status_code=404, detail="Artifact not found.")
 
-        workspace = self.chat_workdir(chat_id).resolve()
-        resolved = (workspace / str(match.get("relative_path") or "")).resolve()
-        try:
-            resolved.relative_to(workspace)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Artifact path is invalid.") from exc
-        if not resolved.exists() or not resolved.is_file():
-            raise HTTPException(status_code=404, detail="Artifact file is no longer available.")
+        resolved = self._resolve_persisted_artifact_path(match)
+        if resolved is None:
+            workspace = self.chat_workdir(chat_id).resolve()
+            resolved = (workspace / str(match.get("relative_path") or "")).resolve()
+            try:
+                resolved.relative_to(workspace)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Artifact path is invalid.") from exc
+            if not resolved.exists() or not resolved.is_file():
+                raise HTTPException(status_code=404, detail="Artifact file is no longer available.")
 
         filename = _normalize_artifact_name(match.get("name"), fallback=resolved.name)
         media_type = (
@@ -8683,6 +8862,9 @@ class HubState:
         workspace = Path(str(chat.get("workspace") or self.chat_dir / chat_id))
         if workspace.exists():
             self._delete_path(workspace)
+        chat_artifact_storage = self._chat_artifact_storage_root(chat_id)
+        if chat_artifact_storage.exists():
+            self._delete_path(chat_artifact_storage)
         runtime_config_file = self._chat_runtime_config_path(chat_id)
         if runtime_config_file.exists():
             try:
@@ -9204,6 +9386,23 @@ class HubState:
             managed_paths.add(resolved_workspace)
         return managed_paths
 
+    def _managed_chat_artifact_paths(self, state: dict[str, Any]) -> set[Path]:
+        managed_paths: set[Path] = set()
+        artifacts_root = self.chat_artifacts_dir.resolve()
+        chats = state.get("chats")
+        if not isinstance(chats, dict):
+            return managed_paths
+
+        for chat_id in chats.keys():
+            artifact_dir = self._chat_artifact_storage_root(str(chat_id))
+            try:
+                resolved_artifact_dir = artifact_dir.resolve()
+                resolved_artifact_dir.relative_to(artifacts_root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            managed_paths.add(resolved_artifact_dir)
+        return managed_paths
+
     def _managed_project_workspace_paths(self, state: dict[str, Any]) -> set[Path]:
         managed_paths: set[Path] = set()
         project_root = self.project_dir.resolve()
@@ -9325,6 +9524,10 @@ class HubState:
             self.chat_dir,
             self._managed_chat_workspace_paths(state),
         )
+        self._remove_orphan_children(
+            self.chat_artifacts_dir,
+            self._managed_chat_artifact_paths(state),
+        )
         removed_orphan_project_paths = self._remove_orphan_children(
             self.project_dir,
             self._managed_project_workspace_paths(state),
@@ -9407,10 +9610,12 @@ class HubState:
         cleared_chats = len(state["chats"])
         state["chats"] = {}
 
-        for path in [self.chat_dir, self.project_dir, self.log_dir]:
+        for path in [self.chat_dir, self.project_dir, self.log_dir, self.artifacts_dir]:
             if path.exists():
                 self._delete_path(path)
             path.mkdir(parents=True, exist_ok=True)
+        self.chat_artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self.session_artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         self.save(state)
         _docker_remove_images(("agent-hub-setup-", "agent-base-"), image_tags)
@@ -11463,6 +11668,29 @@ def main(
             credential_ids=payload.get("credential_ids"),
         )
 
+    @app.post("/api/chats/{chat_id}/agent-tools/artifacts/submit")
+    async def api_agent_tools_submit_chat_artifact(chat_id: str, request: Request) -> dict[str, Any]:
+        auth_header = str(request.headers.get("authorization") or "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
+
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        artifact = state.submit_chat_artifact(
+            chat_id=chat_id,
+            token=token,
+            submitted_path=payload.get("path"),
+            name=payload.get("name"),
+        )
+        return {"artifact": artifact}
+
     @app.get("/api/agent-tools/sessions/{session_id}/credentials")
     def api_agent_tools_session_list_credentials(session_id: str, request: Request) -> dict[str, Any]:
         auth_header = str(request.headers.get("authorization") or "")
@@ -11528,6 +11756,29 @@ def main(
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Invalid JSON payload.")
         artifact = state.publish_session_artifact(
+            session_id=session_id,
+            token=token,
+            submitted_path=payload.get("path"),
+            name=payload.get("name"),
+        )
+        return {"artifact": artifact}
+
+    @app.post("/api/agent-tools/sessions/{session_id}/artifacts/submit")
+    async def api_agent_tools_submit_session_artifact(session_id: str, request: Request) -> dict[str, Any]:
+        auth_header = str(request.headers.get("authorization") or "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
+
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        artifact = state.submit_session_artifact(
             session_id=session_id,
             token=token,
             submitted_path=payload.get("path"),

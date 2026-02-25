@@ -36,7 +36,7 @@ docker build \
 
 - The image entrypoint is `docker/agent_cli/docker-entrypoint.py`.
 - Default runtime home/workspace root is `/workspace`.
-- `hub_artifact` is installed into `/usr/local/bin/hub_artifact` for artifact publishing in hub-launched chats.
+- Hub-launched chats get the `agent_tools` MCP runtime with `submit_artifact` for durable artifact uploads.
 - Docker build layers run as `USER root` to keep package installation deterministic even when a setup snapshot was committed from a non-root runtime user.
 - Setup snapshot commits normalize image metadata (`USER`, `WORKDIR`, `ENTRYPOINT`, `CMD`) before provider overlays are built.
 - Runtime user identity is provided by `docker run --user <uid>:<gid>` and `--group-add`, not by mutating `/etc/passwd` at container startup.
