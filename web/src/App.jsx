@@ -355,7 +355,7 @@ function emptyCreateForm() {
     name: "",
     defaultBranch: "",
     baseImageMode: "tag",
-    baseImageValue: "",
+    baseImageValue: DEFAULT_BASE_IMAGE_TAG,
     setupScript: "",
     defaultVolumes: [],
     defaultEnvVars: []
@@ -1351,9 +1351,10 @@ function EnvVarEditor({ rows, onChange }) {
 }
 
 function projectDraftFromProject(project) {
+  const baseMode = normalizeBaseMode(project.base_image_mode);
   return {
-    baseImageMode: normalizeBaseMode(project.base_image_mode),
-    baseImageValue: String(project.base_image_value || ""),
+    baseImageMode: baseMode,
+    baseImageValue: String(project.base_image_value || (baseMode === "tag" ? DEFAULT_BASE_IMAGE_TAG : "")),
     setupScript: String(project.setup_script || ""),
     defaultVolumes: mountRowsFromArrays(project.default_ro_mounts || [], project.default_rw_mounts || []),
     defaultEnvVars: envRowsFromArray(project.default_env_vars || [])
@@ -1736,7 +1737,6 @@ function HubApp() {
   const githubSetupResolutionRef = useRef("");
   const projectFirstSeenOrderRef = useRef(createFirstSeenOrderState());
   const chatFirstSeenOrderRef = useRef(createFirstSeenOrderState());
-  const autoConfigProjectOrderAliasByProjectIdRef = useRef(new Map());
   const chatOrderAliasByServerIdRef = useRef(new Map());
   const projectChatCreateLocksRef = useRef(new Set());
   const chatFlexOuterModelCacheRef = useRef({ layoutJson: null, model: null });
@@ -2427,7 +2427,7 @@ function HubApp() {
         if (!projectId) {
           return `project-${index}`;
         }
-        return autoConfigProjectOrderAliasByProjectIdRef.current.get(projectId) || projectId;
+        return projectId;
       },
       projectFirstSeenOrderRef.current
     );
@@ -2671,30 +2671,28 @@ function HubApp() {
         })
       });
       const recommendation = payload?.recommendation || {};
-      const autoConfigProjectPayload = {
-        repo_url: repoUrl,
-        name: String(formSnapshot.name || "").trim(),
-        default_branch: String(recommendation.default_branch || formSnapshot.defaultBranch || "").trim(),
-        base_image_mode: normalizeBaseMode(recommendation.base_image_mode || formSnapshot.baseImageMode),
-        base_image_value: String(recommendation.base_image_value || formSnapshot.baseImageValue || ""),
-        setup_script: String(recommendation.setup_script || formSnapshot.setupScript || ""),
-        credential_binding: recommendation.credential_binding || undefined,
-        default_ro_mounts: normalizeStringArray(recommendation.default_ro_mounts),
-        default_rw_mounts: normalizeStringArray(recommendation.default_rw_mounts),
-        default_env_vars: normalizeStringArray(recommendation.default_env_vars)
-      };
-      const createProjectResponse = await fetchJson("/api/projects", {
-        method: "POST",
-        body: JSON.stringify(autoConfigProjectPayload)
+      const recommendedRoMounts = normalizeStringArray(recommendation.default_ro_mounts);
+      const recommendedRwMounts = normalizeStringArray(recommendation.default_rw_mounts);
+      const recommendedEnvVars = normalizeStringArray(recommendation.default_env_vars);
+      const recommendedName = String(formSnapshot.name || "").trim() || extractProjectNameFromRepoUrl(repoUrl);
+      setCreateForm({
+        repoUrl,
+        name: recommendedName,
+        defaultBranch: String(recommendation.default_branch || formSnapshot.defaultBranch || "").trim(),
+        baseImageMode: normalizeBaseMode(recommendation.base_image_mode || formSnapshot.baseImageMode),
+        baseImageValue: String(recommendation.base_image_value || formSnapshot.baseImageValue || ""),
+        setupScript: String(recommendation.setup_script || formSnapshot.setupScript || ""),
+        defaultVolumes: mountRowsFromArrays(recommendedRoMounts, recommendedRwMounts),
+        defaultEnvVars: envRowsFromArray(recommendedEnvVars)
       });
-      const createdProjectId = String(createProjectResponse?.project?.id || "").trim();
-      if (createdProjectId) {
-        autoConfigProjectOrderAliasByProjectIdRef.current.set(createdProjectId, pendingProjectId);
-      }
+      setCreateProjectConfigMode("manual");
       setPendingAutoConfigProjects((prev) => removePendingAutoConfigProject(prev, pendingProjectId));
-      setCreateForm(emptyCreateForm());
+      setPendingAutoConfigCancels((prev) => {
+        const next = { ...prev };
+        delete next[pendingProjectId];
+        return next;
+      });
       setError("");
-      refreshState().catch(() => {});
     } catch (err) {
       const message = err.message || String(err);
       if (isAutoConfigCancelledError(message)) {
@@ -2785,11 +2783,11 @@ function HubApp() {
       agentCapabilitiesRef.current,
       hubSettingsRef.current.defaultAgentType
     );
-    setCreateForm((prev) => ({ ...prev, repoUrl: "" }));
     if (isAutoCreateProjectConfigMode(createProjectConfigMode)) {
       await handleAutoConfigureCreateForm(formSnapshot, autoConfigStartSettingsSnapshot);
       return;
     }
+    setCreateForm((prev) => ({ ...prev, repoUrl: "" }));
     try {
       const mounts = buildMountPayload(formSnapshot.defaultVolumes);
       const envVars = buildEnvPayload(formSnapshot.defaultEnvVars);
@@ -5067,7 +5065,7 @@ function HubApp() {
                   ) : null}
 
                   <button type="submit" className="btn-primary create-project-submit-button">
-                    Add project
+                    {createProjectManualMode ? "Add project" : "Auto-configure"}
                   </button>
                 </form>
               </section>
@@ -5086,7 +5084,7 @@ function HubApp() {
                     : isFailed ? "Auto configure failed" : "Auto configuring";
                   const showAutoConfigMeta = isCancelled
                     ? "Auto configure cancelled. You can still save or edit the recommendation once generated."
-                    : "Running temporary analysis chat, then creating a configured project entry.";
+                    : "Running temporary analysis chat, then populating project configuration fields.";
                   return (
                     <article className="card project-card" key={project.id}>
                       <div className="project-head">
@@ -5115,7 +5113,7 @@ function HubApp() {
                         <div className="meta build-error">
                           {isCancelled
                             ? (project.build_error || AUTO_CONFIG_CANCELLED_ERROR_TEXT)
-                            : (project.build_error || "Auto configure failed before project creation completed.")}
+                            : (project.build_error || "Auto configure failed before project settings were populated.")}
                         </div>
                       ) : null}
                       <div className="actions project-collapsed-actions">

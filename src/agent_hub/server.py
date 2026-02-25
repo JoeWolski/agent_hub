@@ -274,8 +274,6 @@ AUTO_CONFIG_INVALID_OUTPUT_ERROR = "Temporary auto-config chat returned invalid 
 AUTO_CONFIG_NOTES_MAX_CHARS = 400
 AUTO_CONFIG_REPO_DOCKERFILE_MIN_SCORE = 70
 AUTO_CONFIG_REQUEST_ID_MAX_CHARS = 120
-AUTO_CONFIG_BUILD_MAX_ATTEMPTS = 5
-AUTO_CONFIG_BUILD_LOG_EXCERPT_MAX_CHARS = 12_000
 AUTO_CONFIG_CACHE_SIGNAL_MAX_FILES = 3000
 AUTO_CONFIG_CACHE_SIGNAL_IGNORED_DIRS = {
     ".git",
@@ -2304,6 +2302,14 @@ def _normalize_base_image_mode(mode: Any) -> str:
     raise HTTPException(status_code=400, detail="base_image_mode must be 'tag' or 'repo_path'.")
 
 
+def _normalize_base_image_value(mode: Any, value: Any) -> str:
+    normalized_mode = _normalize_base_image_mode(mode)
+    normalized_value = str(value or "").strip()
+    if normalized_mode == "tag":
+        return normalized_value or str(agent_cli_image.DEFAULT_BASE_IMAGE)
+    return normalized_value
+
+
 def _extract_repo_name(repo_url: str) -> str:
     name = repo_url.rstrip("/").split(":")[-1].rsplit("/", 1)[-1]
     return name[:-4] if name.endswith(".git") else name
@@ -3089,7 +3095,7 @@ def _read_codex_auth(path: Path) -> tuple[bool, str]:
 
 
 def _snapshot_schema_version() -> int:
-    return 4
+    return 5
 
 
 def _docker_remove_images(prefixes: tuple[str, ...], explicit_tags: set[str]) -> None:
@@ -6272,95 +6278,6 @@ class HubState:
         next_recommendation["notes"] = notes
         return next_recommendation
 
-    @staticmethod
-    def _auto_config_validation_project_id(repo_url: str, branch: str) -> str:
-        seed = f"{repo_url}::{branch}"
-        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:8]
-        return f"auto-config-{digest}"
-
-    @staticmethod
-    def _extract_auto_config_build_command(build_log: str) -> str:
-        for line in str(build_log or "").splitlines():
-            cleaned = line.strip()
-            if cleaned.startswith("$ "):
-                return cleaned[2:].strip()
-        return ""
-
-    @staticmethod
-    def _auto_config_build_log_excerpt(build_log: str) -> str:
-        cleaned = ANSI_ESCAPE_RE.sub("", str(build_log or "")).replace("\r", "\n").strip()
-        if not cleaned:
-            return "No build log output captured."
-        if len(cleaned) <= AUTO_CONFIG_BUILD_LOG_EXCERPT_MAX_CHARS:
-            return cleaned
-        tail_chars = max(1, AUTO_CONFIG_BUILD_LOG_EXCERPT_MAX_CHARS - 4)
-        return "...\n" + cleaned[-tail_chars:]
-
-    @staticmethod
-    def _auto_config_build_failure_summary(build_log: str, fallback_detail: str) -> str:
-        summary = _codex_exec_error_message(build_log)
-        if summary and summary != "Unknown error.":
-            return summary
-        fallback = _short_summary(str(fallback_detail or ""), max_words=32, max_chars=240)
-        return fallback or "Snapshot build failed with an unknown error."
-
-    def _attempt_auto_config_recommendation_build(
-        self,
-        workspace: Path,
-        repo_url: str,
-        branch: str,
-        recommendation: dict[str, Any],
-        attempt: int,
-        on_output: Callable[[str], None] | None = None,
-    ) -> dict[str, Any]:
-        validation_project = {
-            "id": self._auto_config_validation_project_id(repo_url, branch),
-            "name": _extract_repo_name(repo_url) or "auto-config",
-            "repo_url": repo_url,
-            "default_branch": branch,
-            "base_image_mode": recommendation.get("base_image_mode"),
-            "base_image_value": recommendation.get("base_image_value"),
-            "setup_script": recommendation.get("setup_script"),
-            "default_ro_mounts": list(recommendation.get("default_ro_mounts") or []),
-            "default_rw_mounts": list(recommendation.get("default_rw_mounts") or []),
-            "default_env_vars": list(recommendation.get("default_env_vars") or []),
-        }
-        log_path = workspace / f".agent-hub-auto-config-build-attempt-{attempt}.log"
-        try:
-            log_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-        try:
-            snapshot_tag = self._ensure_project_setup_snapshot(
-                workspace,
-                validation_project,
-                log_path=log_path,
-                project_id=None,
-                on_output=on_output,
-            )
-        except HTTPException as exc:
-            build_log = ""
-            try:
-                build_log = log_path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                pass
-            detail = str(exc.detail or f"HTTP {exc.status_code}")
-            summary = self._auto_config_build_failure_summary(build_log, detail)
-            return {
-                "ok": False,
-                "status_code": exc.status_code,
-                "detail": detail,
-                "summary": summary,
-                "failing_command": self._extract_auto_config_build_command(build_log),
-                "build_log_excerpt": self._auto_config_build_log_excerpt(build_log),
-            }
-
-        return {
-            "ok": True,
-            "snapshot_tag": snapshot_tag,
-        }
-
     def _prepare_agent_cli_command(
         self,
         *,
@@ -6381,6 +6298,7 @@ class HubState:
         artifacts_url: str = "",
         artifacts_token: str = "",
         resume: bool = False,
+        allocate_tty: bool = True,
         context_key: str = "",
         extra_args: list[str] | None = None,
         setup_script: str = "",
@@ -6407,6 +6325,8 @@ class HubState:
             str(self.system_prompt_file),
             "--no-alt-screen",
         ]
+        if not allocate_tty:
+            cmd.append("--no-tty")
         if resume and agent_type == AGENT_TYPE_CODEX:
             cmd.append("--resume")
         cmd.extend(self._openai_credentials_arg())
@@ -6460,7 +6380,6 @@ class HubState:
         agent_type: str = AGENT_TYPE_CODEX,
         agent_args: list[str] | None = None,
         on_output: Callable[[str], None] | None = None,
-        retry_feedback: str = "",
         request_id: str = "",
     ) -> dict[str, Any]:
         normalized_request_id = self._normalize_auto_config_request_id(request_id)
@@ -6484,16 +6403,6 @@ class HubState:
                 raise HTTPException(status_code=409, detail=AUTO_CONFIG_NOT_CONNECTED_ERROR)
 
         prompt = self._auto_config_prompt(repo_url, branch)
-        retry_feedback_text = str(retry_feedback or "").strip()
-        if retry_feedback_text:
-            prompt = (
-                f"{prompt}\n\n"
-                "Previous recommendation failed a real snapshot build. "
-                "Use this exact failure context to revise the recommendation so the next build succeeds.\n"
-                "Failure context:\n"
-                f"{retry_feedback_text}\n\n"
-                "Return exactly one JSON object with the required schema."
-            )
         output_file = workspace / f".agent-hub-auto-config-{uuid.uuid4().hex}.json"
         container_project_name = _container_project_name(_extract_repo_name(repo_url) or "auto-config")
         container_workspace = str(PurePosixPath(DEFAULT_CONTAINER_HOME) / container_project_name)
@@ -6540,6 +6449,7 @@ class HubState:
             repo_url=repo_url,
             artifacts_url=f"{self.artifact_publish_base_url}/api/agent-tools/sessions/{session_id}/artifacts/publish",
             artifacts_token=artifact_publish_token,
+            allocate_tty=False,
             context_key=f"auto_config_chat:{session_id}",
             extra_args=extra_args,
         )
@@ -6547,8 +6457,6 @@ class HubState:
         emit(f"Working directory: {workspace}\n")
         emit(f"Repository URL: {repo_url}\n")
         emit(f"Branch: {branch}\n\n")
-        if retry_feedback_text:
-            emit("Applying previous build failure context for this retry.\n\n")
 
         if self._is_auto_config_request_cancelled(normalized_request_id):
             raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR)
@@ -6806,40 +6714,6 @@ class HubState:
             self._clear_auto_config_request(normalized_request_id)
 
         recommendation["default_branch"] = resolved_branch
-        recommendation["analysis_model"] = str(chat_result.get("model") or "")
-        recommendation["analysis_agent_type"] = str(chat_result.get("agent_type") or resolved_agent_type)
-        recommendation["analysis_agent_args"] = [
-            str(arg)
-            for arg in (chat_result.get("agent_args") or normalized_agent_args)
-            if str(arg).strip()
-        ]
-        recommendation["analysis_auth_mode"] = CHAT_TITLE_AUTH_MODE_ACCOUNT
-        recommendation["analyzed_repo_url"] = normalized_repo_url
-        auto_project = {
-            "id": self._auto_config_validation_project_id(normalized_repo_url, resolved_branch),
-            "repo_url": normalized_repo_url,
-            "credential_binding": _normalize_project_credential_binding(None),
-        }
-        auto_selected_credential_ids = self._resolve_agent_tools_credential_ids(
-            auto_project,
-            PROJECT_CREDENTIAL_BINDING_MODE_AUTO,
-            [],
-        )
-        if auto_selected_credential_ids:
-            recommendation["credential_binding"] = _normalize_project_credential_binding(
-                {
-                    "mode": (
-                        PROJECT_CREDENTIAL_BINDING_MODE_SINGLE
-                        if len(auto_selected_credential_ids) == 1
-                        else PROJECT_CREDENTIAL_BINDING_MODE_SET
-                    ),
-                    "credential_ids": auto_selected_credential_ids,
-                    "source": "auto_configure",
-                    "updated_at": _iso_now(),
-                }
-            )
-        else:
-            recommendation["credential_binding"] = _normalize_project_credential_binding(None)
         emit_auto_config_log("\nAuto-config completed successfully.\n")
         return recommendation
 
@@ -8326,13 +8200,20 @@ class HubState:
                 project={"repo_url": repo_url, "credential_binding": normalized_binding},
             )
             resolved_default_branch = _detect_default_branch(repo_url, env=git_env)
+        normalized_base_mode = _normalize_base_image_mode(base_image_mode)
+        normalized_base_value = _normalize_base_image_value(normalized_base_mode, base_image_value)
+        if normalized_base_mode == "repo_path" and not normalized_base_value:
+            raise HTTPException(
+                status_code=400,
+                detail="base_image_value is required when base_image_mode is 'repo_path'.",
+            )
         project = {
             "id": project_id,
             "name": project_name,
             "repo_url": repo_url,
             "setup_script": setup_script or "",
-            "base_image_mode": _normalize_base_image_mode(base_image_mode),
-            "base_image_value": (base_image_value or "").strip(),
+            "base_image_mode": normalized_base_mode,
+            "base_image_value": normalized_base_value,
             "default_ro_mounts": default_ro_mounts or [],
             "default_rw_mounts": default_rw_mounts or [],
             "default_env_vars": normalized_env_vars,
@@ -8370,6 +8251,15 @@ class HubState:
         ]:
             if field in update:
                 project[field] = update[field]
+        normalized_base_mode = _normalize_base_image_mode(project.get("base_image_mode"))
+        normalized_base_value = _normalize_base_image_value(normalized_base_mode, project.get("base_image_value"))
+        if normalized_base_mode == "repo_path" and not normalized_base_value:
+            raise HTTPException(
+                status_code=400,
+                detail="base_image_value is required when base_image_mode is 'repo_path'.",
+            )
+        project["base_image_mode"] = normalized_base_mode
+        project["base_image_value"] = normalized_base_value
 
         snapshot_fields = {
             "setup_script",
@@ -9614,12 +9504,15 @@ class HubState:
 
     def _resolve_project_base_value(self, workspace: Path, project: dict[str, Any]) -> tuple[str, str] | None:
         base_mode = _normalize_base_image_mode(project.get("base_image_mode"))
-        base_value = str(project.get("base_image_value") or "").strip()
-        if not base_value:
-            return None
+        base_value = _normalize_base_image_value(base_mode, project.get("base_image_value"))
 
         if base_mode == "tag":
             return "base-image", base_value
+        if not base_value:
+            raise HTTPException(
+                status_code=400,
+                detail="base_image_value is required when base_image_mode is 'repo_path'.",
+            )
 
         workspace_root = workspace.resolve()
         base_candidate = Path(base_value)
@@ -9666,13 +9559,18 @@ class HubState:
 
     def _project_setup_snapshot_tag(self, project: dict[str, Any]) -> str:
         project_id = str(project.get("id") or "")[:12] or "project"
+        normalized_base_mode = _normalize_base_image_mode(project.get("base_image_mode"))
+        normalized_base_value = _normalize_base_image_value(
+            normalized_base_mode,
+            project.get("base_image_value"),
+        )
         payload = json.dumps(
             {
                 "snapshot_schema_version": _snapshot_schema_version(),
                 "project_id": project.get("id"),
                 "setup_script": str(project.get("setup_script") or ""),
-                "base_mode": _normalize_base_image_mode(project.get("base_image_mode")),
-                "base_value": str(project.get("base_image_value") or ""),
+                "base_mode": normalized_base_mode,
+                "base_value": normalized_base_value,
                 "default_ro_mounts": list(project.get("default_ro_mounts") or []),
                 "default_rw_mounts": list(project.get("default_rw_mounts") or []),
                 "default_env_vars": list(project.get("default_env_vars") or []),
@@ -9807,8 +9705,13 @@ class HubState:
         should_save = False
         for pid, project in state["projects"].items():
             project_copy = dict(project)
-            project_copy["base_image_mode"] = _normalize_base_image_mode(project_copy.get("base_image_mode"))
-            project_copy["base_image_value"] = str(project_copy.get("base_image_value") or "")
+            normalized_base_mode = _normalize_base_image_mode(project_copy.get("base_image_mode"))
+            normalized_base_value = _normalize_base_image_value(
+                normalized_base_mode,
+                project_copy.get("base_image_value"),
+            )
+            project_copy["base_image_mode"] = normalized_base_mode
+            project_copy["base_image_value"] = normalized_base_value
             project_copy["default_ro_mounts"] = list(project_copy.get("default_ro_mounts") or [])
             project_copy["default_rw_mounts"] = list(project_copy.get("default_rw_mounts") or [])
             project_copy["default_env_vars"] = list(project_copy.get("default_env_vars") or [])
@@ -9819,6 +9722,12 @@ class HubState:
             project_copy["build_finished_at"] = str(project_copy.get("build_finished_at") or "")
             normalized_binding = _normalize_project_credential_binding(project_copy.get("credential_binding"))
             project_copy["credential_binding"] = normalized_binding
+            if state["projects"].get(pid, {}).get("base_image_mode") != normalized_base_mode:
+                state["projects"][pid]["base_image_mode"] = normalized_base_mode
+                should_save = True
+            if str(state["projects"].get(pid, {}).get("base_image_value") or "").strip() != normalized_base_value:
+                state["projects"][pid]["base_image_value"] = normalized_base_value
+                should_save = True
             if state["projects"].get(pid, {}).get("credential_binding") != normalized_binding:
                 state["projects"][pid]["credential_binding"] = normalized_binding
                 should_save = True

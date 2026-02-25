@@ -199,8 +199,49 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(loaded["default_rw_mounts"], [f"{self.host_rw}:/data_rw"])
         self.assertEqual(loaded["default_env_vars"], ["FOO=bar"])
         self.assertEqual(loaded["base_image_mode"], "tag")
+        self.assertEqual(loaded["base_image_value"], "ubuntu:24.04")
         self.assertEqual(loaded["setup_snapshot_image"], self.state._project_setup_snapshot_tag(project))
         self.assertEqual(loaded["build_status"], "ready")
+
+    def test_project_creation_defaults_tag_base_image_value_when_not_provided(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            base_image_mode="tag",
+            base_image_value="",
+        )
+        self.assertEqual(project["base_image_mode"], "tag")
+        self.assertEqual(project["base_image_value"], "ubuntu:24.04")
+
+    def test_project_creation_requires_base_path_for_repo_path_mode(self) -> None:
+        with self.assertRaises(HTTPException) as ctx:
+            self.state.add_project(
+                repo_url="https://example.com/org/repo.git",
+                default_branch="main",
+                base_image_mode="repo_path",
+                base_image_value="",
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(
+            ctx.exception.detail,
+            "base_image_value is required when base_image_mode is 'repo_path'.",
+        )
+
+    def test_state_payload_backfills_missing_tag_base_value(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            base_image_mode="tag",
+            base_image_value="ubuntu:24.04",
+        )
+        state_data = self.state.load()
+        state_data["projects"][project["id"]]["base_image_value"] = ""
+        self.state.save(state_data)
+
+        payload = self.state.state_payload()
+        loaded = next(item for item in payload["projects"] if item["id"] == project["id"])
+        self.assertEqual(loaded["base_image_mode"], "tag")
+        self.assertEqual(loaded["base_image_value"], "ubuntu:24.04")
 
     def test_project_creation_auto_discovers_credential_binding(self) -> None:
         self._connect_github_pat()
@@ -5067,6 +5108,8 @@ Gemini CLI
         self.assertIn("gpt-5-codex", cmd)
         self.assertIn("-c", cmd)
         self.assertIn('model_reasoning_effort="high"', cmd)
+        self.assertIn("--no-tty", cmd)
+        self.assertLess(cmd.index("--no-tty"), cmd.index("--"))
         self.assertLess(cmd.index("--model"), cmd.index("exec"))
         self.assertTrue(any(str(entry).startswith("AGENT_HUB_AGENT_TOOLS_URL=") for entry in cmd))
         self.assertTrue(any(str(entry).startswith("AGENT_HUB_AGENT_TOOLS_TOKEN=") for entry in cmd))
@@ -5116,10 +5159,6 @@ Gemini CLI
                 },
                 "model": "chatgpt-account-codex",
             },
-        ), patch.object(
-            self.state,
-            "_attempt_auto_config_recommendation_build",
-            return_value={"ok": True, "snapshot_tag": "agent-hub-setup-autocfg"},
         ):
             recommendation = self.state.auto_configure_project(
                 repo_url="https://example.com/org/repo.git",
@@ -5134,7 +5173,6 @@ Gemini CLI
         self.assertEqual(attempted_clone_envs[1].get("GIT_CONFIG_COUNT"), "0")
         self.assertNotIn("BAD_AUTH", attempted_clone_envs[1])
         self.assertEqual(recommendation["base_image_mode"], "tag")
-        self.assertEqual(recommendation["analysis_model"], "chatgpt-account-codex")
 
     def test_cancel_auto_configure_request_marks_cancelled_with_active_process(self) -> None:
         request_id = "cancel-auto-001"
@@ -5202,7 +5240,6 @@ Gemini CLI
             agent_type: str = "codex",
             agent_args: list[str] | None = None,
             on_output: Callable[[str], None] | None = None,
-            retry_feedback: str = "",
             request_id: str = "",
         ) -> dict[str, Any]:
             self.assertTrue(workspace.exists())
@@ -5211,7 +5248,6 @@ Gemini CLI
             self.assertEqual(agent_type, "codex")
             self.assertEqual(agent_args or [], [])
             self.assertEqual(request_id, "pending-auto-123")
-            self.assertEqual(retry_feedback, "")
             if on_output is not None:
                 on_output("assistant> analyzing repository layout...\n")
             return {
@@ -5239,10 +5275,6 @@ Gemini CLI
             side_effect=fake_temporary_chat,
         ), patch.object(
             self.state,
-            "_attempt_auto_config_recommendation_build",
-            return_value={"ok": True, "snapshot_tag": "agent-hub-setup-autocfg"},
-        ), patch.object(
-            self.state,
             "_emit_auto_config_log",
             side_effect=capture_live_log,
         ):
@@ -5253,7 +5285,6 @@ Gemini CLI
             )
 
         self.assertEqual(recommendation["default_branch"], "main")
-        self.assertEqual(recommendation["analysis_model"], "chatgpt-account-codex")
         self.assertTrue(emitted_logs)
         self.assertTrue(all(request_id == "pending-auto-123" for request_id, _text, _replace in emitted_logs))
         self.assertTrue(any(replace for _request_id, _text, replace in emitted_logs))
@@ -5264,9 +5295,7 @@ Gemini CLI
             )
         )
 
-    def test_auto_configure_project_retries_build_failures_and_applies_feedback(self) -> None:
-        retry_feedbacks: list[str] = []
-
+    def test_auto_configure_project_runs_single_discovery_attempt(self) -> None:
         def fake_run(
             cmd: list[str],
             cwd: Path | None = None,
@@ -5287,7 +5316,6 @@ Gemini CLI
             agent_type: str = "codex",
             agent_args: list[str] | None = None,
             on_output: Callable[[str], None] | None = None,
-            retry_feedback: str = "",
             request_id: str = "",
         ) -> dict[str, Any]:
             self.assertTrue(workspace.exists())
@@ -5295,28 +5323,14 @@ Gemini CLI
             self.assertEqual(branch, "main")
             self.assertEqual(agent_type, "codex")
             self.assertEqual(agent_args or [], [])
-            retry_feedbacks.append(retry_feedback)
             self.assertEqual(request_id, "")
             if on_output is not None:
                 on_output("assistant> generated recommendation\n")
-            if len(retry_feedbacks) == 1:
-                return {
-                    "payload": {
-                        "base_image_mode": "tag",
-                        "base_image_value": "ubuntu:22.04",
-                        "setup_script": "apt-get install -y build-essential",
-                        "default_ro_mounts": [],
-                        "default_rw_mounts": [],
-                        "default_env_vars": [],
-                        "notes": "",
-                    },
-                    "model": "chatgpt-account-codex",
-                }
             return {
                 "payload": {
                     "base_image_mode": "tag",
-                    "base_image_value": "ubuntu:24.04",
-                    "setup_script": "apt-get update\napt-get install -y build-essential",
+                    "base_image_value": "ubuntu:22.04",
+                    "setup_script": "apt-get install -y build-essential",
                     "default_ro_mounts": [],
                     "default_rw_mounts": [],
                     "default_env_vars": [],
@@ -5332,96 +5346,18 @@ Gemini CLI
             self.state,
             "_run_temporary_auto_config_chat",
             side_effect=fake_temporary_chat,
-        ) as temporary_chat, patch.object(
-            self.state,
-            "_attempt_auto_config_recommendation_build",
-            side_effect=[
-                {
-                    "ok": False,
-                    "summary": "apt-get update was missing before apt-get install.",
-                    "failing_command": "uv run --project /workspace/agent_hub agent_cli ...",
-                    "build_log_excerpt": "$ uv run --project /workspace/agent_hub agent_cli ...\nE: Unable to locate package build-essential",
-                },
-                {
-                    "ok": True,
-                    "snapshot_tag": "agent-hub-setup-autocfg",
-                },
-            ],
-        ) as build_attempt:
+        ) as temporary_chat:
             recommendation = self.state.auto_configure_project(
                 repo_url="https://example.com/org/repo.git",
                 default_branch="",
             )
 
-        self.assertEqual(temporary_chat.call_count, 2)
-        self.assertEqual(build_attempt.call_count, 2)
-        self.assertEqual(retry_feedbacks[0], "")
-        self.assertIn("Attempt 1 of 5 failed.", retry_feedbacks[1])
-        self.assertIn("Build log excerpt:", retry_feedbacks[1])
-        self.assertEqual(recommendation["base_image_value"], "ubuntu:24.04")
+        self.assertEqual(temporary_chat.call_count, 1)
+        self.assertEqual(recommendation["base_image_value"], "ubuntu:22.04")
         self.assertEqual(
             recommendation["setup_script"],
             "apt-get update\napt-get install -y build-essential",
         )
-        self.assertEqual(recommendation["analysis_model"], "chatgpt-account-codex")
-
-    def test_auto_configure_project_reports_summary_and_build_log_after_max_retries(self) -> None:
-        def fake_run(
-            cmd: list[str],
-            cwd: Path | None = None,
-            capture: bool = False,
-            check: bool = True,
-            env: dict[str, str] | None = None,
-        ) -> subprocess.CompletedProcess:
-            del cwd, capture, check, env
-            if cmd[:2] == ["git", "clone"]:
-                Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
-                return subprocess.CompletedProcess(cmd, 0, "Cloning into 'repo'...\n", "")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-
-        with patch("agent_hub.server._detect_default_branch", return_value="main"), patch(
-            "agent_hub.server._run",
-            side_effect=fake_run,
-        ), patch.object(
-            self.state,
-            "_run_temporary_auto_config_chat",
-            return_value={
-                "payload": {
-                    "base_image_mode": "tag",
-                    "base_image_value": "ubuntu:22.04",
-                    "setup_script": "",
-                    "default_ro_mounts": [],
-                    "default_rw_mounts": [],
-                    "default_env_vars": [],
-                    "notes": "",
-                },
-                "model": "chatgpt-account-codex",
-            },
-        ) as temporary_chat, patch.object(
-            self.state,
-            "_attempt_auto_config_recommendation_build",
-            return_value={
-                "ok": False,
-                "summary": "docker build failed: missing compiler toolchain.",
-                "failing_command": "uv run --project /workspace/agent_hub agent_cli ...",
-                "build_log_excerpt": "$ uv run --project /workspace/agent_hub agent_cli ...\nERROR: gcc: command not found",
-            },
-        ) as build_attempt:
-            with self.assertRaises(HTTPException) as ctx:
-                self.state.auto_configure_project(
-                    repo_url="https://example.com/org/repo.git",
-                    default_branch="",
-                )
-
-        self.assertEqual(ctx.exception.status_code, 422)
-        detail = str(ctx.exception.detail)
-        self.assertIn("could not produce a buildable setup after 5 attempts", detail)
-        self.assertIn("Issue summary: docker build failed: missing compiler toolchain.", detail)
-        self.assertIn("Failing command: uv run --project /workspace/agent_hub agent_cli ...", detail)
-        self.assertIn("Build log:", detail)
-        self.assertIn("ERROR: gcc: command not found", detail)
-        self.assertEqual(temporary_chat.call_count, hub_server.AUTO_CONFIG_BUILD_MAX_ATTEMPTS)
-        self.assertEqual(build_attempt.call_count, hub_server.AUTO_CONFIG_BUILD_MAX_ATTEMPTS)
 
     def test_codex_exec_error_message_full_returns_complete_error_line(self) -> None:
         long_error_line = (
@@ -6169,6 +6105,14 @@ class CliEnvVarTests(unittest.TestCase):
             script.index("printf '%s\\n' '[agent_cli] snapshot bootstrap: running project setup script'"),
         )
 
+    def test_snapshot_setup_runtime_image_for_snapshot_changes_with_snapshot_tag(self) -> None:
+        first_runtime = image_cli._snapshot_setup_runtime_image_for_snapshot("snapshot:alpha")
+        second_runtime = image_cli._snapshot_setup_runtime_image_for_snapshot("snapshot:beta")
+
+        self.assertTrue(first_runtime.startswith("agent-runtime-setup-"))
+        self.assertTrue(second_runtime.startswith("agent-runtime-setup-"))
+        self.assertNotEqual(first_runtime, second_runtime)
+
     def test_snapshot_commit_resets_entrypoint_and_cmd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -6209,11 +6153,28 @@ class CliEnvVarTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.exit_code, 0, msg=result.output)
+            expected_setup_runtime = image_cli._snapshot_setup_runtime_image_for_snapshot("snapshot:test")
+            runtime_build_cmd = next(
+                (
+                    cmd
+                    for cmd in commands
+                    if len(cmd) >= 2
+                    and cmd[:2] == ["docker", "build"]
+                    and expected_setup_runtime in cmd
+                ),
+                None,
+            )
+            self.assertIsNotNone(runtime_build_cmd)
+            assert runtime_build_cmd is not None
+            self.assertIn("BASE_IMAGE=ubuntu:24.04", runtime_build_cmd)
+            self.assertIn("AGENT_PROVIDER=none", runtime_build_cmd)
             setup_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
             self.assertIsNotNone(setup_cmd)
             assert setup_cmd is not None
             self.assertIn("--entrypoint", setup_cmd)
             self.assertIn("bash", setup_cmd)
+            self.assertEqual(setup_cmd[-3], expected_setup_runtime)
+            self.assertEqual(setup_cmd[-2], "-lc")
             setup_script = setup_cmd[-1]
             self.assertIn("set -o pipefail", setup_script)
             self.assertIn("git config --global --add safe.directory '*'", setup_script)
@@ -8425,6 +8386,46 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("--add-host", run_cmd)
             self.assertIn("host.docker.internal:host-gateway", run_cmd)
 
+    def test_cli_no_tty_flag_omits_docker_t_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--no-tty",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            self.assertIn("-i", run_cmd)
+            self.assertNotIn("-t", run_cmd)
+
     def test_agent_hub_main_clean_start_invokes_state_cleanup(self) -> None:
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmp:
@@ -8584,7 +8585,6 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             "default_rw_mounts": [],
             "default_env_vars": [],
             "notes": "",
-            "analysis_model": "chatgpt-account-codex",
         }
 
         with patch(

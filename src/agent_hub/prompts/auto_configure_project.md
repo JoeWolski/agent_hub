@@ -7,7 +7,6 @@ Speed-first behavior:
 - Prefer fast, container-first discovery (devcontainer, docker-compose, CI Dockerfiles).
 - If a strong container signal is found, avoid broad extra discovery unless needed for unresolved bootstrap commands.
 - Do not impose hard file-count or command-count limits, but keep exploration minimal and deterministic.
-- If a previous build failure context is provided, make only the smallest targeted fix required by that context.
 
 Agent Hub project configuration semantics:
 - base_image_mode: 'tag' or 'repo_path'
