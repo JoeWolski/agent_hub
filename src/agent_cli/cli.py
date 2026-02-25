@@ -1113,7 +1113,6 @@ def _build_snapshot_setup_shell_script(setup_script: str) -> str:
         "set -o pipefail\n"
         "printf '%s\\n' '[agent_cli] snapshot bootstrap: preparing writable /workspace/tmp'\n"
         "mkdir -p /workspace/tmp\n"
-        "chmod 777 /workspace/tmp\n"
         "printf '%s\\n' '[agent_cli] snapshot bootstrap: configuring git safe.directory'\n"
         "git config --global --add safe.directory '*'\n"
         'if [ -n "${AGENT_HUB_GIT_CREDENTIALS_SOURCE:-}" ]; then\n'
@@ -1179,11 +1178,6 @@ def _default_runtime_image_for_provider(agent_provider: str) -> str:
 
 def _snapshot_runtime_image_for_provider(snapshot_tag: str, agent_provider: str) -> str:
     return f"agent-runtime-{_sanitize_tag_component(agent_provider)}-{_short_hash(snapshot_tag)}"
-
-
-def _snapshot_setup_runtime_image_for_base(base_image: str) -> str:
-    normalized_base = str(base_image or "").strip()
-    return f"agent-runtime-setup-{_short_hash(normalized_base)}"
 
 
 def _runtime_image_build_lock_path(target_image: str) -> Path:
@@ -1847,8 +1841,6 @@ def main(
     if snapshot_tag:
         should_build_snapshot = not cached_snapshot_exists
         if should_build_snapshot:
-            selected_base_for_snapshot = ensure_selected_base_image()
-            setup_runtime_image = _snapshot_setup_runtime_image_for_base(selected_base_for_snapshot)
             click.echo(
                 f"Running RW mount preflight checks for setup snapshot '{snapshot_tag}'",
                 err=True,
@@ -1856,8 +1848,8 @@ def main(
             for host_path, container_path in rw_mount_specs:
                 _validate_rw_mount(host_path, container_path, runtime_uid=uid, runtime_gid=gid)
             _ensure_runtime_image_built_if_missing(
-                base_image=selected_base_for_snapshot,
-                target_image=setup_runtime_image,
+                base_image=ensure_selected_base_image(),
+                target_image=DEFAULT_SETUP_RUNTIME_IMAGE,
                 agent_provider=AGENT_PROVIDER_NONE,
             )
             script = (setup_script or "").strip() or ":"
@@ -1875,7 +1867,7 @@ def main(
                 "--entrypoint",
                 "bash",
                 *run_args,
-                setup_runtime_image,
+                DEFAULT_SETUP_RUNTIME_IMAGE,
                 "-lc",
                 setup_bootstrap_script,
             ]
