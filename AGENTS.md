@@ -60,7 +60,7 @@
 - 1. Install browser tooling: `cd tools/demo && npm ci`
 - 2. Mirror auth/config context from the active server before launching the evidence server (so screenshots reflect real connected state and do not show unrelated credential/setup errors):
 - `export SOURCE_DATA_DIR=\"${SOURCE_DATA_DIR:-$HOME/.local/share/agent-hub}\"`
-- `export UI_DATA_DIR=/tmp/agent-hub-ui-evidence`
+- `export UI_DATA_DIR=/workspace/tmp/agent-hub-ui-evidence`
 - `mkdir -p \"$UI_DATA_DIR\" \"$UI_DATA_DIR/secrets\" \"$HOME/.agent-home/uid-$(id -u)/.codex\"`
 - `if [ -d \"$SOURCE_DATA_DIR/secrets\" ]; then rm -rf \"$UI_DATA_DIR/secrets\" && mkdir -p \"$UI_DATA_DIR/secrets\" && cp -a \"$SOURCE_DATA_DIR/secrets/.\" \"$UI_DATA_DIR/secrets/\"; fi`
 - `if [ -f \"$HOME/.codex/auth.json\" ]; then cp \"$HOME/.codex/auth.json\" \"$HOME/.agent-home/uid-$(id -u)/.codex/auth.json\"; fi`
@@ -68,7 +68,7 @@
 - `cp SYSTEM_PROMPT.md \"$UI_DATA_DIR/SYSTEM_PROMPT.md\"`
 - 3. Start real app server in one terminal with mirrored config context: `UV_PROJECT_ENVIRONMENT=.venv-local uv run agent_hub --host 127.0.0.1 --port 8876 --data-dir \"$UI_DATA_DIR\" --config-file \"$UI_DATA_DIR/agent.config.toml\" --system-prompt-file \"$UI_DATA_DIR/SYSTEM_PROMPT.md\" --frontend-build`
 - 4. Sanity-check auth before screenshots (example: `curl -fsS http://127.0.0.1:8876/api/settings/auth`) and do not proceed while unrelated credential/setup errors are visible in UI state targeted for evidence.
-- 5. Capture screenshots in another terminal using Playwright against `http://127.0.0.1:8876` (real backend) and save to `.agent-artifacts/` (or `/tmp/agent-hub-ui-evidence/`). Prefer `type: "jpeg"`/`.jpg` outputs unless PNG is explicitly needed.
+- 5. Capture screenshots in another terminal using Playwright against `http://127.0.0.1:8876` (real backend) and save to `.agent-artifacts/` (or `/workspace/tmp/agent-hub-ui-evidence/`). Prefer `type: "jpeg"`/`.jpg` outputs unless PNG is explicitly needed.
 - Chat view selector note: the Chats page can render in different layout engines (for example classic cards vs FlexLayout tabs), so Playwright screenshot scripts must not assume a single DOM structure for locating chat rows or controls.
 - Startup validation note: when capturing evidence for chat launch behavior, verify state with `/api/state` polling and explicit assertions that failure UI copy is absent (for example `Chat failed. Review the error and retry.`), instead of depending only on a specific transient CSS class like `.status.starting`.
 - Docker-in-Docker gotcha: ensure `UI_DATA_DIR` and any `--config-file` path used for screenshot runs are bind-mountable from the Docker daemon host perspective, not only visible inside the current container.
