@@ -536,7 +536,7 @@ def _build_agent_tools_runtime_config(
         script_path=mcp_script_path,
     )
 
-    ext = ".json" if isinstance(agent_provider, agent_providers.ClaudeProvider) else ".toml"
+    ext = ".json" if isinstance(agent_provider, (agent_providers.ClaudeProvider, agent_providers.GeminiProvider)) else ".toml"
     runtime_config_path = host_codex_dir / f"agent-tools-runtime-{uuid.uuid4().hex}{ext}"
     try:
         _write_private_text_file(runtime_config_path, merged_config)
