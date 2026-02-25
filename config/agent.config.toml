@@ -47,3 +47,6 @@ tool_output_token_limit = 2000
 
 [notice]
 hide_full_access_warning = true
+
+[tui]
+animations = false
