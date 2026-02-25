@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -101,11 +102,41 @@ def _ensure_claude_native_command_path(*, command: list[str], home: str, source_
         ) from exc
 
 
+def _ensure_claude_json_file(path: Path) -> None:
+    try:
+        if path.exists():
+            if not path.is_file():
+                raise RuntimeError(
+                    "Claude config bootstrap failed: "
+                    f"path={str(path)!r} is not a regular file."
+                )
+            raw = path.read_text(encoding="utf-8")
+            try:
+                json.loads(raw)
+                return
+            except json.JSONDecodeError:
+                path.write_text("{}\n", encoding="utf-8")
+                return
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            "Claude config bootstrap failed: "
+            f"path={str(path)!r} unable to initialize config: {exc}"
+        ) from exc
+    except UnicodeError:
+        path.write_text("{}\n", encoding="utf-8")
+
+
 def _entrypoint_main() -> None:
     command = list(sys.argv[1:]) if sys.argv[1:] else ["codex"]
     local_home = os.environ.get("LOCAL_HOME", "").strip() or os.environ.get("HOME", "").strip() or "/tmp"
     if not os.environ.get("HOME"):
         os.environ["HOME"] = local_home
+
+    if command and Path(command[0]).name == "claude":
+        _ensure_claude_json_file(Path(os.environ["HOME"]) / ".claude.json")
 
     _set_umask()
     _ensure_claude_native_command_path(command=command, home=os.environ["HOME"])

@@ -45,6 +45,7 @@ DEFAULT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
 DEFAULT_CLAUDE_MODEL = "opus"
 DEFAULT_GEMINI_APPROVAL_MODE = "yolo"
 GEMINI_CONTEXT_FILE_NAME = "GEMINI.md"
+GEMINI_SETTINGS_FILE_NAME = "settings.json"
 SYSTEM_PROMPT_FILE_NAME = "SYSTEM_PROMPT.md"
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 TMP_DIR_TMPFS_SPEC = "/tmp:mode=1777,exec"
@@ -425,6 +426,7 @@ class _AgentToolsRuntimeBridge:
     session_id: str
     server: ThreadingHTTPServer | None
     thread: Thread | None
+    cleanup_runtime_config: bool = True
 
     def close(self) -> None:
         if self.server is not None:
@@ -447,10 +449,11 @@ class _AgentToolsRuntimeBridge:
                     sessions.pop(self.session_id, None)
             except Exception:
                 pass
-        try:
-            self.runtime_config_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if self.cleanup_runtime_config:
+            try:
+                self.runtime_config_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _resolve_existing_project_context(state: object, repo_url: str) -> tuple[str, dict[str, object]]:
@@ -494,6 +497,7 @@ def _build_agent_tools_runtime_config(
     agent_tools_env: dict[str, str],
     agent_provider: agent_providers.AgentProvider,
     container_home: str,
+    agent_tools_config_path: Path | None = None,
 ) -> Path:
     from agent_hub import server as hub_server
 
@@ -517,10 +521,34 @@ def _build_agent_tools_runtime_config(
         except OSError as exc:
             raise click.ClickException(f"Failed to materialize agent_tools MCP script {runtime_script}: {exc}") from exc
 
+    if isinstance(agent_provider, (agent_providers.ClaudeProvider, agent_providers.GeminiProvider)):
+        base_config_path = agent_tools_config_path or config_path
+        runtime_config_path = base_config_path if agent_tools_config_path is not None else (
+            host_codex_dir / f"agent-tools-runtime-{uuid.uuid4().hex}.json"
+        )
+    else:
+        base_config_path = config_path
+        runtime_config_path = host_codex_dir / f"agent-tools-runtime-{uuid.uuid4().hex}.toml"
+
     try:
-        base_config = config_path.read_text(encoding="utf-8", errors="ignore")
+        base_config = base_config_path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise click.ClickException(f"Failed to read config file {config_path}: {exc}") from exc
+        raise click.ClickException(f"Failed to read config file {base_config_path}: {exc}") from exc
+
+    if (
+        isinstance(agent_provider, (agent_providers.ClaudeProvider, agent_providers.GeminiProvider))
+        and agent_tools_config_path is not None
+    ):
+        base_config_text = base_config.strip()
+        if base_config_text:
+            try:
+                parsed_config = json.loads(base_config_text)
+            except json.JSONDecodeError as exc:
+                raise click.ClickException(
+                    f"Failed to parse JSON config file {base_config_path}: {exc}"
+                ) from exc
+            if not isinstance(parsed_config, dict):
+                raise click.ClickException(f"{base_config_path} must contain a JSON object for MCP config merging.")
 
     agent_tools_url = str(agent_tools_env.get(AGENT_TOOLS_URL_ENV) or "").strip()
     agent_tools_token = str(agent_tools_env.get(AGENT_TOOLS_TOKEN_ENV) or "").strip()
@@ -548,8 +576,10 @@ def _build_agent_tools_runtime_config(
         script_path=mcp_script_path,
     )
 
-    ext = ".json" if isinstance(agent_provider, agent_providers.ClaudeProvider) else ".toml"
-    runtime_config_path = host_codex_dir / f"agent-tools-runtime-{uuid.uuid4().hex}{ext}"
+    ext = ".json" if isinstance(agent_provider, (agent_providers.ClaudeProvider, agent_providers.GeminiProvider)) else ".toml"
+    if runtime_config_path.suffix != ext:
+        runtime_config_path = runtime_config_path.with_suffix(ext)
+
     try:
         _write_private_text_file(runtime_config_path, merged_config)
     except OSError as exc:
@@ -563,10 +593,16 @@ def _start_agent_tools_runtime_bridge(
     host_codex_dir: Path,
     config_path: Path,
     system_prompt_path: Path,
+    agent_tools_config_path: Path | None,
     parsed_env_vars: list[str],
     agent_provider: agent_providers.AgentProvider,
     container_home: str,
 ) -> _AgentToolsRuntimeBridge | None:
+    preserve_agent_tools_config = bool(
+        isinstance(agent_provider, (agent_providers.ClaudeProvider, agent_providers.GeminiProvider))
+        and agent_tools_config_path is not None
+    )
+
     if AGENT_TOOLS_URL_ENV in _env_var_keys(parsed_env_vars) or AGENT_TOOLS_TOKEN_ENV in _env_var_keys(parsed_env_vars):
         keys = _env_var_keys(parsed_env_vars)
         if AGENT_TOOLS_URL_ENV not in keys or AGENT_TOOLS_TOKEN_ENV not in keys:
@@ -579,6 +615,10 @@ def _start_agent_tools_runtime_bridge(
             agent_tools_env=_agent_tools_env_from_entries(parsed_env_vars),
             agent_provider=agent_provider,
             container_home=container_home,
+            agent_tools_config_path=agent_tools_config_path if isinstance(
+                agent_provider,
+                (agent_providers.ClaudeProvider, agent_providers.GeminiProvider),
+            ) else None,
         )
         return _AgentToolsRuntimeBridge(
             runtime_config_path=runtime_config_path,
@@ -587,6 +627,7 @@ def _start_agent_tools_runtime_bridge(
             session_id="",
             server=None,
             thread=None,
+            cleanup_runtime_config=not preserve_agent_tools_config,
         )
 
     from agent_hub import server as hub_server
@@ -722,6 +763,10 @@ def _start_agent_tools_runtime_bridge(
             agent_tools_env=_agent_tools_env_from_entries(env_vars),
             agent_provider=agent_provider,
             container_home=container_home,
+            agent_tools_config_path=agent_tools_config_path if isinstance(
+                agent_provider,
+                (agent_providers.ClaudeProvider, agent_providers.GeminiProvider),
+            ) else None,
         )
         return _AgentToolsRuntimeBridge(
             runtime_config_path=runtime_config_path,
@@ -730,6 +775,7 @@ def _start_agent_tools_runtime_bridge(
             session_id=session_id,
             server=server,
             thread=thread,
+            cleanup_runtime_config=not preserve_agent_tools_config,
         )
     except Exception:
         if server is not None:
@@ -753,10 +799,11 @@ def _start_agent_tools_runtime_bridge(
                 except Exception:
                     pass
         if runtime_config_path is not None:
-            try:
-                runtime_config_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if not preserve_agent_tools_config:
+                try:
+                    runtime_config_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         raise
 
 
@@ -1222,15 +1269,62 @@ def _ensure_claude_json_file(path: Path) -> None:
         if not path.is_file():
             raise click.ClickException(f"Claude config path exists but is not a file: {path}")
         try:
-            if path.stat().st_size > 0:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise click.ClickException(f"Unable to read Claude config file {path}: {exc}") from exc
+        stripped_raw = raw.strip()
+        if stripped_raw:
+            try:
+                parsed = json.loads(stripped_raw)
+                if not isinstance(parsed, dict):
+                    raise click.ClickException(f"Claude config file {path} must be a JSON object")
                 return
-        except OSError as exc:
-            raise click.ClickException(f"Unable to inspect Claude config file {path}: {exc}") from exc
+            except json.JSONDecodeError as exc:
+                raise click.ClickException(f"Claude config file {path} must be valid JSON: {exc}") from exc
 
+        try:
+            path.write_text("{}\n", encoding="utf-8")
+        except OSError as exc:
+            raise click.ClickException(f"Unable to initialize Claude config file {path}: {exc}") from exc
+        return
     try:
         path.write_text("{}\n", encoding="utf-8")
     except OSError as exc:
         raise click.ClickException(f"Unable to initialize Claude config file {path}: {exc}") from exc
+
+
+def _ensure_gemini_settings_file(path: Path) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise click.ClickException(f"Unable to create parent directory for Gemini settings file {path}: {exc}") from exc
+
+    if path.exists():
+        if not path.is_file():
+            raise click.ClickException(f"Gemini settings path exists but is not a file: {path}")
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise click.ClickException(f"Unable to read Gemini settings file {path}: {exc}") from exc
+
+        stripped_raw = raw.strip()
+        if stripped_raw:
+            try:
+                parsed = json.loads(stripped_raw)
+                if not isinstance(parsed, dict):
+                    raise click.ClickException(f"Gemini settings file {path} must be a JSON object")
+                return
+            except json.JSONDecodeError as exc:
+                raise click.ClickException(f"Gemini settings file {path} must be valid JSON: {exc}") from exc
+        try:
+            path.write_text("{}", encoding="utf-8")
+        except OSError as exc:
+            raise click.ClickException(f"Unable to initialize Gemini settings file {path}: {exc}") from exc
+        return
+    try:
+        path.write_text("{}", encoding="utf-8")
+    except OSError as exc:
+        raise click.ClickException(f"Unable to initialize Gemini settings file {path}: {exc}") from exc
 
 
 def _normalize_git_credential_host(raw_value: str) -> str:
@@ -1542,9 +1636,11 @@ def main(
     host_claude_json_file = host_agent_home / ".claude.json"
     host_claude_config_dir = host_agent_home / ".config" / "claude"
     host_gemini_dir = host_agent_home / ".gemini"
+    host_gemini_settings_file = host_gemini_dir / GEMINI_SETTINGS_FILE_NAME
     host_codex_dir.mkdir(parents=True, exist_ok=True)
     host_claude_dir.mkdir(parents=True, exist_ok=True)
     _ensure_claude_json_file(host_claude_json_file)
+    _ensure_gemini_settings_file(host_gemini_settings_file)
     host_claude_config_dir.mkdir(parents=True, exist_ok=True)
     host_gemini_dir.mkdir(parents=True, exist_ok=True)
     (host_agent_home / "projects").mkdir(parents=True, exist_ok=True)
@@ -1646,7 +1742,15 @@ def main(
         ]
 
     config_mount_target = f"{container_home_path}/.codex/config.toml:ro"
-    mcp_config_mount_target = agent_provider.get_mcp_config_mount_target(container_home_path) + ":ro"
+    mcp_config_mount_target = agent_provider.get_mcp_config_mount_target(container_home_path)
+    mcp_config_mount_mode = ":ro"
+    if isinstance(agent_provider, (agent_providers.ClaudeProvider, agent_providers.GeminiProvider)):
+        mcp_config_mount_mode = ""
+    mcp_config_mount_entry = (
+        f"{host_gemini_settings_file}:{mcp_config_mount_target}{mcp_config_mount_mode}"
+        if isinstance(agent_provider, agent_providers.GeminiProvider)
+        else None
+    )
     config_mount_entry = f"{config_path}:{config_mount_target}"
     run_args = [
         "--init",
@@ -1672,6 +1776,11 @@ def main(
         f"{host_gemini_dir}:{container_home_path}/.gemini",
         "--volume",
         config_mount_entry,
+        *(
+            ["--volume", mcp_config_mount_entry]
+            if mcp_config_mount_entry is not None
+            else []
+        ),
         "--env",
         f"LOCAL_UMASK={local_umask}",
         "--env",
@@ -1817,14 +1926,21 @@ def main(
             host_codex_dir=host_codex_dir,
             config_path=config_path,
             system_prompt_path=system_prompt_path,
+            agent_tools_config_path=(
+                host_claude_json_file
+                if isinstance(agent_provider, agent_providers.ClaudeProvider)
+                else host_gemini_settings_file
+                if isinstance(agent_provider, agent_providers.GeminiProvider)
+                else None
+            ),
             parsed_env_vars=parsed_env_vars,
             agent_provider=agent_provider,
             container_home=container_home_path,
         )
         if runtime_bridge is not None:
             runtime_run_args = list(run_args)
-            runtime_mount = f"{runtime_bridge.runtime_config_path}:{mcp_config_mount_target}"
-            mcp_mount_target = agent_provider.get_mcp_config_mount_target(container_home_path)
+            runtime_mount = f"{runtime_bridge.runtime_config_path}:{mcp_config_mount_target}{mcp_config_mount_mode}"
+            mcp_mount_target = mcp_config_mount_target
 
             replaced_mount = False
             for index in range(len(runtime_run_args) - 1):

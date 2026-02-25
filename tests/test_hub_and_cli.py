@@ -1649,6 +1649,23 @@ Gemini CLI
         )
         self.assertEqual(self.state.agent_tools_mcp_runtime_script.stat().st_mode & 0o777, 0o600)
 
+    def test_prepare_chat_runtime_config_uses_json_for_gemini(self) -> None:
+        self.config_file.write_text("model = 'test'\n", encoding="utf-8")
+        runtime_config_file = self.state._prepare_chat_runtime_config(
+            "chat-gemini-json",
+            agent_type="gemini",
+            agent_tools_url="http://host.docker.internal:8765/api/chats/chat-mcp-test/agent-tools",
+            agent_tools_token="mcp-token-test",
+            agent_tools_project_id="project-mcp-test",
+            agent_tools_chat_id="chat-gemini-json",
+        )
+
+        self.assertEqual(runtime_config_file.suffix, ".json")
+        runtime_text = runtime_config_file.read_text(encoding="utf-8")
+        parsed = json.loads(runtime_text)
+        self.assertIn("mcpServers", parsed)
+        self.assertIn("agent_tools", parsed["mcpServers"])
+
     def test_start_chat_filters_reserved_openai_env_vars(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
@@ -5642,6 +5659,15 @@ class CliEnvVarTests(unittest.TestCase):
 
             self.assertEqual(json.loads(claude_json_file.read_text(encoding="utf-8")), {})
 
+    def test_ensure_claude_json_file_raises_on_invalid_json_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_json_file = Path(tmp) / ".claude.json"
+            claude_json_file.write_text("{", encoding="utf-8")
+
+            with self.assertRaises(ClickException) as ctx:
+                image_cli._ensure_claude_json_file(claude_json_file)
+            self.assertIn("must be valid JSON", str(ctx.exception))
+
     def test_ensure_claude_json_file_preserves_existing_non_empty_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             claude_json_file = Path(tmp) / ".claude.json"
@@ -5658,6 +5684,55 @@ class CliEnvVarTests(unittest.TestCase):
 
             with self.assertRaises(ClickException) as ctx:
                 image_cli._ensure_claude_json_file(claude_json_dir)
+
+            self.assertIn("not a file", str(ctx.exception))
+
+    def test_ensure_gemini_settings_file_initializes_missing_file_with_valid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gemini_settings_file = Path(tmp) / ".gemini" / "settings.json"
+
+            image_cli._ensure_gemini_settings_file(gemini_settings_file)
+
+            self.assertTrue(gemini_settings_file.is_file())
+            self.assertEqual(json.loads(gemini_settings_file.read_text(encoding="utf-8")), {})
+
+    def test_ensure_gemini_settings_file_rewrites_empty_file_with_valid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gemini_settings_file = Path(tmp) / ".gemini" / "settings.json"
+            gemini_settings_file.parent.mkdir(parents=True, exist_ok=True)
+            gemini_settings_file.write_text("", encoding="utf-8")
+
+            image_cli._ensure_gemini_settings_file(gemini_settings_file)
+
+            self.assertEqual(json.loads(gemini_settings_file.read_text(encoding="utf-8")), {})
+
+    def test_ensure_gemini_settings_file_raises_on_invalid_json_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gemini_settings_file = Path(tmp) / ".gemini" / "settings.json"
+            gemini_settings_file.parent.mkdir(parents=True, exist_ok=True)
+            gemini_settings_file.write_text("{", encoding="utf-8")
+
+            with self.assertRaises(ClickException) as ctx:
+                image_cli._ensure_gemini_settings_file(gemini_settings_file)
+            self.assertIn("must be valid JSON", str(ctx.exception))
+
+    def test_ensure_gemini_settings_file_preserves_existing_non_empty_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gemini_settings_file = Path(tmp) / ".gemini" / "settings.json"
+            gemini_settings_file.parent.mkdir(parents=True, exist_ok=True)
+            gemini_settings_file.write_text('{"existing":"value"}\n', encoding="utf-8")
+
+            image_cli._ensure_gemini_settings_file(gemini_settings_file)
+
+            self.assertEqual(gemini_settings_file.read_text(encoding="utf-8"), '{"existing":"value"}\n')
+
+    def test_ensure_gemini_settings_file_fails_when_path_is_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gemini_settings_dir = Path(tmp) / ".gemini" / "settings.json"
+            gemini_settings_dir.mkdir(parents=True, exist_ok=True)
+
+            with self.assertRaises(ClickException) as ctx:
+                image_cli._ensure_gemini_settings_file(gemini_settings_dir)
 
             self.assertIn("not a file", str(ctx.exception))
 
@@ -5957,6 +6032,54 @@ class CliEnvVarTests(unittest.TestCase):
                 "test-token",
             )
 
+    def test_build_agent_tools_runtime_config_preserves_existing_agent_json_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            host_codex_dir = tmp_path / ".codex"
+            host_codex_dir.mkdir(parents=True, exist_ok=True)
+
+            for provider in (
+                image_cli.agent_providers.ClaudeProvider(),
+                image_cli.agent_providers.GeminiProvider(),
+            ):
+                if isinstance(provider, image_cli.agent_providers.ClaudeProvider):
+                    agent_settings = tmp_path / ".claude.json"
+                else:
+                    agent_settings = tmp_path / ".gemini" / "settings.json"
+                provider_name = provider.name
+                agent_settings.parent.mkdir(parents=True, exist_ok=True)
+                agent_settings.write_text(
+                    json.dumps(
+                        {
+                            "mcpServers": {"existing": {"command": "existing"}},
+                            "meta": {"provider": provider_name},
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                runtime_config = image_cli._build_agent_tools_runtime_config(
+                    config_path=tmp_path / "agent.config.toml",
+                    host_codex_dir=host_codex_dir,
+                    agent_tools_env={
+                        "AGENT_HUB_AGENT_TOOLS_URL": "http://host.docker.internal:48123",
+                        "AGENT_HUB_AGENT_TOOLS_TOKEN": "test-token",
+                        "AGENT_HUB_AGENT_TOOLS_PROJECT_ID": "project-test",
+                        "AGENT_HUB_AGENT_TOOLS_CHAT_ID": "chat-test",
+                    },
+                    agent_provider=provider,
+                    container_home="/workspace",
+                    agent_tools_config_path=agent_settings,
+                )
+
+                self.assertEqual(runtime_config, agent_settings)
+                updated = json.loads(agent_settings.read_text(encoding="utf-8"))
+                self.assertEqual(updated["meta"]["provider"], provider_name)
+                self.assertEqual(updated["mcpServers"]["existing"]["command"], "existing")
+                self.assertIn("agent_tools", updated["mcpServers"])
+                self.assertEqual(updated["mcpServers"]["agent_tools"]["command"], "python3")
+
     def test_build_agent_tools_runtime_config_preserves_tui_animations_false(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -6152,7 +6275,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
 
-            runtime_mount = f"{runtime_config}:{image_cli.DEFAULT_CONTAINER_HOME}/.claude.json:ro"
+            runtime_mount = f"{runtime_config}:{image_cli.DEFAULT_CONTAINER_HOME}/.claude.json"
             default_mount = f"{(agent_home / '.claude.json').resolve()}:{image_cli.DEFAULT_CONTAINER_HOME}/.claude.json"
 
             self.assertIn(runtime_mount, run_cmd)
@@ -6161,9 +6284,81 @@ class CliEnvVarTests(unittest.TestCase):
                 str(entry)
                 for entry in run_cmd
                 if str(entry).endswith(f":{image_cli.DEFAULT_CONTAINER_HOME}/.claude.json")
-                or str(entry).endswith(f":{image_cli.DEFAULT_CONTAINER_HOME}/.claude.json:ro")
             ]
             self.assertEqual(claude_json_mounts, [runtime_mount])
+            self.assertTrue(fake_bridge.closed)
+
+    def test_agent_cli_gemini_runtime_bridge_replaces_default_gemini_settings_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            runtime_config = tmp_path / "runtime-agent-tools.json"
+            agent_home = tmp_path / "agent-home"
+            config.write_text("model = 'test'\\n", encoding="utf-8")
+            runtime_config.write_text("{}", encoding="utf-8")
+
+            class FakeBridge:
+                def __init__(self, runtime_path: Path):
+                    self.runtime_config_path = runtime_path
+                    self.env_vars = [
+                        "AGENT_HUB_AGENT_TOOLS_URL=http://host.docker.internal:48123",
+                        "AGENT_HUB_AGENT_TOOLS_TOKEN=test-token",
+                    ]
+                    self.closed = False
+
+                def close(self) -> None:
+                    self.closed = True
+
+            fake_bridge = FakeBridge(runtime_config)
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._start_agent_tools_runtime_bridge",
+                return_value=fake_bridge,
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-home-path",
+                        str(agent_home),
+                        "--agent-command",
+                        "gemini",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+
+            runtime_mount = f"{runtime_config}:{image_cli.DEFAULT_CONTAINER_HOME}/.gemini/settings.json"
+            default_mount = f"{(agent_home / '.gemini' / 'settings.json').resolve()}:{image_cli.DEFAULT_CONTAINER_HOME}/.gemini/settings.json"
+
+            self.assertIn(runtime_mount, run_cmd)
+            self.assertNotIn(default_mount, run_cmd)
+            gemini_settings_mounts = [
+                str(entry)
+                for entry in run_cmd
+                if str(entry).endswith(f":{image_cli.DEFAULT_CONTAINER_HOME}/.gemini/settings.json")
+            ]
+            self.assertEqual(gemini_settings_mounts, [runtime_mount])
             self.assertTrue(fake_bridge.closed)
 
     def test_no_alt_screen_flag_passes_through_to_codex_command(self) -> None:
