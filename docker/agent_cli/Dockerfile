@@ -19,8 +19,11 @@ RUN case "${AGENT_PROVIDER}" in \
  && if command -v npm >/dev/null 2>&1; then npm cache clean --force; fi \
  && rm -rf /var/lib/apt/lists/*
 
-RUN if ! id -u agent >/dev/null 2>&1; then \
-      useradd --home-dir /home/agent --create-home --shell /bin/bash agent; \
+RUN if ! getent group agent >/dev/null 2>&1; then \
+      groupadd agent; \
+    fi \
+ && if ! id -u agent >/dev/null 2>&1; then \
+      useradd --home-dir /home/agent --create-home --shell /bin/bash --gid agent agent; \
     fi \
  && agent_group="$(id -gn agent)" \
  && mkdir -p /home/agent/projects /home/agent/.cache/uv /home/agent/.codex \
