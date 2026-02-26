@@ -9,6 +9,15 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 RUN case "${AGENT_PROVIDER}" in \
+      codex|gemini) \
+        if ! command -v npm >/dev/null 2>&1; then \
+          apt-get update \
+          && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+          && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+          && apt-get install -y --no-install-recommends nodejs; \
+        fi ;; \
+    esac \
+ && case "${AGENT_PROVIDER}" in \
       codex) npm install -g @openai/codex ;; \
       claude) curl -fsSL https://claude.ai/install.sh | bash \
               && cp -L /root/.local/bin/claude /usr/local/bin/claude ;; \

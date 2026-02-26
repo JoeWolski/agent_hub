@@ -535,6 +535,7 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("/host/codex:/workspace/.codex", run_args)
         self.assertIn("/host/agent.config.toml:/workspace/.codex/config.toml", run_args)
         self.assertIn("HOME=/workspace", run_args)
+        self.assertIn("NPM_CONFIG_CACHE=/tmp/.npm", run_args)
         self.assertIn("CONTAINER_HOME=/workspace", run_args)
         self.assertEqual(run_args.count("--group-add"), 2)
         self.assertIn("agent", run_args)
@@ -8361,6 +8362,7 @@ class CliEnvVarTests(unittest.TestCase):
                 f"UV_PROJECT_ENVIRONMENT={expected_container_project}/.venv",
                 env_values,
             )
+            self.assertIn("NPM_CONFIG_CACHE=/tmp/.npm", env_values)
 
     def test_cli_replaces_dumb_term_with_xterm_256color_in_runtime_container(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
