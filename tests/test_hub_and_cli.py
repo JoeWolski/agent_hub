@@ -3050,7 +3050,7 @@ Gemini CLI
             )
         self.assertEqual(ctx.exception.status_code, 403)
 
-    def test_publish_chat_artifact_rejects_paths_outside_workspace(self) -> None:
+    def test_publish_chat_artifact_allows_absolute_paths_outside_workspace(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
             default_branch="main",
@@ -3068,13 +3068,16 @@ Gemini CLI
         state_data["chats"][chat["id"]]["artifact_publish_token_hash"] = hub_server._hash_artifact_publish_token("token-abc")
         self.state.save(state_data)
 
-        with self.assertRaises(HTTPException) as ctx:
-            self.state.publish_chat_artifact(
-                chat_id=chat["id"],
-                token="token-abc",
-                submitted_path="../outside.txt",
-            )
-        self.assertEqual(ctx.exception.status_code, 400)
+        outside_path = self.tmp_path / "outside.txt"
+        outside_path.write_text("outside", encoding="utf-8")
+
+        artifact = self.state.publish_chat_artifact(
+            chat_id=chat["id"],
+            token="token-abc",
+            submitted_path=str(outside_path.resolve()),
+        )
+        self.assertTrue(artifact["relative_path"].startswith("external/"))
+        self.assertTrue(artifact["relative_path"].endswith("/outside.txt"))
 
     def test_create_and_start_chat_rejects_when_project_build_is_not_ready(self) -> None:
         project = self.state.add_project(
