@@ -8085,17 +8085,6 @@ class HubState:
         workspace = self.chat_workdir(chat_id).resolve()
         candidate = Path(raw_path).expanduser()
         resolved = candidate.resolve() if candidate.is_absolute() else (workspace / candidate).resolve()
-        try:
-            relative = resolved.relative_to(workspace)
-        except ValueError as exc:
-            LOGGER.warning(
-                "Artifact path outside chat workspace: chat_id=%s raw_path=%s resolved=%s workspace=%s",
-                chat_id,
-                raw_path,
-                resolved,
-                workspace,
-            )
-            raise HTTPException(status_code=400, detail="Artifact path must be inside the chat workspace.") from exc
         if not resolved.exists():
             LOGGER.warning(
                 "Artifact file not found for chat_id=%s raw_path=%s resolved=%s",
@@ -8112,7 +8101,12 @@ class HubState:
                 resolved,
             )
             raise HTTPException(status_code=400, detail=f"Artifact path is not a file: {raw_path}")
-        relative_path = _coerce_artifact_relative_path(relative.as_posix())
+        try:
+            relative_path_value = resolved.relative_to(workspace).as_posix()
+        except ValueError:
+            # Preserve deterministic, non-empty metadata for files outside workspace.
+            relative_path_value = f"external/{resolved.as_posix()}"
+        relative_path = _coerce_artifact_relative_path(relative_path_value)
         if not relative_path:
             LOGGER.warning("Artifact path normalized to empty for chat_id=%s raw_path=%s resolved=%s", chat_id, raw_path, resolved)
             raise HTTPException(status_code=400, detail="Artifact path is invalid.")
@@ -8899,17 +8893,8 @@ class HubState:
         if not normalized_path:
             raise HTTPException(status_code=400, detail="path is required.")
 
-        candidate = (workspace / normalized_path).resolve()
-        try:
-            candidate.relative_to(workspace)
-        except ValueError as exc:
-            LOGGER.warning(
-                "Artifact path outside workspace: workspace=%s raw_path=%s candidate=%s",
-                workspace,
-                normalized_path,
-                candidate,
-            )
-            raise HTTPException(status_code=400, detail="Artifact path must be inside the workspace.") from exc
+        raw_candidate = Path(normalized_path).expanduser()
+        candidate = raw_candidate.resolve() if raw_candidate.is_absolute() else (workspace / raw_candidate).resolve()
 
         if not candidate.exists():
             LOGGER.warning(
@@ -8928,8 +8913,12 @@ class HubState:
             )
             raise HTTPException(status_code=400, detail=f"Artifact path is not a file: {normalized_path}")
 
-        relative = candidate.relative_to(workspace)
-        relative_path = _coerce_artifact_relative_path(relative.as_posix())
+        try:
+            relative_path_value = candidate.relative_to(workspace).as_posix()
+        except ValueError:
+            # Keep outside-workspace submissions uniquely identifiable in artifact history.
+            relative_path_value = f"external/{candidate.as_posix()}"
+        relative_path = _coerce_artifact_relative_path(relative_path_value)
         if not relative_path:
             LOGGER.warning(
                 "Artifact path normalized to empty in workspace: workspace=%s raw_path=%s candidate=%s",
