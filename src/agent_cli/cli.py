@@ -1889,6 +1889,8 @@ def main(
         "--env",
         f"HOME={container_home_path}",
         "--env",
+        "NPM_CONFIG_CACHE=/tmp/.npm",
+        "--env",
         f"CONTAINER_HOME={container_home_path}",
         "--env",
         f"PATH={container_home_path}/.codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",

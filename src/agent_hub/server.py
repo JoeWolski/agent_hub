@@ -1693,6 +1693,8 @@ def _agent_capability_probe_docker_run_args(
         "--env",
         f"HOME={container_home}",
         "--env",
+        "NPM_CONFIG_CACHE=/tmp/.npm",
+        "--env",
         f"CONTAINER_HOME={container_home}",
         "--env",
         f"PATH={container_home}/.codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
