@@ -80,6 +80,31 @@ def _ensure_workspace_permissions() -> None:
         pass
 
 
+def _ensure_user_in_passwd() -> None:
+    uid = os.getuid()
+    gid = os.getgid()
+    if uid == 0:
+        return
+    try:
+        passwd_content = Path("/etc/passwd").read_text()
+        if f":x:{uid}:{gid}:" in passwd_content:
+            return
+    except OSError:
+        pass
+
+    try:
+        with Path("/etc/passwd").open("a") as f:
+            f.write(f"agentuser:x:{uid}:{gid}:Mapped Runtime User:/workspace:/bin/bash\n")
+    except OSError:
+        pass
+
+    try:
+        with Path("/etc/shadow").open("a") as f:
+            f.write(f"agentuser::19888:0:99999:7:::\n")
+    except OSError:
+        pass
+
+
 def _ensure_claude_native_command_path(*, command: list[str], home: str, source_path: Path | None = None) -> None:
     if not command:
         return
@@ -153,6 +178,7 @@ def _entrypoint_main() -> None:
 
     _ensure_workspace_tmp()
     _set_umask()
+    _ensure_user_in_passwd()
     _ensure_workspace_permissions()
     _ensure_claude_native_command_path(command=command, home=os.environ["HOME"])
     _prepare_git_credentials()
