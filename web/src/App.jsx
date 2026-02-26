@@ -1640,6 +1640,9 @@ function HubApp() {
   const [projectBuildLogs, setProjectBuildLogs] = useState({});
   const [projectStaticLogs, setProjectStaticLogs] = useState({});
   const [openBuildLogs, setOpenBuildLogs] = useState({});
+  const [chatStaticLogs, setChatStaticLogs] = useState({});
+  const [openChatLogs, setOpenChatLogs] = useState({});
+  const [pendingChatLogLoads, setPendingChatLogLoads] = useState({});
   const [activeTab, setActiveTab] = useState("projects");
   const [openChats, setOpenChats] = useState({});
   const [openChatDetails, setOpenChatDetails] = useState({});
@@ -3000,6 +3003,17 @@ function HubApp() {
   async function handleStartChat(chatId) {
     setPendingChatStarts((prev) => ({ ...prev, [chatId]: Date.now() }));
     setOpenChats((prev) => ({ ...prev, [chatId]: true }));
+    setOpenChatLogs((prev) => ({ ...prev, [chatId]: false }));
+    setPendingChatLogLoads((prev) => {
+      const next = { ...prev };
+      delete next[chatId];
+      return next;
+    });
+    setChatStaticLogs((prev) => {
+      const next = { ...prev };
+      delete next[chatId];
+      return next;
+    });
     try {
       await fetchJson(`/api/chats/${chatId}/start`, { method: "POST" });
       setError("");
@@ -3058,6 +3072,24 @@ function HubApp() {
       return next;
     });
     setOpenChatDetails((prev) => {
+      const next = { ...prev };
+      delete next[uiId];
+      delete next[chatId];
+      return next;
+    });
+    setOpenChatLogs((prev) => {
+      const next = { ...prev };
+      delete next[uiId];
+      delete next[chatId];
+      return next;
+    });
+    setPendingChatLogLoads((prev) => {
+      const next = { ...prev };
+      delete next[uiId];
+      delete next[chatId];
+      return next;
+    });
+    setChatStaticLogs((prev) => {
       const next = { ...prev };
       delete next[uiId];
       delete next[chatId];
@@ -3178,6 +3210,37 @@ function HubApp() {
       setError("");
     } catch (err) {
       setError(err.message || String(err));
+    }
+  }
+
+  async function handleToggleStoredChatLog(chatId) {
+    const normalizedChatId = String(chatId || "").trim();
+    if (!normalizedChatId) {
+      return;
+    }
+    const currentlyOpen = Boolean(openChatLogs[normalizedChatId]);
+    if (currentlyOpen) {
+      setOpenChatLogs((prev) => ({ ...prev, [normalizedChatId]: false }));
+      return;
+    }
+    if (chatStaticLogs[normalizedChatId] !== undefined) {
+      setOpenChatLogs((prev) => ({ ...prev, [normalizedChatId]: true }));
+      return;
+    }
+    setPendingChatLogLoads((prev) => ({ ...prev, [normalizedChatId]: true }));
+    try {
+      const text = await fetchText(`/api/chats/${encodeURIComponent(normalizedChatId)}/logs`);
+      setChatStaticLogs((prev) => ({ ...prev, [normalizedChatId]: text }));
+      setOpenChatLogs((prev) => ({ ...prev, [normalizedChatId]: true }));
+      setError("");
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setPendingChatLogLoads((prev) => {
+        const next = { ...prev };
+        delete next[normalizedChatId];
+        return next;
+      });
     }
   }
 
@@ -4238,6 +4301,9 @@ function HubApp() {
     const onSelectTerminalTab = typeof options?.onSelectTerminalTab === "function"
       ? options.onSelectTerminalTab
       : null;
+    const isChatLogOpen = Boolean(openChatLogs[resolvedChatId]);
+    const chatLogLoading = Boolean(pendingChatLogLoads[resolvedChatId]);
+    const storedChatLogText = String(chatStaticLogs[resolvedChatId] || "");
 
     const buildArtifactRenderInfo = (artifact) => {
       const artifactId = String(artifact?.id || "");
@@ -4465,7 +4531,26 @@ function HubApp() {
                 >
                   {isFailed ? "Retry chat" : "Start chat"}
                 </button>
+                {isFailed ? (
+                  <button
+                    type="button"
+                    className="btn-secondary chat-log-action"
+                    onClick={() => handleToggleStoredChatLog(resolvedChatId)}
+                    disabled={chatLogLoading}
+                  >
+                    {chatLogLoading
+                      ? <SpinnerLabel text="Loading log..." />
+                      : (isChatLogOpen ? "Hide chat log" : "View chat log")}
+                  </button>
+                ) : null}
               </div>
+              {isFailed && isChatLogOpen ? (
+                <pre className="log-box">
+                  {storedChatLogText.trim()
+                    ? storedChatLogText
+                    : "No stored chat log found for this chat yet."}
+                </pre>
+              ) : null}
             </div>
           ) : null}
 

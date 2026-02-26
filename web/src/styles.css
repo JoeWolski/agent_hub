@@ -1242,7 +1242,8 @@ button:focus-visible {
   margin-left: auto;
 }
 
-.chat-actions .chat-primary-action {
+.chat-actions .chat-primary-action,
+.chat-actions .chat-log-action {
   min-width: 132px;
 }
 
@@ -2742,7 +2743,8 @@ button:focus-visible {
     width: auto;
   }
 
-  .chat-actions .chat-primary-action {
+  .chat-actions .chat-primary-action,
+  .chat-actions .chat-log-action {
     min-width: 0;
   }
 
