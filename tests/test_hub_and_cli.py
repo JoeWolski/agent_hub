@@ -533,7 +533,7 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("--tmpfs", run_args)
         self.assertIn(hub_server.TMP_DIR_TMPFS_SPEC, run_args)
         self.assertIn("/host/codex:/workspace/.codex", run_args)
-        self.assertIn("/host/agent.config.toml:/workspace/.codex/config.toml:ro", run_args)
+        self.assertIn("/host/agent.config.toml:/workspace/.codex/config.toml", run_args)
         self.assertIn("HOME=/workspace", run_args)
         self.assertIn("CONTAINER_HOME=/workspace", run_args)
         self.assertEqual(run_args.count("--group-add"), 2)
@@ -6633,7 +6633,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
             self.assertIn(
-                f"{runtime_config}:{image_cli.DEFAULT_CONTAINER_HOME}/.codex/config.toml:ro",
+                f"{runtime_config}:{image_cli.DEFAULT_CONTAINER_HOME}/.codex/config.toml",
                 run_cmd,
             )
             self.assertIn("AGENT_HUB_AGENT_TOOLS_URL=http://host.docker.internal:48123", run_cmd)

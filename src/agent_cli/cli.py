@@ -1804,11 +1804,9 @@ def main(
             ),
         ]
 
-    config_mount_target = f"{container_home_path}/.codex/config.toml:ro"
+    config_mount_target = f"{container_home_path}/.codex/config.toml"
     mcp_config_mount_target = agent_provider.get_mcp_config_mount_target(container_home_path)
-    mcp_config_mount_mode = ":ro"
-    if isinstance(agent_provider, (agent_providers.ClaudeProvider, agent_providers.GeminiProvider)):
-        mcp_config_mount_mode = ""
+    mcp_config_mount_mode = ""
     mcp_config_mount_entry = (
         f"{host_gemini_settings_file}:{mcp_config_mount_target}{mcp_config_mount_mode}"
         if isinstance(agent_provider, agent_providers.GeminiProvider)
