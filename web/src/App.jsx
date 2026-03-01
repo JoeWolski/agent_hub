@@ -3205,6 +3205,7 @@ function HubApp() {
         project_id: normalizedProjectId,
         project_name: project?.name || "Unknown",
         agent_type: agentType,
+        create_request_id: requestId,
         server_chat_id: "",
         created_at_ms: pendingCreatedAtMs,
         server_chat_id_set_at_ms: 0,
@@ -3218,6 +3219,7 @@ function HubApp() {
       trace("create_chat_optimistic_row_added", {
         project_id: normalizedProjectId,
         pending_ui_id: uiId,
+        request_id: requestId,
         known_server_chat_ids: knownServerChatIds.length
       });
 
@@ -3229,6 +3231,7 @@ function HubApp() {
       trace("create_chat_start_response", {
         project_id: normalizedProjectId,
         pending_ui_id: uiId,
+        request_id: requestId,
         chat_id: String(chatId || ""),
         has_chat: Boolean(response?.chat)
       });
@@ -3255,6 +3258,7 @@ function HubApp() {
       trace("create_chat_state_enqueued", {
         project_id: normalizedProjectId,
         pending_ui_id: uiId,
+        request_id: requestId,
         chat_id: String(chatId || "")
       });
       refreshState().catch(() => {});

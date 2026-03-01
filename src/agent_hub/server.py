@@ -11092,7 +11092,7 @@ class HubState:
             chat_copy.pop("artifact_publish_token_issued_at", None)
             chat_copy.pop("agent_tools_token_hash", None)
             chat_copy.pop("agent_tools_token_issued_at", None)
-            chat_copy.pop("create_request_id", None)
+            chat_copy["create_request_id"] = _compact_whitespace(str(chat_copy.get("create_request_id") or "")).strip()
             running = _is_process_running(pid)
             normalized_status = _normalize_chat_status(chat_copy.get("status"))
             if running:

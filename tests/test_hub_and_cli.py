@@ -3265,6 +3265,26 @@ Gemini CLI
         create_chat.assert_not_called()
         start_chat.assert_not_called()
 
+    def test_state_payload_includes_create_request_id_for_chat_matching(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+            create_request_id="req-join-123",
+        )
+
+        payload = self.state.state_payload()
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(chat_payload["create_request_id"], "req-join-123")
+
     def test_create_and_start_chat_passes_agent_type(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
