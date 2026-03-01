@@ -2434,6 +2434,43 @@ Gemini CLI
         self.assertEqual(result["target_origin"], "http://127.0.0.1:1455")
         self.assertEqual(attempted_urls[0], "http://127.0.0.1:1455/auth/callback?code=abc&state=xyz")
 
+    def test_forward_openai_callback_via_container_loopback_reports_python_missing(self) -> None:
+        fake_process = SimpleNamespace(returncode=127, stdout="", stderr="python runtime unavailable in login container")
+        with patch("agent_hub.server.shutil.which", return_value="/usr/bin/docker"), patch(
+            "agent_hub.server.subprocess.run",
+            return_value=fake_process,
+        ):
+            result = hub_server._forward_openai_callback_via_container_loopback(
+                "container-test",
+                callback_port=1455,
+                callback_path="/auth/callback",
+                query="code=abc&state=xyz",
+            )
+
+        self.assertTrue(result.attempted)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_class, "container_python_missing")
+        self.assertIn("rc=127", result.error_detail)
+        self.assertIn("stderr=python runtime unavailable", result.error_detail)
+
+    def test_forward_openai_callback_via_container_loopback_reports_container_not_running(self) -> None:
+        fake_process = SimpleNamespace(returncode=1, stdout="", stderr="Error response from daemon: Container abc is not running")
+        with patch("agent_hub.server.shutil.which", return_value="/usr/bin/docker"), patch(
+            "agent_hub.server.subprocess.run",
+            return_value=fake_process,
+        ):
+            result = hub_server._forward_openai_callback_via_container_loopback(
+                "container-test",
+                callback_port=1455,
+                callback_path="/auth/callback",
+                query="code=abc&state=xyz",
+            )
+
+        self.assertTrue(result.attempted)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_class, "container_not_running")
+        self.assertIn("is not running", result.error_detail)
+
     def test_parse_env_vars_rejects_openai_api_key(self) -> None:
         with self.assertRaises(HTTPException):
             hub_server._parse_env_vars(["OPENAI_API_KEY=sk-test-abcdef"])

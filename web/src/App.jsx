@@ -3846,6 +3846,7 @@ function HubApp() {
 
   async function handleForwardOpenAiAccountCallback(event) {
     event.preventDefault();
+    openAiLoginAutoOpenArmedRef.current = false;
     const query = extractCallbackQuery(openAiAccountCallbackInput);
     if (!query) {
       setError("Paste the full callback URL (or query string) from the localhost error page.");
