@@ -101,6 +101,7 @@ AGENT_HUB_TMP_HOST_PATH_ENV = "AGENT_HUB_TMP_HOST_PATH"
 AGENT_HUB_HOST_UID_ENV = "AGENT_HUB_HOST_UID"
 AGENT_HUB_HOST_GID_ENV = "AGENT_HUB_HOST_GID"
 AGENT_HUB_HOST_SUPP_GIDS_ENV = "AGENT_HUB_HOST_SUPPLEMENTARY_GIDS"
+AGENT_HUB_SHARED_ROOT_ENV = "AGENT_HUB_SHARED_ROOT"
 AGENT_TOOLS_MCP_RUNTIME_DIR_NAME = "agent_hub"
 AGENT_TOOLS_MCP_RUNTIME_FILE_NAME = "agent_tools_mcp.py"
 AGENT_TOOLS_URL_ENV = "AGENT_HUB_AGENT_TOOLS_URL"
@@ -3877,6 +3878,32 @@ def _parse_non_negative_int_env(var_name: str, fallback: int) -> int:
     return value
 
 
+def _resolve_hub_runtime_identity() -> tuple[int, int, str]:
+    host_uid_raw = str(os.environ.get(AGENT_HUB_HOST_UID_ENV, "")).strip()
+    host_gid_raw = str(os.environ.get(AGENT_HUB_HOST_GID_ENV, "")).strip()
+    host_supp_gids = _normalize_csv(str(os.environ.get(AGENT_HUB_HOST_SUPP_GIDS_ENV, "")))
+    if host_uid_raw or host_gid_raw:
+        if not host_uid_raw or not host_gid_raw:
+            raise RuntimeError(
+                f"{AGENT_HUB_HOST_UID_ENV} and {AGENT_HUB_HOST_GID_ENV} must be set together."
+            )
+        uid = _parse_non_negative_int_env(AGENT_HUB_HOST_UID_ENV, os.getuid())
+        gid = _parse_non_negative_int_env(AGENT_HUB_HOST_GID_ENV, os.getgid())
+        return uid, gid, host_supp_gids
+
+    shared_root_raw = str(os.environ.get(AGENT_HUB_SHARED_ROOT_ENV, "")).strip()
+    if shared_root_raw:
+        try:
+            metadata = Path(shared_root_raw).stat()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to stat {AGENT_HUB_SHARED_ROOT_ENV}={shared_root_raw!r}: {exc}"
+            ) from exc
+        return int(metadata.st_uid), int(metadata.st_gid), host_supp_gids
+
+    return os.getuid(), os.getgid(), (_default_supplementary_gids() if not host_supp_gids else host_supp_gids)
+
+
 def _parse_gid_csv(value: str) -> list[int]:
     gids: list[int] = []
     seen: set[int] = set()
@@ -4199,12 +4226,8 @@ class HubState:
         artifact_publish_base_url: str | None = None,
         ui_lifecycle_debug: bool = False,
     ):
-        self.local_uid = _parse_non_negative_int_env(AGENT_HUB_HOST_UID_ENV, os.getuid())
+        self.local_uid, self.local_gid, self.local_supp_gids = _resolve_hub_runtime_identity()
         self.local_user = f"uid-{self.local_uid}"
-        self.local_gid = _parse_non_negative_int_env(AGENT_HUB_HOST_GID_ENV, os.getgid())
-        self.local_supp_gids = _normalize_csv(
-            str(os.environ.get(AGENT_HUB_HOST_SUPP_GIDS_ENV) or _default_supplementary_gids())
-        )
         self.local_umask = "0022"
         self.host_agent_home = (Path.home() / ".agent-home" / self.local_user).resolve()
         self.host_codex_dir = self.host_agent_home / ".codex"
@@ -7336,21 +7359,8 @@ class HubState:
         return next_recommendation
 
     def _runtime_identity_for_workspace(self, workspace: Path) -> tuple[int, int, str]:
-        # Default to hub startup identity (which may be env-overridden) and narrow to
-        # workspace ownership when available so runtime writes align with mounted project owners.
-        resolved_uid = int(self.local_uid)
-        resolved_gid = int(self.local_gid)
-        try:
-            metadata = workspace.resolve().stat()
-            resolved_uid = int(metadata.st_uid)
-            resolved_gid = int(metadata.st_gid)
-        except OSError:
-            pass
-
-        resolved_supp_gids = self.local_supp_gids if (
-            resolved_uid == self.local_uid and resolved_gid == self.local_gid
-        ) else ""
-        return resolved_uid, resolved_gid, resolved_supp_gids
+        del workspace
+        return int(self.local_uid), int(self.local_gid), self.local_supp_gids
 
     def _prepare_agent_cli_command(
         self,
