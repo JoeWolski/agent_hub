@@ -7335,6 +7335,23 @@ class HubState:
         next_recommendation["notes"] = notes
         return next_recommendation
 
+    def _runtime_identity_for_workspace(self, workspace: Path) -> tuple[int, int, str]:
+        # Default to hub startup identity (which may be env-overridden) and narrow to
+        # workspace ownership when available so runtime writes align with mounted project owners.
+        resolved_uid = int(self.local_uid)
+        resolved_gid = int(self.local_gid)
+        try:
+            metadata = workspace.resolve().stat()
+            resolved_uid = int(metadata.st_uid)
+            resolved_gid = int(metadata.st_gid)
+        except OSError:
+            pass
+
+        resolved_supp_gids = self.local_supp_gids if (
+            resolved_uid == self.local_uid and resolved_gid == self.local_gid
+        ) else ""
+        return resolved_uid, resolved_gid, resolved_supp_gids
+
     def _prepare_agent_cli_command(
         self,
         *,
@@ -7364,6 +7381,7 @@ class HubState:
         project_in_image: bool = False,
         runtime_tmp_mount: str = "",
     ) -> list[str]:
+        runtime_uid, runtime_gid, runtime_supp_gids = self._runtime_identity_for_workspace(workspace)
         agent_command = AGENT_COMMAND_BY_TYPE.get(agent_type, AGENT_COMMAND_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE])
         cmd = [
             "uv",
@@ -7384,13 +7402,13 @@ class HubState:
             "--system-prompt-file",
             str(self.system_prompt_file),
             "--local-uid",
-            str(self.local_uid),
+            str(runtime_uid),
             "--local-gid",
-            str(self.local_gid),
+            str(runtime_gid),
             "--no-alt-screen",
         ]
-        if self.local_supp_gids:
-            cmd.extend(["--local-supplementary-gids", self.local_supp_gids])
+        if runtime_supp_gids:
+            cmd.extend(["--local-supplementary-gids", runtime_supp_gids])
         if not allocate_tty:
             cmd.append("--no-tty")
         if resume and agent_type == AGENT_TYPE_CODEX:

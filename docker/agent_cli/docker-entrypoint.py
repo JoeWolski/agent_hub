@@ -84,6 +84,9 @@ def _set_umask() -> None:
 
 
 def _ensure_workspace_permissions() -> None:
+    if os.getuid() == 0:
+        # Avoid mutating host-mounted workspace permissions when entrypoint runs as root.
+        return
     try:
         _run(["chmod", "-R", "g+rwx", "/workspace"], check=False)
     except Exception:
@@ -101,6 +104,57 @@ def _ensure_user_in_passwd() -> None:
             return
     except OSError:
         pass
+
+
+def _parse_non_negative_int(raw_value: str) -> int | None:
+    value = str(raw_value or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = int(value, 10)
+    except ValueError:
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
+def _resolve_runtime_uid_gid() -> tuple[int, int] | None:
+    explicit_uid = _parse_non_negative_int(str(os.environ.get("LOCAL_UID") or ""))
+    explicit_gid = _parse_non_negative_int(str(os.environ.get("LOCAL_GID") or ""))
+    if explicit_uid is not None and explicit_gid is not None:
+        return explicit_uid, explicit_gid
+
+    candidates: list[Path] = []
+    project_path = str(os.environ.get("CONTAINER_PROJECT_PATH") or "").strip()
+    if project_path:
+        candidates.append(Path(project_path))
+    candidates.append(Path("/workspace"))
+
+    for candidate in candidates:
+        try:
+            metadata = candidate.stat()
+        except OSError:
+            continue
+        return int(metadata.st_uid), int(metadata.st_gid)
+    return None
+
+
+def _drop_privileges_to_runtime_identity() -> None:
+    if os.getuid() != 0:
+        return
+    target = _resolve_runtime_uid_gid()
+    if target is None:
+        return
+    uid, gid = target
+    if uid == 0 and gid == 0:
+        return
+    try:
+        os.setgroups([])
+    except (PermissionError, OSError):
+        pass
+    os.setgid(gid)
+    os.setuid(uid)
 
     try:
         with Path("/etc/passwd").open("a") as f:
@@ -218,6 +272,7 @@ def _entrypoint_main() -> None:
     if command and Path(command[0]).name == "claude":
         _ensure_claude_json_file(Path(os.environ["HOME"]) / ".claude.json")
 
+    _drop_privileges_to_runtime_identity()
     _ensure_workspace_tmp()
     _set_umask()
     _ensure_user_in_passwd()

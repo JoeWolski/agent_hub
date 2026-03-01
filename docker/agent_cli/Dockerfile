@@ -46,6 +46,6 @@ COPY docker/agent_cli/docker-entrypoint.py /usr/local/bin/docker-entrypoint.py
 RUN chmod +x /usr/local/bin/docker-entrypoint.py
 
 WORKDIR /workspace
-USER agent
+USER 0
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]
 CMD ["codex"]
