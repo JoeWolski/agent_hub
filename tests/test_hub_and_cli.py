@@ -9574,6 +9574,32 @@ class DockerEntrypointTests(unittest.TestCase):
             module._configure_git_auth_from_env()
         run_mock.assert_not_called()
 
+    def test_configure_git_safe_directory_for_project_uses_container_project_path(self) -> None:
+        module = self._load_entrypoint_module()
+        with patch.object(module, "_run", return_value=SimpleNamespace(returncode=0)) as run_mock, patch.dict(
+            os.environ,
+            {"CONTAINER_PROJECT_PATH": "/workspace/demo-project"},
+            clear=False,
+        ):
+            module._configure_git_safe_directory_for_project()
+
+        run_mock.assert_called_once_with(
+            ["git", "config", "--global", "--add", "safe.directory", "/workspace/demo-project"]
+        )
+
+    def test_configure_git_safe_directory_for_project_falls_back_to_cwd(self) -> None:
+        module = self._load_entrypoint_module()
+        with self._temporary_exec_dir() as tmp:
+            cwd = Path(tmp).resolve()
+            with patch.object(module, "_run", return_value=SimpleNamespace(returncode=0)) as run_mock, patch.dict(
+                os.environ,
+                {"CONTAINER_PROJECT_PATH": ""},
+                clear=False,
+            ), patch.object(module.Path, "cwd", return_value=cwd):
+                module._configure_git_safe_directory_for_project()
+
+        run_mock.assert_called_once_with(["git", "config", "--global", "--add", "safe.directory", str(cwd)])
+
     def test_entrypoint_module_does_not_define_prepare_git_credentials(self) -> None:
         module = self._load_entrypoint_module()
         self.assertFalse(hasattr(module, "_prepare_git_credentials"))
@@ -9626,13 +9652,21 @@ class DockerEntrypointTests(unittest.TestCase):
         ) as ensure_workspace_tmp, patch.object(
             module, "_configure_git_identity", return_value=None
         ) as configure_git, patch.object(
+            module, "_configure_git_safe_directory_for_project", return_value=None
+        ) as configure_safe_directory, patch.object(
+            module, "_configure_git_auth_from_env", return_value=None
+        ) as configure_git_auth, patch.object(
+            module, "_ack_runtime_ready", return_value=None
+        ), patch.object(
             module.os, "execvp", side_effect=SystemExit(0)
         ) as execvp:
             with self.assertRaises(SystemExit):
                 module._entrypoint_main()
 
         ensure_workspace_tmp.assert_called_once_with()
+        configure_git_auth.assert_called_once_with()
         configure_git.assert_called_once_with()
+        configure_safe_directory.assert_called_once_with()
         execvp.assert_called_once_with("codex", ["codex"])
 
     def test_entrypoint_main_execs_requested_command(self) -> None:
@@ -9650,6 +9684,12 @@ class DockerEntrypointTests(unittest.TestCase):
             module, "_ensure_workspace_tmp", return_value=None
         ) as ensure_workspace_tmp, patch.object(
             module, "_configure_git_identity", return_value=None
+        ) as configure_git, patch.object(
+            module, "_configure_git_safe_directory_for_project", return_value=None
+        ) as configure_safe_directory, patch.object(
+            module, "_configure_git_auth_from_env", return_value=None
+        ) as configure_git_auth, patch.object(
+            module, "_ack_runtime_ready", return_value=None
         ), patch.object(
             module.os, "execvp", side_effect=SystemExit(0)
         ) as execvp:
@@ -9660,6 +9700,9 @@ class DockerEntrypointTests(unittest.TestCase):
         self.assertEqual(observed_home, "/tmp/entrypoint-local-home")
         execvp.assert_called_once_with("bash", ["bash", "-lc", "echo ok"])
         ensure_workspace_tmp.assert_called_once_with()
+        configure_git_auth.assert_called_once_with()
+        configure_git.assert_called_once_with()
+        configure_safe_directory.assert_called_once_with()
 
     def test_entrypoint_main_bootstraps_claude_native_command_path(self) -> None:
         module = self._load_entrypoint_module()
@@ -9676,6 +9719,12 @@ class DockerEntrypointTests(unittest.TestCase):
             module, "_ensure_claude_native_command_path", return_value=None
         ) as ensure_claude_native_path, patch.object(
             module, "_configure_git_identity", return_value=None
+        ) as configure_git, patch.object(
+            module, "_configure_git_safe_directory_for_project", return_value=None
+        ) as configure_safe_directory, patch.object(
+            module, "_configure_git_auth_from_env", return_value=None
+        ) as configure_git_auth, patch.object(
+            module, "_ack_runtime_ready", return_value=None
         ), patch.object(
             module.os, "execvp", side_effect=SystemExit(0)
         ) as execvp:
@@ -9687,6 +9736,9 @@ class DockerEntrypointTests(unittest.TestCase):
             command=["claude", "--help"],
             home="/tmp/entrypoint-home",
         )
+        configure_git_auth.assert_called_once_with()
+        configure_git.assert_called_once_with()
+        configure_safe_directory.assert_called_once_with()
         execvp.assert_called_once_with("claude", ["claude", "--help"])
 
     def test_entrypoint_ensure_workspace_tmp(self) -> None:
