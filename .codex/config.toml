@@ -1,0 +1,19 @@
+# Repository-local Codex profile policy for multi-agent workflow execution.
+# Keep coding-critical roles on codex; reserve spark for fast read-heavy triage.
+
+model = "gpt-5.3-codex"
+reasoning_effort = "medium"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[profiles.deep_review]
+model = "gpt-5.3-codex"
+reasoning_effort = "high"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[profiles.spark_triage]
+model = "gpt-5.3-codex-spark"
+reasoning_effort = "low"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
