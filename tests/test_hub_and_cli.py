@@ -2886,6 +2886,7 @@ Gemini CLI
         self.assertIn("--local-gid", cmd)
         local_gid_index = cmd.index("--local-gid")
         self.assertEqual(cmd[local_gid_index + 1], str(self.state.local_gid))
+        self.assertIn("--bootstrap-as-root", cmd)
         self.assertIn("--model", cmd)
         self.assertIn("sonnet", cmd)
         started_chat = self.state.load()["chats"][chat["id"]]
@@ -9708,6 +9709,59 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("3001", run_cmd)
             self.assertIn("4444", run_cmd)
 
+    def test_cli_bootstrap_as_root_passes_local_identity_env(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/workspace/tmp") as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            agent_home = tmp_path / "agent-home"
+            agent_home.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--agent-home-path",
+                        str(agent_home),
+                        "--config-file",
+                        str(config),
+                        "--local-uid",
+                        "1234",
+                        "--local-gid",
+                        "2345",
+                        "--local-supplementary-gids",
+                        "3000,3001",
+                        "--bootstrap-as-root",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            user_index = run_cmd.index("--user")
+            self.assertEqual(run_cmd[user_index + 1], "0:0")
+            self.assertIn("LOCAL_UID=1234", run_cmd)
+            self.assertIn("LOCAL_GID=2345", run_cmd)
+            self.assertIn("LOCAL_SUPPLEMENTARY_GIDS=3000,3001", run_cmd)
+
     def test_cli_adds_host_gateway_alias_on_linux(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -10580,16 +10634,19 @@ class DockerEntrypointTests(unittest.TestCase):
             {
                 "LOCAL_UID": "2001",
                 "LOCAL_GID": "3001",
+                "LOCAL_SUPPLEMENTARY_GIDS": "3001,3002,3003",
                 "CONTAINER_PROJECT_PATH": "",
             },
             clear=False,
         ):
-            self.assertEqual(module._resolve_runtime_uid_gid(), (2001, 3001))
+            self.assertEqual(module._resolve_runtime_uid_gid(), (2001, 3001, [3002, 3003]))
 
     def test_drop_privileges_to_runtime_identity_uses_resolved_target(self) -> None:
         module = self._load_entrypoint_module()
         with patch.object(module.os, "getuid", return_value=0), patch.object(
-            module, "_resolve_runtime_uid_gid", return_value=(1002, 1007)
+            module, "_resolve_runtime_uid_gid", return_value=(1002, 1007, [3001, 3002])
+        ), patch.object(
+            module, "_ensure_workspace_root_ownership", return_value=None
         ), patch.object(
             module.os, "setgroups", return_value=None
         ) as setgroups_mock, patch.object(
@@ -10599,7 +10656,7 @@ class DockerEntrypointTests(unittest.TestCase):
         ) as setuid_mock:
             module._drop_privileges_to_runtime_identity()
 
-        setgroups_mock.assert_called_once_with([])
+        setgroups_mock.assert_called_once_with([3001, 3002])
         setgid_mock.assert_called_once_with(1007)
         setuid_mock.assert_called_once_with(1002)
 

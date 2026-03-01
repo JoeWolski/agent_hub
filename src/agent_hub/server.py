@@ -7415,6 +7415,7 @@ class HubState:
             str(runtime_uid),
             "--local-gid",
             str(runtime_gid),
+            "--bootstrap-as-root",
             "--no-alt-screen",
         ]
         if runtime_supp_gids:
