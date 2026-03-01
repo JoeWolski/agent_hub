@@ -118,6 +118,19 @@ TERMINAL_QUEUE_MAX = 256
 HUB_EVENT_QUEUE_MAX = 512
 OPENAI_ACCOUNT_LOGIN_LOG_MAX_CHARS = 16_000
 OPENAI_ACCOUNT_LOGIN_DEFAULT_CALLBACK_PORT = 1455
+OPENAI_ACCOUNT_CALLBACK_FORWARD_TIMEOUT_SECONDS = 8.0
+OPENAI_ACCOUNT_CALLBACK_DOCKER_INSPECT_TIMEOUT_SECONDS = 2.0
+OPENAI_ACCOUNT_CALLBACK_SENSITIVE_QUERY_KEYS = frozenset(
+    {
+        "access_token",
+        "code",
+        "code_verifier",
+        "id_token",
+        "refresh_token",
+        "state",
+        "token",
+    }
+)
 DEFAULT_AGENT_IMAGE = "agent-ubuntu2204-codex:latest"
 AGENT_TYPE_CODEX = "codex"
 AGENT_TYPE_CLAUDE = "claude"
@@ -3322,6 +3335,260 @@ def _normalize_callback_forward_host(raw_value: Any) -> str:
     if re.fullmatch(r"[a-z0-9.-]+", token):
         return token
     return ""
+
+
+def _parse_callback_forward_host_port(raw_value: Any) -> tuple[str, int | None]:
+    token = str(raw_value or "").strip()
+    if not token:
+        return "", None
+    if "," in token:
+        token = token.split(",", 1)[0].strip()
+    if not token:
+        return "", None
+
+    host_token = token
+    parsed_port: int | None = None
+    if token.startswith("["):
+        bracket_end = token.find("]")
+        if bracket_end > 0:
+            host_token = token[1:bracket_end]
+            remainder = token[bracket_end + 1 :].strip()
+            if remainder.startswith(":") and remainder[1:].isdigit():
+                parsed_port = int(remainder[1:])
+        else:
+            host_token = token.strip("[]")
+    else:
+        if token.count(":") == 1:
+            maybe_host, maybe_port = token.rsplit(":", 1)
+            if maybe_port.isdigit():
+                host_token = maybe_host
+                parsed_port = int(maybe_port)
+
+    normalized_host = _normalize_callback_forward_host(host_token)
+    if not normalized_host:
+        return "", None
+    if parsed_port is not None and (parsed_port < 1 or parsed_port > 65535):
+        parsed_port = None
+    return normalized_host, parsed_port
+
+
+def _parse_forwarded_header(raw_value: Any) -> dict[str, str]:
+    token = str(raw_value or "").strip()
+    if not token:
+        return {}
+    first_entry = token.split(",", 1)[0].strip()
+    if not first_entry:
+        return {}
+    parsed: dict[str, str] = {}
+    for segment in first_entry.split(";"):
+        key, sep, value = segment.partition("=")
+        if not sep:
+            continue
+        normalized_key = str(key or "").strip().lower()
+        if not normalized_key:
+            continue
+        normalized_value = str(value or "").strip().strip('"')
+        if normalized_value:
+            parsed[normalized_key] = normalized_value
+    return parsed
+
+
+def _openai_callback_request_context_from_request(request: Request) -> dict[str, Any]:
+    headers = request.headers
+    forwarded_raw = str(headers.get("forwarded") or "").strip()
+    forwarded_values = _parse_forwarded_header(forwarded_raw)
+    x_forwarded_host_raw = str(headers.get("x-forwarded-host") or "").strip()
+    x_forwarded_proto_raw = str(headers.get("x-forwarded-proto") or "").strip().lower()
+    x_forwarded_port_raw = str(headers.get("x-forwarded-port") or "").strip()
+    host_header_raw = str(headers.get("host") or "").strip()
+    client_host = request.client.host if request.client is not None else ""
+
+    x_forwarded_host, x_forwarded_host_port = _parse_callback_forward_host_port(x_forwarded_host_raw)
+    forwarded_host, forwarded_host_port = _parse_callback_forward_host_port(forwarded_values.get("host") or "")
+    host_header_host, host_header_port = _parse_callback_forward_host_port(host_header_raw)
+    parsed_request_client_host, _ = _parse_callback_forward_host_port(client_host)
+
+    parsed_x_forwarded_port: int | None = None
+    if x_forwarded_port_raw.isdigit():
+        port_value = int(x_forwarded_port_raw)
+        if 1 <= port_value <= 65535:
+            parsed_x_forwarded_port = port_value
+
+    return {
+        "client_host": parsed_request_client_host,
+        "forwarded_raw_present": bool(forwarded_raw),
+        "forwarded_host": forwarded_host,
+        "forwarded_host_port": forwarded_host_port,
+        "forwarded_proto": str(forwarded_values.get("proto") or "").strip().lower(),
+        "x_forwarded_host": x_forwarded_host,
+        "x_forwarded_host_port": x_forwarded_host_port,
+        "x_forwarded_proto": x_forwarded_proto_raw.split(",", 1)[0].strip(),
+        "x_forwarded_port": parsed_x_forwarded_port,
+        "host_header_host": host_header_host,
+        "host_header_port": host_header_port,
+    }
+
+
+def _openai_callback_query_summary(query: str) -> dict[str, Any]:
+    keys: list[str] = []
+    sensitive_keys: list[str] = []
+    for key, _value in urllib.parse.parse_qsl(query or "", keep_blank_values=True):
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            continue
+        keys.append(normalized_key)
+        lowered = normalized_key.lower()
+        if (
+            lowered in OPENAI_ACCOUNT_CALLBACK_SENSITIVE_QUERY_KEYS
+            or "token" in lowered
+            or "secret" in lowered
+            or "verifier" in lowered
+        ):
+            sensitive_keys.append(normalized_key)
+    return {
+        "param_count": len(keys),
+        "keys": keys,
+        "sensitive_keys": sorted(set(sensitive_keys)),
+        "values_redacted": True,
+    }
+
+
+def _redact_url_query_values(url: str) -> str:
+    parsed = urllib.parse.urlsplit(str(url or ""))
+    if not parsed.query:
+        return str(url or "")
+    redacted_pairs: list[tuple[str, str]] = []
+    for key, _value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+        redacted_pairs.append((str(key or ""), "<redacted>"))
+    redacted_query = urllib.parse.urlencode(redacted_pairs, doseq=True)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, redacted_query, parsed.fragment))
+
+
+def _discover_linux_default_gateway_host() -> tuple[str, dict[str, str]]:
+    diagnostics: dict[str, str] = {}
+    route_file = Path("/proc/net/route")
+    if not route_file.exists():
+        diagnostics["status"] = "missing_route_file"
+        return "", diagnostics
+    try:
+        lines = route_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError as exc:
+        diagnostics["status"] = "route_read_error"
+        diagnostics["error"] = f"{type(exc).__name__}: {exc}"
+        return "", diagnostics
+
+    for line in lines[1:]:
+        columns = line.split()
+        if len(columns) < 4:
+            continue
+        iface = columns[0]
+        destination = columns[1]
+        gateway_hex = columns[2]
+        flags_hex = columns[3]
+        try:
+            flags = int(flags_hex, 16)
+        except ValueError:
+            continue
+        if destination != "00000000" or (flags & 0x2) == 0:
+            continue
+        try:
+            gateway = socket.inet_ntoa(struct.pack("<L", int(gateway_hex, 16)))
+        except (ValueError, OSError):
+            continue
+        normalized_gateway = _normalize_callback_forward_host(gateway)
+        if normalized_gateway:
+            diagnostics["status"] = "resolved"
+            diagnostics["interface"] = iface
+            diagnostics["gateway"] = normalized_gateway
+            return normalized_gateway, diagnostics
+
+    diagnostics["status"] = "not_found"
+    return "", diagnostics
+
+
+def _discover_docker_bridge_gateway_host() -> tuple[str, dict[str, str]]:
+    diagnostics: dict[str, str] = {"status": "not_attempted"}
+    if shutil.which("docker") is None:
+        diagnostics["status"] = "docker_unavailable"
+        return "", diagnostics
+    try:
+        process = subprocess.run(
+            ["docker", "network", "inspect", "bridge", "--format", "{{(index .IPAM.Config 0).Gateway}}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=OPENAI_ACCOUNT_CALLBACK_DOCKER_INSPECT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        diagnostics["status"] = "docker_inspect_error"
+        diagnostics["error"] = f"{type(exc).__name__}: {exc}"
+        return "", diagnostics
+
+    stdout = str(process.stdout or "").strip()
+    stderr = str(process.stderr or "").strip()
+    diagnostics["status"] = "docker_inspect_complete"
+    diagnostics["return_code"] = str(int(process.returncode))
+    if stderr:
+        diagnostics["stderr"] = stderr[:220]
+    if process.returncode != 0:
+        return "", diagnostics
+    normalized_gateway = _normalize_callback_forward_host(stdout)
+    if not normalized_gateway:
+        diagnostics["status"] = "docker_inspect_empty_gateway"
+        return "", diagnostics
+    diagnostics["status"] = "resolved"
+    diagnostics["gateway"] = normalized_gateway
+    return normalized_gateway, diagnostics
+
+
+def _discover_openai_callback_bridge_hosts() -> tuple[list[str], dict[str, Any]]:
+    hosts: list[str] = []
+    linux_gateway, linux_diagnostics = _discover_linux_default_gateway_host()
+    if linux_gateway and linux_gateway not in hosts:
+        hosts.append(linux_gateway)
+    docker_gateway, docker_diagnostics = _discover_docker_bridge_gateway_host()
+    if docker_gateway and docker_gateway not in hosts:
+        hosts.append(docker_gateway)
+    return hosts, {
+        "linux_default_route": linux_diagnostics,
+        "docker_bridge": docker_diagnostics,
+        "bridge_hosts": hosts,
+    }
+
+
+def _classify_openai_callback_forward_error(exc: BaseException) -> str:
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, TimeoutError):
+            return "timeout"
+        if isinstance(reason, socket.timeout):
+            return "timeout"
+        if isinstance(reason, ConnectionRefusedError):
+            return "connection_refused"
+        if isinstance(reason, socket.gaierror):
+            return "dns_resolution_failed"
+        if isinstance(reason, OSError):
+            if reason.errno in {101, 113}:
+                return "network_unreachable"
+            if reason.errno == 111:
+                return "connection_refused"
+        reason_text = str(reason or "").strip().lower()
+        if "timed out" in reason_text:
+            return "timeout"
+        if "refused" in reason_text:
+            return "connection_refused"
+        if "name or service not known" in reason_text or "temporary failure in name resolution" in reason_text:
+            return "dns_resolution_failed"
+        return "url_error"
+    if isinstance(exc, OSError):
+        if exc.errno in {101, 113}:
+            return "network_unreachable"
+        if exc.errno == 111:
+            return "connection_refused"
+        return "os_error"
+    return "unknown_transport_error"
 
 
 def _host_port_netloc(host: str, port: int) -> str:
@@ -8125,6 +8392,7 @@ class HubState:
         query: str,
         path: str = "/auth/callback",
         request_host: str = "",
+        request_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self._openai_login_lock:
             session = self._openai_login_session
@@ -8140,10 +8408,26 @@ class HubState:
         if not query:
             raise HTTPException(status_code=400, detail="Missing callback query parameters.")
 
+        callback_query_summary = _openai_callback_query_summary(query)
+        normalized_context = dict(request_context or {})
+
         candidate_hosts: list[str] = ["127.0.0.1", "localhost"]
         normalized_request_host = _normalize_callback_forward_host(request_host)
+        if not normalized_request_host:
+            normalized_request_host = _normalize_callback_forward_host(normalized_context.get("client_host") or "")
         if normalized_request_host and normalized_request_host not in candidate_hosts:
             candidate_hosts.append(normalized_request_host)
+
+        forwarded_host = _normalize_callback_forward_host(normalized_context.get("forwarded_host") or "")
+        if forwarded_host and forwarded_host not in candidate_hosts:
+            candidate_hosts.append(forwarded_host)
+        x_forwarded_host = _normalize_callback_forward_host(normalized_context.get("x_forwarded_host") or "")
+        if x_forwarded_host and x_forwarded_host not in candidate_hosts:
+            candidate_hosts.append(x_forwarded_host)
+        host_header_host = _normalize_callback_forward_host(normalized_context.get("host_header_host") or "")
+        if host_header_host and host_header_host not in candidate_hosts:
+            candidate_hosts.append(host_header_host)
+
         artifact_publish_host = _normalize_callback_forward_host(
             urllib.parse.urlsplit(str(self.artifact_publish_base_url or "")).hostname or ""
         )
@@ -8159,35 +8443,121 @@ class HubState:
                 candidate_hosts.append(resolved_default_host)
         except OSError:
             pass
+        bridge_hosts, bridge_diagnostics = _discover_openai_callback_bridge_hosts()
+        for bridge_host in bridge_hosts:
+            if bridge_host not in candidate_hosts:
+                candidate_hosts.append(bridge_host)
+
+        LOGGER.info(
+            (
+                "OpenAI callback forward resolution "
+                "session_id=%s container=%s callback_path=%s callback_port=%s "
+                "callback_query=%s request_context=%s bridge_routing=%s candidate_hosts=%s"
+            ),
+            session.id,
+            session.container_name,
+            callback_path,
+            callback_port,
+            json.dumps(callback_query_summary, sort_keys=True),
+            json.dumps(
+                {
+                    "client_host": normalized_context.get("client_host") or "",
+                    "forwarded_host": forwarded_host,
+                    "forwarded_proto": normalized_context.get("forwarded_proto") or "",
+                    "forwarded_port": normalized_context.get("forwarded_host_port"),
+                    "x_forwarded_host": x_forwarded_host,
+                    "x_forwarded_proto": normalized_context.get("x_forwarded_proto") or "",
+                    "x_forwarded_port": normalized_context.get("x_forwarded_port"),
+                    "host_header_host": host_header_host,
+                    "host_header_port": normalized_context.get("host_header_port"),
+                },
+                sort_keys=True,
+            ),
+            json.dumps(bridge_diagnostics, sort_keys=True),
+            ", ".join(candidate_hosts),
+        )
 
         status_code = 0
         response_body = ""
         target_origin = ""
         last_exc: BaseException | None = None
+        failure_categories: list[str] = []
         for candidate_host in candidate_hosts:
             target_url = urllib.parse.urlunparse(
                 ("http", _host_port_netloc(candidate_host, callback_port), callback_path, "", query, "")
             )
+            redacted_target_url = _redact_url_query_values(target_url)
             request = urllib.request.Request(target_url, method="GET")
+            LOGGER.info(
+                "OpenAI callback forward upstream request session_id=%s target=%s timeout_sec=%.1f",
+                session.id,
+                redacted_target_url,
+                OPENAI_ACCOUNT_CALLBACK_FORWARD_TIMEOUT_SECONDS,
+            )
             try:
-                with urllib.request.urlopen(request, timeout=8.0) as response:
+                with urllib.request.urlopen(request, timeout=OPENAI_ACCOUNT_CALLBACK_FORWARD_TIMEOUT_SECONDS) as response:
                     status_code = int(response.getcode() or 0)
                     response_body = response.read().decode("utf-8", errors="ignore")
                 target_origin = f"http://{_host_port_netloc(candidate_host, callback_port)}"
+                LOGGER.info(
+                    "OpenAI callback forward upstream response session_id=%s target=%s status=%s error_class=none",
+                    session.id,
+                    redacted_target_url,
+                    status_code,
+                )
                 break
             except urllib.error.HTTPError as exc:
                 status_code = int(exc.code or 0)
                 response_body = exc.read().decode("utf-8", errors="ignore")
                 target_origin = f"http://{_host_port_netloc(candidate_host, callback_port)}"
+                LOGGER.warning(
+                    (
+                        "OpenAI callback forward upstream response session_id=%s target=%s "
+                        "status=%s error_class=http_error"
+                    ),
+                    session.id,
+                    redacted_target_url,
+                    status_code,
+                )
                 break
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_exc = exc
+                error_class = _classify_openai_callback_forward_error(exc)
+                failure_categories.append(error_class)
+                LOGGER.warning(
+                    (
+                        "OpenAI callback forward upstream error session_id=%s target=%s "
+                        "error_class=%s error_type=%s detail=%s"
+                    ),
+                    session.id,
+                    redacted_target_url,
+                    error_class,
+                    type(exc).__name__,
+                    str(exc),
+                )
                 continue
         else:
             attempted = ", ".join(f"http://{_host_port_netloc(host, callback_port)}" for host in candidate_hosts)
+            failure_reason = "all_upstream_targets_failed"
+            if failure_categories:
+                failure_reason = "+".join(sorted(set(failure_categories)))
+            LOGGER.error(
+                (
+                    "OpenAI callback forward failed session_id=%s failure_reason=%s "
+                    "attempted_origins=%s callback_path=%s callback_query=%s"
+                ),
+                session.id,
+                failure_reason,
+                attempted,
+                callback_path,
+                json.dumps(callback_query_summary, sort_keys=True),
+            )
             raise HTTPException(
                 status_code=502,
-                detail=f"Failed to forward OAuth callback to login container. Attempted: {attempted}",
+                detail=(
+                    "Failed to forward OAuth callback to login container. "
+                    f"Reason: {failure_reason}. Attempted: {attempted}"
+                ),
             ) from last_exc
 
         with self._openai_login_lock:
@@ -8201,6 +8571,17 @@ class HubState:
                 if current.status in {"running", "waiting_for_browser"}:
                     current.status = "callback_received"
         self._emit_openai_account_session_changed(reason="oauth_callback_forwarded")
+        LOGGER.info(
+            (
+                "OpenAI callback forward completed session_id=%s target_origin=%s target_path=%s "
+                "status=%s response_summary_present=%s"
+            ),
+            session.id,
+            target_origin,
+            callback_path,
+            status_code,
+            bool(response_body),
+        )
 
         return {
             "forwarded": True,
@@ -12560,10 +12941,12 @@ def main(
         callback_path = str(request.query_params.get("callback_path") or "")
         query_items = [(key, value) for key, value in request.query_params.multi_items() if key != "callback_path"]
         request_client_host = request.client.host if request.client is not None else ""
+        request_context = _openai_callback_request_context_from_request(request)
         forwarded = state.forward_openai_account_callback(
             urllib.parse.urlencode(query_items, doseq=True),
             path=callback_path,
             request_host=request_client_host,
+            request_context=request_context,
         )
         payload = state.openai_account_session_payload()
         payload["callback"] = forwarded
