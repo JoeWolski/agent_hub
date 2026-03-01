@@ -2121,6 +2121,31 @@ Gemini CLI
         self.assertIn("mcpServers", parsed)
         self.assertIn("agent_tools", parsed["mcpServers"])
 
+    def test_prepare_chat_runtime_config_adds_codex_project_trust_for_container_workspace(self) -> None:
+        self.config_file.write_text(
+            (
+                "model = 'test'\n"
+                'projects."/workspace/other".trust_level = "trusted"\n'
+                'projects."/workspace/agent_hub".trust_level = "untrusted"\n'
+            ),
+            encoding="utf-8",
+        )
+        runtime_config_file = self.state._prepare_chat_runtime_config(
+            "chat-codex-trust",
+            agent_type="codex",
+            agent_tools_url="http://host.docker.internal:8765/api/chats/chat-codex-trust/agent-tools",
+            agent_tools_token="mcp-token-test",
+            agent_tools_project_id="project-mcp-test",
+            agent_tools_chat_id="chat-codex-trust",
+            trusted_project_path="/workspace/agent_hub",
+        )
+
+        runtime_text = runtime_config_file.read_text(encoding="utf-8")
+        self.assertIn('projects."/workspace/other".trust_level = "trusted"', runtime_text)
+        expected_line = 'projects."/workspace/agent_hub".trust_level = "trusted"'
+        self.assertIn(expected_line, runtime_text)
+        self.assertEqual(runtime_text.count(expected_line), 1)
+
     def test_start_chat_filters_reserved_openai_env_vars(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
