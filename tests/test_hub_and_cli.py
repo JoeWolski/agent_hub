@@ -2058,6 +2058,127 @@ Gemini CLI
             ],
         )
 
+    def test_forward_openai_account_callback_uses_artifact_publish_host_fallback(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                del exc_type, exc, tb
+                return False
+
+            def getcode(self) -> int:
+                return 200
+
+            def read(self) -> bytes:
+                return b"ok"
+
+        attempted_urls: list[str] = []
+
+        def fake_urlopen(request: urllib.request.Request, timeout: float = 0.0):
+            del timeout
+            url = str(request.full_url)
+            attempted_urls.append(url)
+            if "127.0.0.1:1455" in url or "localhost:1455" in url:
+                raise urllib.error.URLError("connection refused")
+            if "10.88.0.4:1455" in url:
+                return FakeResponse()
+            raise AssertionError(f"Unexpected callback URL: {url}")
+
+        self.state.artifact_publish_base_url = "http://10.88.0.4:8765"
+        self.state._openai_login_session = hub_server.OpenAIAccountLoginSession(
+            id="session-artifact-host",
+            process=SimpleNamespace(pid=9993, poll=lambda: None),
+            container_name="container-artifact-host",
+            started_at="2026-02-21T00:00:00Z",
+            status="waiting_for_browser",
+            callback_port=1455,
+            callback_path="/auth/callback",
+        )
+        with patch("agent_hub.server._is_process_running", return_value=True), patch(
+            "agent_hub.server.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ), patch("agent_hub.server.socket.gethostbyname", return_value="172.17.0.1"):
+            result = self.state.forward_openai_account_callback(
+                "code=abc&state=xyz",
+                path="/auth/callback",
+                request_host="",
+            )
+
+        self.assertTrue(result["forwarded"])
+        self.assertEqual(result["status_code"], 200)
+        self.assertEqual(result["target_origin"], "http://10.88.0.4:1455")
+        self.assertEqual(
+            attempted_urls,
+            [
+                "http://127.0.0.1:1455/auth/callback?code=abc&state=xyz",
+                "http://localhost:1455/auth/callback?code=abc&state=xyz",
+                "http://10.88.0.4:1455/auth/callback?code=abc&state=xyz",
+            ],
+        )
+
+    def test_forward_openai_account_callback_uses_resolved_default_host_for_default_startup(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                del exc_type, exc, tb
+                return False
+
+            def getcode(self) -> int:
+                return 200
+
+            def read(self) -> bytes:
+                return b"ok"
+
+        attempted_urls: list[str] = []
+
+        def fake_urlopen(request: urllib.request.Request, timeout: float = 0.0):
+            del timeout
+            url = str(request.full_url)
+            attempted_urls.append(url)
+            if "127.0.0.1:1455" in url or "localhost:1455" in url or "10.0.1.1:1455" in url or "host.docker.internal:1455" in url:
+                raise urllib.error.URLError("connection refused")
+            if "172.17.0.1:1455" in url:
+                return FakeResponse()
+            raise AssertionError(f"Unexpected callback URL: {url}")
+
+        # Mirrors `agent_hub` default startup path with no explicit --artifact-publish-base-url.
+        self.state.artifact_publish_base_url = hub_server._default_artifact_publish_base_url(hub_server.DEFAULT_PORT)
+        self.state._openai_login_session = hub_server.OpenAIAccountLoginSession(
+            id="session-default-startup",
+            process=SimpleNamespace(pid=9994, poll=lambda: None),
+            container_name="container-default-startup",
+            started_at="2026-02-21T00:00:00Z",
+            status="waiting_for_browser",
+            callback_port=1455,
+            callback_path="/auth/callback",
+        )
+        with patch("agent_hub.server._is_process_running", return_value=True), patch(
+            "agent_hub.server.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ), patch("agent_hub.server.socket.gethostbyname", return_value="172.17.0.1"):
+            result = self.state.forward_openai_account_callback(
+                "code=abc&state=xyz",
+                path="/auth/callback",
+                request_host="10.0.1.1",
+            )
+
+        self.assertTrue(result["forwarded"])
+        self.assertEqual(result["status_code"], 200)
+        self.assertEqual(result["target_origin"], "http://172.17.0.1:1455")
+        self.assertEqual(
+            attempted_urls,
+            [
+                "http://127.0.0.1:1455/auth/callback?code=abc&state=xyz",
+                "http://localhost:1455/auth/callback?code=abc&state=xyz",
+                "http://10.0.1.1:1455/auth/callback?code=abc&state=xyz",
+                "http://host.docker.internal:1455/auth/callback?code=abc&state=xyz",
+                "http://172.17.0.1:1455/auth/callback?code=abc&state=xyz",
+            ],
+        )
+
     def test_parse_env_vars_rejects_openai_api_key(self) -> None:
         with self.assertRaises(HTTPException):
             hub_server._parse_env_vars(["OPENAI_API_KEY=sk-test-abcdef"])
@@ -9725,6 +9846,43 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         self.assertEqual(post_response.json(), discovery_payload)
         read_capabilities.assert_called_once_with()
         start_discovery.assert_called_once_with()
+
+    def test_openai_account_callback_route_passes_empty_callback_path_by_default(self) -> None:
+        app = self._build_app()
+        forwarded_payload = {
+            "forwarded": True,
+            "status_code": 200,
+            "target_origin": "http://127.0.0.1:1455",
+            "target_path": "/oauth/callback",
+            "response_summary": "ok",
+        }
+        session_payload = {
+            "session": {
+                "id": "session-1",
+                "status": "callback_received",
+            }
+        }
+
+        with patch.object(
+            hub_server.HubState,
+            "forward_openai_account_callback",
+            return_value=forwarded_payload,
+        ) as forward_callback, patch.object(
+            hub_server.HubState,
+            "openai_account_session_payload",
+            return_value=session_payload,
+        ):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/settings/auth/openai/account/callback?code=abc&state=xyz",
+                )
+
+        self.assertEqual(response.status_code, 200, msg=response.text)
+        self.assertEqual(response.json(), {**session_payload, "callback": forwarded_payload})
+        call_args, call_kwargs = forward_callback.call_args
+        self.assertEqual(call_args[0], "code=abc&state=xyz")
+        self.assertEqual(call_kwargs["path"], "")
+        self.assertTrue(isinstance(call_kwargs.get("request_host"), str))
 
     def test_terminal_websocket_disconnect_during_backlog_send_detaches_listener(self) -> None:
         app = self._build_app()

@@ -16,6 +16,7 @@ import queue
 import re
 import secrets
 import signal
+import socket
 import struct
 import subprocess
 import shutil
@@ -8125,8 +8126,21 @@ class HubState:
         normalized_request_host = _normalize_callback_forward_host(request_host)
         if normalized_request_host and normalized_request_host not in candidate_hosts:
             candidate_hosts.append(normalized_request_host)
+        artifact_publish_host = _normalize_callback_forward_host(
+            urllib.parse.urlsplit(str(self.artifact_publish_base_url or "")).hostname or ""
+        )
+        if artifact_publish_host and artifact_publish_host not in candidate_hosts:
+            candidate_hosts.append(artifact_publish_host)
         if DEFAULT_ARTIFACT_PUBLISH_HOST not in candidate_hosts:
             candidate_hosts.append(DEFAULT_ARTIFACT_PUBLISH_HOST)
+        try:
+            resolved_default_host = _normalize_callback_forward_host(
+                socket.gethostbyname(DEFAULT_ARTIFACT_PUBLISH_HOST)
+            )
+            if resolved_default_host and resolved_default_host not in candidate_hosts:
+                candidate_hosts.append(resolved_default_host)
+        except OSError:
+            pass
 
         status_code = 0
         response_body = ""
@@ -12520,7 +12534,7 @@ def main(
 
     @app.get("/api/settings/auth/openai/account/callback")
     def api_openai_account_callback(request: Request) -> dict[str, Any]:
-        callback_path = str(request.query_params.get("callback_path") or "/auth/callback")
+        callback_path = str(request.query_params.get("callback_path") or "")
         query_items = [(key, value) for key, value in request.query_params.multi_items() if key != "callback_path"]
         request_client_host = request.client.host if request.client is not None else ""
         forwarded = state.forward_openai_account_callback(
