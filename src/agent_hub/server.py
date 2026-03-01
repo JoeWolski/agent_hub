@@ -3482,8 +3482,9 @@ def _read_codex_auth(path: Path) -> tuple[bool, str]:
 
 
 def _snapshot_schema_version() -> int:
-    # v6 invalidates snapshots built before in-image ownership repair rollout.
-    return 6
+    # v7 invalidates snapshots that may have been prepared without guaranteed
+    # project-in-image ownership repair/writability probes.
+    return 7
 
 
 def _docker_remove_images(prefixes: tuple[str, ...], explicit_tags: set[str]) -> None:
@@ -7083,6 +7084,7 @@ class HubState:
             env_vars=project_for_launch.get("default_env_vars"),
             setup_script=str(project_for_launch.get("setup_script") or ""),
             prepare_snapshot_only=True,
+            project_in_image=True,
             runtime_tmp_mount=str(project_tmp_workspace),
             context_key=f"snapshot:{project_for_launch.get('id')}",
         )
@@ -11012,6 +11014,7 @@ class HubState:
             env_vars=project.get("default_env_vars"),
             setup_script=setup_script,
             prepare_snapshot_only=True,
+            project_in_image=True,
             runtime_tmp_mount=str(project_tmp_workspace),
             context_key=f"snapshot:{project.get('id')}",
         )

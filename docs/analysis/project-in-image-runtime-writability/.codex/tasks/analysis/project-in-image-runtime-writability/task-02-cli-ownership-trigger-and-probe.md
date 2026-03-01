@@ -1,6 +1,6 @@
 # Task 02: CLI Ownership Trigger And Probe
 
-Status: PLANNED
+Status: COMPLETE
 
 ## Objective
 Refactor ownership-repair trigger to depend on deterministic snapshot workspace-copy state and add explicit writability probe before snapshot commit.
@@ -10,29 +10,18 @@ Refactor ownership-repair trigger to depend on deterministic snapshot workspace-
 - `tests/test_hub_and_cli.py`
 - `docs/analysis/project-in-image-runtime-writability/*`
 
-## Proposed Changes
-- Introduce explicit internal condition representing "repo copied into image workspace".
-- Run ownership repair when that condition is true, independent of launch-mode mismatch.
-- Add a runtime-user writability probe; fail fast before commit when probe fails.
+## Changes Implemented
+- Added `_verify_snapshot_project_writable` helper.
+- Switched repair/probe trigger to `snapshot_workspace_copied_into_image = not use_project_bind_mount`.
+- Enforced sequence: setup run -> ownership repair -> writability probe (runtime UID:GID) -> commit.
+- Added/updated tests for both `--project-in-image` and `--prepare-snapshot-only` snapshot build paths.
 
-## Incremental Testing Breakdown
-1. Baseline current ownership-repair tests.
-2. Add/adjust helper-level tests for trigger condition and probe command behavior.
-3. Re-run targeted cli unit tests after each chunk.
-4. Run final snapshot-related test subset.
+## Commands Run
+- `UV_PROJECT_ENVIRONMENT=/workspace/agent_hub_writable_1772390241/.venv uv run pytest tests/test_hub_and_cli.py -k "snapshot_runtime_project_in_image_repairs_project_ownership_before_commit or snapshot_prepare_only_repairs_project_ownership_and_verifies_writable_before_commit" -q` (PASS via grouped run)
+- `UV_PROJECT_ENVIRONMENT=/workspace/agent_hub_writable_1772390241/.venv uv run pytest tests/test_hub_and_cli.py -k "snapshot_runtime_project_in_image" -q` (PASS)
 
-## Required Validation Commands
-- `uv run pytest tests/test_hub_and_cli.py -k "repairs_project_ownership" -q`
-- `uv run pytest tests/test_hub_and_cli.py -k "snapshot_runtime_project_in_image" -q`
+## Pass/Fail
+PASS
 
-## Logging/Diagnostics Plan
-- Record command list with ordering checks (`run` -> `chown` -> probe -> `commit`).
-- Ensure failure assertions include stderr/stdout snippet for fast triage.
-
-## PR Evidence Plan
-- Include probe success/failure validation entries in `validation/manifest.txt`.
-- No visual evidence required.
-
-## Risks
-- Extra probe can add latency or break in restricted container images.
-- Mitigation: use simple POSIX-safe probe and clear fallback error.
+## Remaining Risks
+- Broader snapshot test subset includes unrelated pre-existing failures due `/tmp` daemon-visibility checks.
