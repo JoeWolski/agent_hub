@@ -1895,6 +1895,12 @@ def main(
         shared_prompt_context=shared_prompt_context,
         no_alt_screen=no_alt_screen,
     )
+    codex_project_trust_key = f"projects.{json.dumps(container_project_path)}.trust_level"
+    if (
+        selected_agent_provider == AGENT_PROVIDER_CODEX
+        and not _has_codex_config_override(explicit_container_args, key=codex_project_trust_key)
+    ):
+        runtime_flags.extend(["--config", f'{codex_project_trust_key}="trusted"'])
 
     command = [selected_agent_command]
     command.extend(runtime_flags)
