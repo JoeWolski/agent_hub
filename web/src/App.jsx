@@ -1866,6 +1866,8 @@ function HubApp() {
   const authRefreshQueuedRef = useRef(false);
   const capabilitiesRefreshInFlightRef = useRef(false);
   const capabilitiesRefreshQueuedRef = useRef(false);
+  const openAiLoginAutoOpenArmedRef = useRef(false);
+  const openAiLoginAutoOpenedRef = useRef("");
   const githubSetupResolutionRef = useRef("");
   const projectDraftsRef = useRef({});
   const projectFirstSeenOrderRef = useRef(createFirstSeenOrderState());
@@ -3790,6 +3792,7 @@ function HubApp() {
   }
 
   async function handleStartOpenAiAccountLogin(method) {
+    openAiLoginAutoOpenArmedRef.current = method === "browser_callback";
     setOpenAiAccountStarting(true);
     try {
       const payload = await fetchJson("/api/settings/auth/openai/account/start", {
@@ -3800,6 +3803,7 @@ function HubApp() {
       setError("");
       refreshAuthSettings().catch(() => {});
     } catch (err) {
+      openAiLoginAutoOpenArmedRef.current = false;
       setError(err.message || String(err));
     } finally {
       setOpenAiAccountStarting(false);
@@ -3807,6 +3811,7 @@ function HubApp() {
   }
 
   async function handleCancelOpenAiAccountLogin() {
+    openAiLoginAutoOpenArmedRef.current = false;
     setOpenAiAccountCancelling(true);
     try {
       const payload = await fetchJson("/api/settings/auth/openai/account/cancel", {
@@ -3823,6 +3828,7 @@ function HubApp() {
   }
 
   async function handleDisconnectOpenAiAccount() {
+    openAiLoginAutoOpenArmedRef.current = false;
     setOpenAiAccountDisconnecting(true);
     try {
       const payload = await fetchJson("/api/settings/auth/openai/account/disconnect", {
@@ -4105,6 +4111,25 @@ function HubApp() {
       setOpenAiCardExpanded(true);
     }
   }, [openAiCardCanExpand, openAiAccountLoginInFlight]);
+
+  useEffect(() => {
+    if (!openAiLoginAutoOpenArmedRef.current) {
+      return;
+    }
+    if (openAiAccountSessionMethod !== "browser_callback" || !openAiAccountLoginUrl) {
+      return;
+    }
+    const sessionId = String(openAiAccountSession?.id || "");
+    const openKey = `${sessionId}:${openAiAccountLoginUrl}`;
+    if (!sessionId || openAiLoginAutoOpenedRef.current === openKey) {
+      return;
+    }
+    const popup = window.open(openAiAccountLoginUrl, "_blank", "noopener,noreferrer");
+    if (popup) {
+      openAiLoginAutoOpenedRef.current = openKey;
+      openAiLoginAutoOpenArmedRef.current = false;
+    }
+  }, [openAiAccountLoginUrl, openAiAccountSession, openAiAccountSessionMethod]);
 
   useEffect(() => {
     if (openAiAccountConnected && openAiCardExpanded) {

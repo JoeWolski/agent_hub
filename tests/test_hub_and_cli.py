@@ -1866,6 +1866,24 @@ Gemini CLI
         self.assertEqual(status["account_auth_mode"], "chatgpt")
         self.assertTrue(status["account_updated_at"])
 
+    def test_openai_login_url_in_text_accepts_redirect_uri_login_url(self) -> None:
+        line = (
+            "Open this URL to continue: "
+            "https://login.example.test/oauth?"
+            "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=abc"
+        )
+        self.assertEqual(
+            hub_server._openai_login_url_in_text(line),
+            "https://login.example.test/oauth?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=abc",
+        )
+
+    def test_openai_login_url_in_text_accepts_chatgpt_auth_url(self) -> None:
+        line = "Visit https://chatgpt.com/auth/login?client_id=codex and complete sign-in."
+        self.assertEqual(
+            hub_server._openai_login_url_in_text(line),
+            "https://chatgpt.com/auth/login?client_id=codex",
+        )
+
     def test_start_openai_account_login_uses_host_network(self) -> None:
         captured: dict[str, list[str]] = {}
         self.state.local_supp_gids = f"{self.state.local_gid},3000,3001"
