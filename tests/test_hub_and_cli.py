@@ -118,6 +118,34 @@ class HubStateTests(unittest.TestCase):
         self.host_ro.mkdir(parents=True, exist_ok=True)
         self.host_rw.mkdir(parents=True, exist_ok=True)
 
+    def test_hub_state_uses_host_identity_env_overrides(self) -> None:
+        override_data_dir = self.tmp_path / "hub-override"
+        with patch.dict(
+            os.environ,
+            {
+                hub_server.AGENT_HUB_HOST_UID_ENV: "4242",
+                hub_server.AGENT_HUB_HOST_GID_ENV: "4343",
+                hub_server.AGENT_HUB_HOST_SUPP_GIDS_ENV: "4343,5000,5001",
+            },
+            clear=False,
+        ):
+            override_state = hub_server.HubState(override_data_dir, self.config_file)
+
+        self.assertEqual(override_state.local_uid, 4242)
+        self.assertEqual(override_state.local_gid, 4343)
+        self.assertEqual(override_state.local_supp_gids, "4343,5000,5001")
+
+    def test_hub_state_rejects_invalid_host_uid_override(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                hub_server.AGENT_HUB_HOST_UID_ENV: "not-an-int",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Invalid AGENT_HUB_HOST_UID"):
+                hub_server.HubState(self.tmp_path / "hub-invalid-uid", self.config_file)
+
     def _connect_github_app(self) -> dict[str, object]:
         with patch.object(
             hub_server.HubState,

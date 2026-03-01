@@ -38,4 +38,11 @@ Entry-point behavior:
 - validates Docker socket presence
 - validates `AGENT_HUB_SHARED_ROOT` same-path bind mount (unless explicitly bypassed)
 - initializes config/data/home under `${AGENT_HUB_SHARED_ROOT}`
+- exports `AGENT_HUB_HOST_UID`/`AGENT_HUB_HOST_GID` from `${AGENT_HUB_SHARED_ROOT}` owner when not provided
 - executes `./bin/agent_hub --no-frontend-build`
+
+To force chat runtime identity explicitly, set:
+
+- `AGENT_HUB_HOST_UID=<host uid>`
+- `AGENT_HUB_HOST_GID=<host gid>`
+- optionally `AGENT_HUB_HOST_SUPPLEMENTARY_GIDS=<gid1,gid2,...>`

@@ -98,6 +98,9 @@ RUNTIME_TMP_PROJECTS_DIR_NAME = "projects"
 RUNTIME_TMP_CHATS_DIR_NAME = "chats"
 RUNTIME_TMP_WORKSPACE_DIR_NAME = "workspace"
 AGENT_HUB_TMP_HOST_PATH_ENV = "AGENT_HUB_TMP_HOST_PATH"
+AGENT_HUB_HOST_UID_ENV = "AGENT_HUB_HOST_UID"
+AGENT_HUB_HOST_GID_ENV = "AGENT_HUB_HOST_GID"
+AGENT_HUB_HOST_SUPP_GIDS_ENV = "AGENT_HUB_HOST_SUPPLEMENTARY_GIDS"
 AGENT_TOOLS_MCP_RUNTIME_DIR_NAME = "agent_hub"
 AGENT_TOOLS_MCP_RUNTIME_FILE_NAME = "agent_tools_mcp.py"
 AGENT_TOOLS_URL_ENV = "AGENT_HUB_AGENT_TOOLS_URL"
@@ -3861,6 +3864,19 @@ def _normalize_csv(value: str | None) -> str:
     return ",".join(values)
 
 
+def _parse_non_negative_int_env(var_name: str, fallback: int) -> int:
+    raw = str(os.environ.get(var_name, "")).strip()
+    if not raw:
+        return int(fallback)
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid {var_name}: expected integer, got {raw!r}") from exc
+    if value < 0:
+        raise RuntimeError(f"Invalid {var_name}: expected non-negative integer, got {raw!r}")
+    return value
+
+
 def _parse_gid_csv(value: str) -> list[int]:
     gids: list[int] = []
     seen: set[int] = set()
@@ -4183,10 +4199,12 @@ class HubState:
         artifact_publish_base_url: str | None = None,
         ui_lifecycle_debug: bool = False,
     ):
-        self.local_uid = os.getuid()
+        self.local_uid = _parse_non_negative_int_env(AGENT_HUB_HOST_UID_ENV, os.getuid())
         self.local_user = f"uid-{self.local_uid}"
-        self.local_gid = os.getgid()
-        self.local_supp_gids = _normalize_csv(_default_supplementary_gids())
+        self.local_gid = _parse_non_negative_int_env(AGENT_HUB_HOST_GID_ENV, os.getgid())
+        self.local_supp_gids = _normalize_csv(
+            str(os.environ.get(AGENT_HUB_HOST_SUPP_GIDS_ENV) or _default_supplementary_gids())
+        )
         self.local_umask = "0022"
         self.host_agent_home = (Path.home() / ".agent-home" / self.local_user).resolve()
         self.host_codex_dir = self.host_agent_home / ".codex"

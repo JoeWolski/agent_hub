@@ -30,6 +30,13 @@ if [[ ! -f "${config_file}" ]]; then
   cp /opt/agent_hub/config/agent.config.toml "${config_file}"
 fi
 
+if [[ -z "${AGENT_HUB_HOST_UID:-}" ]]; then
+  export AGENT_HUB_HOST_UID="$(stat -c '%u' "${shared_root}")"
+fi
+if [[ -z "${AGENT_HUB_HOST_GID:-}" ]]; then
+  export AGENT_HUB_HOST_GID="$(stat -c '%g' "${shared_root}")"
+fi
+
 if ! awk -v mount_point="${shared_root}" '$5 == mount_point {found = 1} END {exit !found}' /proc/self/mountinfo; then
   if [[ "${AGENT_HUB_ALLOW_UNMOUNTED_SHARED_ROOT:-0}" != "1" ]]; then
     cat >&2 <<EOF
