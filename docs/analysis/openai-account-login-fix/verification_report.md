@@ -26,8 +26,7 @@
 ## Validation Evidence
 - See `validation/manifest.txt` for exact commands and PASS/FAIL.
 - Final targeted suites PASS:
-  - `forward_openai_account_callback`: `8 passed, 311 deselected`
-  - `openai_account_callback_route or parse_callback_forward_host_port`: `3 passed, 316 deselected`
+  - `forward_openai_account_callback or forward_openai_callback_via_container_loopback or openai_account_callback_route or parse_callback_forward_host_port`: `13 passed, 308 deselected`
 
 ## Result
 PASS

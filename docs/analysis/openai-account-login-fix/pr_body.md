@@ -18,6 +18,12 @@ Fixes OpenAI account login callback failures ending in `502 Bad Gateway` by addi
   - callback query value summaries only
   - redacted query values in logged target URLs
   - no logging of code/code_verifier/access_token-like values
+- Hardened container-loopback forwarding runtime:
+  - switched exec launcher to `sh -lc` with `python3`/`python` fallback
+  - improved container exec failure categorization (`container_not_running`, `container_python_missing`)
+  - include `returncode` + stdout/stderr snippets in diagnostics
+- UI guardrail:
+  - disarm browser auto-open when submitting callback URL so submit cannot relaunch login tab
 - Added targeted tests for:
   - callback success path
   - 502-producing failure path + failure-category logs + redaction

@@ -3616,7 +3616,7 @@ def _forward_openai_callback_via_container_loopback(
             error_detail="docker command not found",
         )
 
-    script = (
+    python_script = (
         "import json, os, urllib.error, urllib.request\n"
         "port = int(os.environ.get('AGENT_HUB_CALLBACK_PORT', '1455'))\n"
         "path = os.environ.get('AGENT_HUB_CALLBACK_PATH', '/auth/callback')\n"
@@ -3636,6 +3636,16 @@ def _forward_openai_callback_via_container_loopback(
         "    body = exc.read().decode('utf-8', errors='ignore')\n"
         "print(json.dumps({'status_code': status, 'body': body}))\n"
     )
+    launch_script = (
+        "if command -v python3 >/dev/null 2>&1; then "
+        "exec python3 -c \"$AGENT_HUB_CALLBACK_FORWARDER_SCRIPT\"; "
+        "elif command -v python >/dev/null 2>&1; then "
+        "exec python -c \"$AGENT_HUB_CALLBACK_FORWARDER_SCRIPT\"; "
+        "else "
+        "echo 'python runtime unavailable in login container' >&2; "
+        "exit 127; "
+        "fi"
+    )
     cmd = [
         "docker",
         "exec",
@@ -3647,10 +3657,12 @@ def _forward_openai_callback_via_container_loopback(
         f"AGENT_HUB_CALLBACK_QUERY={query}",
         "--env",
         f"AGENT_HUB_CALLBACK_TIMEOUT={OPENAI_ACCOUNT_CALLBACK_FORWARD_TIMEOUT_SECONDS}",
+        "--env",
+        f"AGENT_HUB_CALLBACK_FORWARDER_SCRIPT={python_script}",
         container_name,
-        "python3",
-        "-c",
-        script,
+        "sh",
+        "-lc",
+        launch_script,
     ]
     try:
         process = subprocess.run(
@@ -3674,17 +3686,30 @@ def _forward_openai_callback_via_container_loopback(
         )
 
     if process.returncode != 0:
+        stdout = str(process.stdout or "").strip()
         stderr = str(process.stderr or "").strip()
-        if "executable file not found" in stderr.lower() and "python3" in stderr.lower():
+        combined = f"{stdout}\n{stderr}".lower()
+        error_detail = (
+            f"rc={int(process.returncode)} "
+            f"stdout={stdout[:220] if stdout else '<empty>'} "
+            f"stderr={stderr[:220] if stderr else '<empty>'}"
+        )
+        if "not running" in combined or "no such container" in combined:
+            return OpenAICallbackContainerForwardResult(
+                attempted=True,
+                error_class="container_not_running",
+                error_detail=error_detail,
+            )
+        if process.returncode == 127 or "python runtime unavailable in login container" in combined:
             return OpenAICallbackContainerForwardResult(
                 attempted=True,
                 error_class="container_python_missing",
-                error_detail=stderr[:220],
+                error_detail=error_detail,
             )
         return OpenAICallbackContainerForwardResult(
             attempted=True,
             error_class="container_exec_failed",
-            error_detail=stderr[:220],
+            error_detail=error_detail,
         )
 
     stdout = str(process.stdout or "").strip()
