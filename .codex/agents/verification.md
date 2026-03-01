@@ -29,7 +29,7 @@ Own verification end-to-end across both:
 5. Verify PR evidence planning and artifact policy compliance:
    - feature planning includes explicit PR evidence step
    - planned visualizations are concrete and mapped to correctness claims
-   - visualization artifacts intended for PR prefer `.jpg`/`.jpeg` (`.png` only when required)
+   - visualization artifacts intended for PR are `.png` only
    - visualization self-review assertions are present and complete
    - PR body has been kept current through revision cycle
 6. In implementation workflow, ensure evidence report exists:
@@ -67,7 +67,7 @@ Own verification end-to-end across both:
 - Risk/control claims must map to explicit command/test evidence.
 - Incremental testing evidence must exist for large/complex tasks (baseline, chunk checks, integration, final validation).
 - Long-running tasks must include short plumbing-check evidence before full-length executions.
-- Visual PR evidence should prefer `.jpg`/`.jpeg` (`.png` only when required).
+- Visual PR evidence must use `.png` only when visuals are used.
 - Verification must fail if planned PR visualization evidence is missing or not self-reviewed.
 - Verification must fail if PR body does not reflect latest validation/evidence status.
 - Do not mark gate passing if any required command fails.

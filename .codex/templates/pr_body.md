@@ -25,7 +25,7 @@
   - Updated artifacts/code/tests revalidated automatically
   - PR stack refreshed and returned for review
 - PR evidence discipline:
-  - Visual evidence format: prefer `.jpg`/`.jpeg`; use `.png` only when required
+  - Visual evidence format: `.png` only
   - Planned visualizations from feature docs are implemented as specified
   - Each visualization has self-review assertion recorded:
     - clear/readable
@@ -41,7 +41,7 @@
   - `uv run pytest tests/test_hub_and_cli.py -k <targeted_case>` : PASS/FAIL
   - `cd web && yarn build` : PASS/FAIL (frontend changes only)
 - PR evidence checks:
-  - planned visual artifacts present in preferred format (`.jpg`/`.jpeg`; `.png` only when required): PASS/FAIL
+  - planned `.png` visualization artifacts present: PASS/FAIL
   - visualization self-review completed: PASS/FAIL
   - PR body reflects latest evidence and validation state: PASS/FAIL
 

@@ -23,7 +23,7 @@ Provide an independent implementation-vs-design audit using a brand-new agent co
 3. Verify each claimed validation command exists in manifest/report.
 4. Identify mismatches between design intent and actual implementation behavior.
 5. Assert PR evidence quality/completeness against planned visualization requirements:
-   - visual artifacts used for PR evidence prefer `.jpg`/`.jpeg` (`.png` only when required)
+   - visual artifacts used for PR evidence are `.png` only
    - required planned visualizations are present
    - each visualization provides at-a-glance correctness support
    - self-review checks were completed (clarity, legend match, no glitches/artifacts)

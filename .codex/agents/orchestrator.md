@@ -56,7 +56,7 @@ readiness.
    - `.codex/tasks/analysis/<feature-name>/task-*.md`
 5. In design docs and task contracts, add explicit PR evidence planning:
    - define required evidence artifacts for the feature
-   - if visuals are used, prefer `.jpg`/`.jpeg`; use `.png` only when required
+   - if visuals are used, require `.png` only
    - define exact planned visualizations and at-a-glance correctness claim for each
    - include required visualization self-review criteria for later PR inclusion
 6. On user feedback, update docs and return another design revision.
@@ -101,7 +101,7 @@ readiness.
 - In `implementation`, do not begin code edits before design docs are present.
 - Every task must include allowed edit paths and required validation commands.
 - Every task must include incremental testing breakdown and logging/diagnostics plan.
-- Every task must include explicit PR evidence plan with preferred `.jpg`/`.jpeg` visuals (`.png` only when required).
+- Every task must include explicit PR evidence plan with `.png`-only visuals when applicable.
 - Sub-agent work requires explicit file ownership boundaries.
 - Do not ask the user to run manual gate/evidence bookkeeping commands.
 - Do not ask for intermediate confirmations inside a workflow cycle.
@@ -111,7 +111,7 @@ readiness.
   - `## Changes`
   - `## Validation`
   - `## Risks`
-- PR evidence visuals should prefer `.jpg`/`.jpeg` when possible (`.png` only when required).
+- PR evidence visuals must be `.png` only when visuals are used.
 - Required planned visualization artifacts must be self-reviewed before PR-body inclusion.
 
 ## Stop Conditions

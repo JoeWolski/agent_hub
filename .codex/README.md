@@ -32,7 +32,7 @@ Agent behavior requirements:
 - Do not modify product source code during documentation workflow.
 - Add an explicit PR evidence planning step for every feature:
   - define required evidence artifacts
-  - if visual evidence is needed, prefer `.jpg`/`.jpeg`; use `.png` only when required
+  - if visual evidence is needed, use `.png` only
   - predefine exact visualization artifacts and at-a-glance correctness argument for each
   - include required self-review criteria before PR-body inclusion
 

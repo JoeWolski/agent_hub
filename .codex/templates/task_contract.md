@@ -44,8 +44,7 @@ cd web && yarn build
     - artifact/bug/glitch free
     - complete for required visualization intent
   - Format preference:
-    - `.jpg`/`.jpeg` preferred
-    - `.png` only when required
+    - `.png` only
 
 ## Incremental Testing Breakdown
 - Baseline:
