@@ -1,6 +1,6 @@
 # Task 01: Hub Snapshot Command Wiring
 
-Status: COMPLETE
+Status: PLANNED
 
 ## Objective
 Ensure project snapshot build invocations use explicit in-image workspace semantics so ownership repair is guaranteed to run during snapshot preparation.
@@ -10,17 +10,28 @@ Ensure project snapshot build invocations use explicit in-image workspace semant
 - `tests/test_hub_and_cli.py`
 - `docs/analysis/project-in-image-runtime-writability/*`
 
-## Changes Implemented
-- Updated `project_snapshot_launch_profile` to pass `project_in_image=True` when `prepare_snapshot_only=True`.
-- Updated `_ensure_project_setup_snapshot` to pass `project_in_image=True` when `prepare_snapshot_only=True`.
-- Updated unit test coverage to assert `--project-in-image` is present in snapshot build command.
+## Proposed Changes
+- Update project snapshot build command construction to pass the in-image workspace mode used by chat launches.
+- Add/adjust tests asserting snapshot build command includes the required mode and remains backward compatible for non-snapshot flows.
 
-## Commands Run
-- `UV_PROJECT_ENVIRONMENT=/workspace/agent_hub_writable_1772390241/.venv uv run pytest tests/test_hub_and_cli.py -k "project_snapshot_launch_profile or ensure_project_setup_snapshot" -q` (PASS)
-- `UV_PROJECT_ENVIRONMENT=/workspace/agent_hub_writable_1772390241/.venv uv run pytest tests/test_hub_and_cli.py -k "ensure_project_setup_snapshot_builds_once" -q` (PASS via grouped run)
+## Incremental Testing Breakdown
+1. Baseline targeted tests around snapshot command construction.
+2. Re-run smallest affected unit test after command wiring edits.
+3. Re-run broader `tests/test_hub_and_cli.py` subset covering snapshot launch profile.
+4. Run full required validation command list before handoff.
 
-## Pass/Fail
-PASS
+## Required Validation Commands
+- `uv run pytest tests/test_hub_and_cli.py -k "snapshot and launch_profile" -q`
+- `uv run pytest tests/test_hub_and_cli.py -k "project_in_image" -q`
 
-## Remaining Risks
-- Full end-to-end integration for daemon/runtime writability remains a follow-up opportunity.
+## Logging/Diagnostics Plan
+- Capture generated command arrays and assert flags directly in tests.
+- On failure, include full command diff in assertion message.
+
+## PR Evidence Plan
+- Add command-level evidence lines in `validation/manifest.txt` for each required test.
+- No visual evidence required.
+
+## Risks
+- Passing new mode in unintended contexts could alter existing snapshot-only scenarios.
+- Mitigation: strict tests for non-project-in-image command paths.
