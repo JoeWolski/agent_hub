@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import html
 import hmac
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -3291,6 +3292,30 @@ def _parse_local_callback(url_text: str) -> tuple[str, int, str]:
         )
     )
     return normalized_url, callback_port, callback_path
+
+
+def _normalize_callback_forward_host(raw_value: Any) -> str:
+    token = str(raw_value or "").strip().lower().strip("[]")
+    if not token:
+        return ""
+    if any(marker in token for marker in ("/", "?", "#", "@", " ")):
+        return ""
+    if ":" in token:
+        try:
+            ipaddress.IPv6Address(token)
+        except ValueError:
+            return ""
+        return token
+    if re.fullmatch(r"[a-z0-9.-]+", token):
+        return token
+    return ""
+
+
+def _host_port_netloc(host: str, port: int) -> str:
+    normalized_host = str(host or "").strip()
+    if ":" in normalized_host and not normalized_host.startswith("["):
+        normalized_host = f"[{normalized_host}]"
+    return f"{normalized_host}:{int(port)}"
 
 
 def _chat_subtitle_from_log(log_path: Path) -> str:
@@ -8076,7 +8101,12 @@ class HubState:
             return {"session": cancelled_payload}
         return {"session": None}
 
-    def forward_openai_account_callback(self, query: str, path: str = "/auth/callback") -> dict[str, Any]:
+    def forward_openai_account_callback(
+        self,
+        query: str,
+        path: str = "/auth/callback",
+        request_host: str = "",
+    ) -> dict[str, Any]:
         with self._openai_login_lock:
             session = self._openai_login_session
             if session is None:
@@ -8087,22 +8117,46 @@ class HubState:
             callback_path = str(path or session.callback_path or "/auth/callback").strip() or "/auth/callback"
             if not callback_path.startswith("/"):
                 callback_path = f"/{callback_path}"
-            target_origin = f"http://127.0.0.1:{callback_port}"
 
         if not query:
             raise HTTPException(status_code=400, detail="Missing callback query parameters.")
 
-        target_url = urllib.parse.urlunparse(("http", f"127.0.0.1:{callback_port}", callback_path, "", query, ""))
-        request = urllib.request.Request(target_url, method="GET")
-        try:
-            with urllib.request.urlopen(request, timeout=8.0) as response:
-                status_code = int(response.getcode() or 0)
-                response_body = response.read().decode("utf-8", errors="ignore")
-        except urllib.error.HTTPError as exc:
-            status_code = int(exc.code or 0)
-            response_body = exc.read().decode("utf-8", errors="ignore")
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise HTTPException(status_code=502, detail="Failed to forward OAuth callback to login container.") from exc
+        candidate_hosts: list[str] = ["127.0.0.1", "localhost"]
+        normalized_request_host = _normalize_callback_forward_host(request_host)
+        if normalized_request_host and normalized_request_host not in candidate_hosts:
+            candidate_hosts.append(normalized_request_host)
+        if DEFAULT_ARTIFACT_PUBLISH_HOST not in candidate_hosts:
+            candidate_hosts.append(DEFAULT_ARTIFACT_PUBLISH_HOST)
+
+        status_code = 0
+        response_body = ""
+        target_origin = ""
+        last_exc: BaseException | None = None
+        for candidate_host in candidate_hosts:
+            target_url = urllib.parse.urlunparse(
+                ("http", _host_port_netloc(candidate_host, callback_port), callback_path, "", query, "")
+            )
+            request = urllib.request.Request(target_url, method="GET")
+            try:
+                with urllib.request.urlopen(request, timeout=8.0) as response:
+                    status_code = int(response.getcode() or 0)
+                    response_body = response.read().decode("utf-8", errors="ignore")
+                target_origin = f"http://{_host_port_netloc(candidate_host, callback_port)}"
+                break
+            except urllib.error.HTTPError as exc:
+                status_code = int(exc.code or 0)
+                response_body = exc.read().decode("utf-8", errors="ignore")
+                target_origin = f"http://{_host_port_netloc(candidate_host, callback_port)}"
+                break
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_exc = exc
+                continue
+        else:
+            attempted = ", ".join(f"http://{_host_port_netloc(host, callback_port)}" for host in candidate_hosts)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to forward OAuth callback to login container. Attempted: {attempted}",
+            ) from last_exc
 
         with self._openai_login_lock:
             current = self._openai_login_session
@@ -12468,9 +12522,11 @@ def main(
     def api_openai_account_callback(request: Request) -> dict[str, Any]:
         callback_path = str(request.query_params.get("callback_path") or "/auth/callback")
         query_items = [(key, value) for key, value in request.query_params.multi_items() if key != "callback_path"]
+        request_client_host = request.client.host if request.client is not None else ""
         forwarded = state.forward_openai_account_callback(
             urllib.parse.urlencode(query_items, doseq=True),
             path=callback_path,
+            request_host=request_client_host,
         )
         payload = state.openai_account_session_payload()
         payload["callback"] = forwarded

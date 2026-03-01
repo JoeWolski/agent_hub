@@ -10,6 +10,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import urllib.error
 import urllib.request
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1998,6 +1999,64 @@ Gemini CLI
             server.shutdown()
             server.server_close()
             thread.join(timeout=1.0)
+
+    def test_forward_openai_account_callback_falls_back_to_request_host(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                del exc_type, exc, tb
+                return False
+
+            def getcode(self) -> int:
+                return 200
+
+            def read(self) -> bytes:
+                return b"ok"
+
+        attempted_urls: list[str] = []
+
+        def fake_urlopen(request: urllib.request.Request, timeout: float = 0.0):
+            del timeout
+            url = str(request.full_url)
+            attempted_urls.append(url)
+            if "127.0.0.1:1455" in url or "localhost:1455" in url:
+                raise urllib.error.URLError("connection refused")
+            if "10.0.1.1:1455" in url:
+                return FakeResponse()
+            raise AssertionError(f"Unexpected callback URL: {url}")
+
+        self.state._openai_login_session = hub_server.OpenAIAccountLoginSession(
+            id="session-fallback",
+            process=SimpleNamespace(pid=9992, poll=lambda: None),
+            container_name="container-fallback",
+            started_at="2026-02-21T00:00:00Z",
+            status="waiting_for_browser",
+            callback_port=1455,
+            callback_path="/auth/callback",
+        )
+        with patch("agent_hub.server._is_process_running", return_value=True), patch(
+            "agent_hub.server.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            result = self.state.forward_openai_account_callback(
+                "code=abc&state=xyz",
+                path="/auth/callback",
+                request_host="10.0.1.1",
+            )
+
+        self.assertTrue(result["forwarded"])
+        self.assertEqual(result["status_code"], 200)
+        self.assertEqual(result["target_origin"], "http://10.0.1.1:1455")
+        self.assertEqual(
+            attempted_urls,
+            [
+                "http://127.0.0.1:1455/auth/callback?code=abc&state=xyz",
+                "http://localhost:1455/auth/callback?code=abc&state=xyz",
+                "http://10.0.1.1:1455/auth/callback?code=abc&state=xyz",
+            ],
+        )
 
     def test_parse_env_vars_rejects_openai_api_key(self) -> None:
         with self.assertRaises(HTTPException):
