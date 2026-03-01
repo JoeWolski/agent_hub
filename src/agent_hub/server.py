@@ -2491,6 +2491,18 @@ def _container_workspace_path_for_project(value: Any) -> str:
     return str(PurePosixPath(DEFAULT_CONTAINER_HOME) / _container_project_name(value))
 
 
+def _upsert_codex_trusted_project_config(base_config_text: str, container_project_path: str) -> str:
+    normalized_path = str(container_project_path or "").strip()
+    if not normalized_path:
+        return str(base_config_text or "")
+    if not normalized_path.startswith("/"):
+        normalized_path = "/" + normalized_path.lstrip("/")
+    assignment_key = f"projects.{json.dumps(normalized_path)}.trust_level"
+    pattern = re.compile(rf"(?m)^\s*{re.escape(assignment_key)}\s*=.*\n?")
+    cleaned = re.sub(pattern, "", str(base_config_text or ""))
+    return f"{cleaned.rstrip()}\n{assignment_key} = \"trusted\"\n"
+
+
 def _short_summary(text: str, max_words: int = 10, max_chars: int = 80) -> str:
     words = [part for part in text.strip().split() if part]
     if not words:
@@ -3470,7 +3482,8 @@ def _read_codex_auth(path: Path) -> tuple[bool, str]:
 
 
 def _snapshot_schema_version() -> int:
-    return 5
+    # v6 invalidates snapshots built before in-image ownership repair rollout.
+    return 6
 
 
 def _docker_remove_images(prefixes: tuple[str, ...], explicit_tags: set[str]) -> None:
@@ -7122,6 +7135,7 @@ class HubState:
             agent_tools_token=agent_tools_token,
             agent_tools_project_id=str(project.get("id") or ""),
             agent_tools_chat_id=chat_id,
+            trusted_project_path=str(PurePosixPath(DEFAULT_CONTAINER_HOME) / container_project_name),
         )
         agent_args = [str(arg) for arg in (chat.get("agent_args") or []) if str(arg).strip()]
         if resume and agent_type == AGENT_TYPE_CODEX:
@@ -7221,6 +7235,7 @@ class HubState:
             agent_tools_token=session_token,
             agent_tools_project_id="",
             agent_tools_chat_id=agent_tools_chat_id,
+            trusted_project_path=container_workspace,
         )
         artifact_publish_token = _new_artifact_publish_token()
         with self._agent_tools_sessions_lock:
@@ -8239,6 +8254,7 @@ class HubState:
         agent_tools_token: str,
         agent_tools_project_id: str,
         agent_tools_chat_id: str,
+        trusted_project_path: str = "",
     ) -> Path:
         from agent_cli import providers as agent_providers
         try:
@@ -8262,6 +8278,8 @@ class HubState:
         self._ensure_agent_tools_mcp_runtime_script()
 
         agent_provider = agent_providers.get_provider(agent_type)
+        if isinstance(agent_provider, agent_providers.CodexProvider):
+            base_text = _upsert_codex_trusted_project_config(base_text, trusted_project_path)
         mcp_env = {
             AGENT_TOOLS_URL_ENV: normalized_agent_tools_url,
             AGENT_TOOLS_TOKEN_ENV: normalized_agent_tools_token,
@@ -11354,6 +11372,7 @@ class HubState:
                 agent_tools_token=agent_tools_token,
                 agent_tools_project_id=agent_tools_project_id,
                 agent_tools_chat_id=chat_id,
+                trusted_project_path=_container_workspace_path_for_project(project.get("name") or project.get("id")),
             )
             agent_command = AGENT_COMMAND_BY_TYPE.get(agent_type, AGENT_COMMAND_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE])
             chat["agent_type"] = agent_type
