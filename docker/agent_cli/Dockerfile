@@ -6,7 +6,12 @@ USER 0
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     docker.io \
+    sudo \
  && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /etc/sudoers.d \
+ && printf '%s\n' 'ALL ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/00-agent-hub-nopasswd \
+ && chmod 0440 /etc/sudoers.d/00-agent-hub-nopasswd
 
 RUN case "${AGENT_PROVIDER}" in \
       codex|gemini) \

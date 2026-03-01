@@ -27,8 +27,13 @@ RUN apt-get update \
     docker.io \
     git \
     openssh-client \
+    sudo \
     tini \
  && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /etc/sudoers.d \
+ && printf '%s\n' 'ALL ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/00-agent-hub-nopasswd \
+ && chmod 0440 /etc/sudoers.d/00-agent-hub-nopasswd
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 

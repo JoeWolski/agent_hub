@@ -26,11 +26,16 @@ RUN apt-get update \
     python3 \
     python3-pip \
     python3-venv \
+    sudo \
     tini \
     xauth \
     xdotool \
     xvfb \
  && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /etc/sudoers.d \
+ && printf '%s\n' 'ALL ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/00-agent-hub-nopasswd \
+ && chmod 0440 /etc/sudoers.d/00-agent-hub-nopasswd
 
 COPY --from=uv_distroless /uv /uvx /usr/local/bin/
 
