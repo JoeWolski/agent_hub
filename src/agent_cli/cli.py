@@ -1675,6 +1675,12 @@ def _resolve_base_image(
 @click.option("--local-gid", default=None, type=int)
 @click.option("--local-supplementary-gids", default=None, help="Comma-separated supplemental GIDs")
 @click.option("--local-supplementary-groups", default=None, help="Comma-separated supplemental group names")
+@click.option(
+    "--bootstrap-as-root",
+    is_flag=True,
+    default=False,
+    help="Start container as root, then drop to --local-uid/--local-gid inside entrypoint after workspace ownership bootstrap.",
+)
 @click.option("--local-umask", default="0022")
 @click.option("--ro-mount", "ro_mounts", multiple=True, help="Host:container read-only mount")
 @click.option("--rw-mount", "rw_mounts", multiple=True, help="Host:container read-write mount")
@@ -1740,6 +1746,7 @@ def main(
     local_gid: int | None,
     local_supplementary_gids: str | None,
     local_supplementary_groups: str | None,
+    bootstrap_as_root: bool,
     local_umask: str,
     ro_mounts: tuple[str, ...],
     rw_mounts: tuple[str, ...],
@@ -1988,7 +1995,7 @@ def main(
     run_args = [
         "--init",
         "--user",
-        f"{uid}:{gid}",
+        ("0:0" if bootstrap_as_root else f"{uid}:{gid}"),
         "--gpus",
         "all",
         "--workdir",
@@ -2035,6 +2042,11 @@ def main(
         "--env",
         f"UV_PROJECT_ENVIRONMENT={container_project_path}/.venv",
     ]
+    if bootstrap_as_root:
+        run_args.extend(["--env", f"LOCAL_UID={uid}"])
+        run_args.extend(["--env", f"LOCAL_GID={gid}"])
+        if supp_gids_csv:
+            run_args.extend(["--env", f"LOCAL_SUPPLEMENTARY_GIDS={supp_gids_csv}"])
     if use_project_bind_mount:
         run_args.extend(["--volume", project_mount_entry])
 

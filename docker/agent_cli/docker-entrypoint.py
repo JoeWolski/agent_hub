@@ -119,11 +119,28 @@ def _parse_non_negative_int(raw_value: str) -> int | None:
     return parsed
 
 
-def _resolve_runtime_uid_gid() -> tuple[int, int] | None:
+def _parse_gid_csv(raw_value: str) -> list[int]:
+    gids: list[int] = []
+    seen: set[int] = set()
+    for token in str(raw_value or "").split(","):
+        parsed = _parse_non_negative_int(token)
+        if parsed is None or parsed in seen:
+            continue
+        gids.append(parsed)
+        seen.add(parsed)
+    return gids
+
+
+def _resolve_runtime_uid_gid() -> tuple[int, int, list[int]] | None:
     explicit_uid = _parse_non_negative_int(str(os.environ.get("LOCAL_UID") or ""))
     explicit_gid = _parse_non_negative_int(str(os.environ.get("LOCAL_GID") or ""))
     if explicit_uid is not None and explicit_gid is not None:
-        return explicit_uid, explicit_gid
+        explicit_supp_gids = [
+            gid
+            for gid in _parse_gid_csv(str(os.environ.get("LOCAL_SUPPLEMENTARY_GIDS") or ""))
+            if gid != explicit_gid
+        ]
+        return explicit_uid, explicit_gid, explicit_supp_gids
 
     candidates: list[Path] = []
     project_path = str(os.environ.get("CONTAINER_PROJECT_PATH") or "").strip()
@@ -136,8 +153,31 @@ def _resolve_runtime_uid_gid() -> tuple[int, int] | None:
             metadata = candidate.stat()
         except OSError:
             continue
-        return int(metadata.st_uid), int(metadata.st_gid)
+        return int(metadata.st_uid), int(metadata.st_gid), []
     return None
+
+
+def _ensure_workspace_root_ownership(*, uid: int, gid: int) -> None:
+    if os.getuid() != 0:
+        return
+    targets: list[Path] = [Path("/workspace")]
+    project_path = str(os.environ.get("CONTAINER_PROJECT_PATH") or "").strip()
+    if project_path:
+        targets.append(Path(project_path))
+
+    for target in targets:
+        try:
+            metadata = target.stat()
+        except OSError:
+            continue
+        if int(metadata.st_uid) == uid and int(metadata.st_gid) == gid:
+            continue
+        try:
+            os.chown(target, uid, gid)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Workspace ownership bootstrap failed: path={str(target)!r} target_uid_gid={uid}:{gid} error={exc}"
+            ) from exc
 
 
 def _drop_privileges_to_runtime_identity() -> None:
@@ -146,11 +186,12 @@ def _drop_privileges_to_runtime_identity() -> None:
     target = _resolve_runtime_uid_gid()
     if target is None:
         return
-    uid, gid = target
+    uid, gid, supp_gids = target
     if uid == 0 and gid == 0:
         return
+    _ensure_workspace_root_ownership(uid=uid, gid=gid)
     try:
-        os.setgroups([])
+        os.setgroups(supp_gids)
     except (PermissionError, OSError):
         pass
     os.setgid(gid)
