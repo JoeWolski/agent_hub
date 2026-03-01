@@ -3265,26 +3265,6 @@ Gemini CLI
         create_chat.assert_not_called()
         start_chat.assert_not_called()
 
-    def test_state_payload_includes_create_request_id_for_chat_matching(self) -> None:
-        project = self.state.add_project(
-            repo_url="https://example.com/org/repo.git",
-            default_branch="main",
-            setup_script="echo setup",
-        )
-        chat = self.state.create_chat(
-            project["id"],
-            profile="",
-            ro_mounts=[],
-            rw_mounts=[],
-            env_vars=[],
-            agent_args=[],
-            create_request_id="req-join-123",
-        )
-
-        payload = self.state.state_payload()
-        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
-        self.assertEqual(chat_payload["create_request_id"], "req-join-123")
-
     def test_create_and_start_chat_passes_agent_type(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
@@ -8992,34 +8972,6 @@ class CliEnvVarTests(unittest.TestCase):
             kwargs = state_cls.call_args.kwargs
             self.assertEqual(kwargs.get("artifact_publish_base_url"), "http://172.17.0.4:8765/hub")
 
-    def test_agent_hub_main_passes_ui_lifecycle_debug_to_state(self) -> None:
-        runner = CliRunner()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            data_dir = tmp_path / "hub"
-            config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
-
-            with patch("agent_hub.server.HubState") as state_cls, patch(
-                "agent_hub.server.uvicorn.run",
-                return_value=None,
-            ):
-                result = runner.invoke(
-                    hub_server.main,
-                    [
-                        "--data-dir",
-                        str(data_dir),
-                        "--config-file",
-                        str(config),
-                        "--no-frontend-build",
-                        "--ui-lifecycle-debug",
-                    ],
-                )
-
-            self.assertEqual(result.exit_code, 0, msg=result.output)
-            kwargs = state_cls.call_args.kwargs
-            self.assertTrue(kwargs.get("ui_lifecycle_debug"))
-
 
 class HubApiAsyncRouteTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -9333,22 +9285,6 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         update_settings.assert_called_once_with(
             {"default_agent_type": "gemini", "chat_layout_engine": "flexlayout"}
         )
-
-    def test_runtime_flags_route_returns_state_payload(self) -> None:
-        app = self._build_app()
-        flags_payload = {"ui_lifecycle_debug": True}
-
-        with patch.object(
-            hub_server.HubState,
-            "runtime_flags_payload",
-            return_value=flags_payload,
-        ) as runtime_flags_payload:
-            with TestClient(app) as client:
-                response = client.get("/api/runtime-flags")
-
-        self.assertEqual(response.status_code, 200, msg=response.text)
-        self.assertEqual(response.json(), flags_payload)
-        runtime_flags_payload.assert_called_once_with()
 
     def test_agent_capabilities_routes_return_cached_and_discovery_payloads(self) -> None:
         app = self._build_app()

@@ -47,25 +47,6 @@ export function findMatchingServerChatForPendingSession(session, serverChats, ma
   }
   const serverList = Array.isArray(serverChats) ? serverChats : [];
   const mappedServerIdSet = mappedServerIds instanceof Set ? mappedServerIds : new Set();
-  const sessionRequestId = String(session.create_request_id || "").trim();
-
-  if (sessionRequestId) {
-    for (const chat of serverList) {
-      const chatId = String(chat?.id || "");
-      if (!chatId || mappedServerIdSet.has(chatId)) {
-        continue;
-      }
-      if (String(chat?.project_id || "") !== projectId) {
-        continue;
-      }
-      const chatRequestId = String(chat?.create_request_id || "").trim();
-      if (!chatRequestId || chatRequestId !== sessionRequestId) {
-        continue;
-      }
-      return chat;
-    }
-  }
-
   const knownServerIds = new Set(
     (Array.isArray(session.known_server_chat_ids) ? session.known_server_chat_ids : [])
       .map((chatId) => String(chatId || ""))
