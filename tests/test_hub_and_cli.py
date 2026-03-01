@@ -7069,6 +7069,10 @@ class CliEnvVarTests(unittest.TestCase):
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind", return_value="file"
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -7100,6 +7104,73 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("AGENT_HUB_AGENT_TOOLS_TOKEN=test-token", run_cmd)
             self.assertIn("AGENT_HUB_AGENT_TOOLS_PROJECT_ID=", run_cmd)
             self.assertIn("AGENT_HUB_AGENT_TOOLS_CHAT_ID=agent_cli:test-session", run_cmd)
+            self.assertIn("--config", run_cmd)
+            self.assertIn('projects."/workspace/project".trust_level="trusted"', run_cmd)
+            self.assertTrue(fake_bridge.closed)
+
+    def test_agent_cli_default_run_does_not_duplicate_explicit_codex_project_trust_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            runtime_config = tmp_path / "runtime-agent-tools.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+            runtime_config.write_text("model = 'test'\n", encoding="utf-8")
+
+            class FakeBridge:
+                def __init__(self, runtime_path: Path):
+                    self.runtime_config_path = runtime_path
+                    self.env_vars = [
+                        "AGENT_HUB_AGENT_TOOLS_URL=http://host.docker.internal:48123",
+                        "AGENT_HUB_AGENT_TOOLS_TOKEN=test-token",
+                    ]
+                    self.closed = False
+
+                def close(self) -> None:
+                    self.closed = True
+
+            fake_bridge = FakeBridge(runtime_config)
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind", return_value="file"
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._start_agent_tools_runtime_bridge",
+                return_value=fake_bridge,
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--",
+                        "--config",
+                        'projects."/workspace/project".trust_level="trusted"',
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            trust_override_count = run_cmd.count('projects."/workspace/project".trust_level="trusted"')
+            self.assertEqual(trust_override_count, 1)
             self.assertTrue(fake_bridge.closed)
 
     def test_agent_cli_claude_runtime_bridge_replaces_default_claude_json_mount(self) -> None:
