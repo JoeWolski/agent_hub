@@ -3990,6 +3990,7 @@ Gemini CLI
         cmd = executed[0]
         self.assertIn("agent_cli", cmd)
         self.assertIn("--prepare-snapshot-only", cmd)
+        self.assertIn("--project-in-image", cmd)
         self.assertIn("--snapshot-image-tag", cmd)
         self.assertIn("--setup-script", cmd)
         self.assertIn("--container-project-name", cmd)
@@ -6892,6 +6893,8 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertEqual(setup_cmd[-4], expected_setup_runtime)
             self.assertEqual(setup_cmd[-3], "bash")
             self.assertEqual(setup_cmd[-2], "-lc")
+            user_index = setup_cmd.index("--user")
+            self.assertEqual(setup_cmd[user_index + 1], "0:0")
             self.assertIn(
                 f"{project.resolve()}:{image_cli.SNAPSHOT_SOURCE_PROJECT_PATH}:ro",
                 setup_cmd,
@@ -6900,11 +6903,13 @@ class CliEnvVarTests(unittest.TestCase):
             setup_script = setup_cmd[-1]
             self.assertIn("set -o pipefail", setup_script)
             self.assertIn("git config --global --add safe.directory '*'", setup_script)
+            self.assertIn("setpriv --reuid", setup_script)
             self.assertNotIn("AGENT_HUB_GIT_CREDENTIALS_SOURCE", setup_script)
             self.assertNotIn("AGENT_HUB_GIT_CREDENTIALS_FILE", setup_script)
             self.assertNotIn("git config --system", setup_script)
             self.assertNotIn("|| true", setup_script)
-            self.assertNotIn("chown -R", setup_script)
+            self.assertIn("chown -R", setup_script)
+            self.assertIn(".agent-cli-write-probe-", setup_script)
             commit_cmd = next((cmd for cmd in commands if len(cmd) >= 3 and cmd[0:2] == ["docker", "commit"]), None)
             self.assertIsNotNone(commit_cmd)
             assert commit_cmd is not None
@@ -8393,7 +8398,6 @@ class CliEnvVarTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.exit_code, 0, msg=result.output)
-            expected_chown = f"chown -R {os.getuid()}:{os.getgid()} /workspace/project"
             setup_cmd = next(
                 (
                     cmd
@@ -8405,25 +8409,79 @@ class CliEnvVarTests(unittest.TestCase):
                 None,
             )
             self.assertIsNotNone(setup_cmd)
-            chown_cmd = next(
+            assert setup_cmd is not None
+            setup_script = setup_cmd[-1]
+            self.assertIn(f"chown -R {os.getuid()}:{os.getgid()} /workspace/project", setup_script)
+            self.assertIn(".agent-cli-write-probe-", setup_script)
+            self.assertIn("setpriv --reuid", setup_script)
+            commit_cmd = next((cmd for cmd in commands if len(cmd) >= 3 and cmd[0:2] == ["docker", "commit"]), None)
+            self.assertIsNotNone(commit_cmd)
+            assert commit_cmd is not None
+            self.assertLess(commands.index(setup_cmd), commands.index(commit_cmd))
+            self.assertFalse(
+                any(
+                    len(cmd) >= 2 and cmd[:2] == ["docker", "exec"]
+                    for cmd in commands
+                )
+            )
+
+    def test_snapshot_prepare_only_allows_project_in_image_without_bind_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind", return_value="file"
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=False
+            ), patch(
+                "agent_cli.cli._docker_rm_force", return_value=None
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--snapshot-image-tag",
+                        "snapshot:test",
+                        "--prepare-snapshot-only",
+                        "--project-in-image",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            setup_cmd = next(
                 (
                     cmd
                     for cmd in commands
-                    if len(cmd) >= 7
-                    and cmd[:2] == ["docker", "exec"]
-                    and cmd[2:4] == ["--user", "0:0"]
-                    and cmd[-3:] == ["bash", "-lc", expected_chown]
+                    if len(cmd) >= 2
+                    and cmd[:2] == ["docker", "run"]
+                    and "agent-runtime-setup-" in cmd[-4]
                 ),
                 None,
             )
-            self.assertIsNotNone(chown_cmd)
-            commit_cmd = next((cmd for cmd in commands if len(cmd) >= 3 and cmd[0:2] == ["docker", "commit"]), None)
-            self.assertIsNotNone(commit_cmd)
+            self.assertIsNotNone(setup_cmd)
             assert setup_cmd is not None
-            assert chown_cmd is not None
-            assert commit_cmd is not None
-            self.assertLess(commands.index(setup_cmd), commands.index(chown_cmd))
-            self.assertLess(commands.index(chown_cmd), commands.index(commit_cmd))
+            self.assertNotIn(f"{project.resolve()}:/workspace/project", setup_cmd)
+            self.assertIn(f"{project.resolve()}:{image_cli.SNAPSHOT_SOURCE_PROJECT_PATH}:ro", setup_cmd)
 
     def test_ensure_runtime_image_built_if_missing_waits_for_concurrent_builder(self) -> None:
         target_image = "agent-runtime-claude-test"
