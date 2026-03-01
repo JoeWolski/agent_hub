@@ -146,6 +146,33 @@ class HubStateTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Invalid AGENT_HUB_HOST_UID"):
                 hub_server.HubState(self.tmp_path / "hub-invalid-uid", self.config_file)
 
+    def test_runtime_identity_for_workspace_uses_workspace_owner(self) -> None:
+        class _Resolved:
+            def stat(self):
+                return SimpleNamespace(st_uid=9001, st_gid=9002)
+
+        class _Workspace:
+            def resolve(self):
+                return _Resolved()
+
+        uid, gid, supp = self.state._runtime_identity_for_workspace(_Workspace())  # type: ignore[arg-type]
+        self.assertEqual(uid, 9001)
+        self.assertEqual(gid, 9002)
+        self.assertEqual(supp, "")
+
+    def test_runtime_identity_for_workspace_falls_back_to_hub_identity(self) -> None:
+        class _Resolved:
+            def stat(self):
+                raise OSError("boom")
+
+        class _Workspace:
+            def resolve(self):
+                return _Resolved()
+
+        uid, gid, supp = self.state._runtime_identity_for_workspace(_Workspace())  # type: ignore[arg-type]
+        self.assertEqual(uid, self.state.local_uid)
+        self.assertEqual(gid, self.state.local_gid)
+        self.assertEqual(supp, self.state.local_supp_gids)
     def _connect_github_app(self) -> dict[str, object]:
         with patch.object(
             hub_server.HubState,
@@ -6925,6 +6952,7 @@ class CliEnvVarTests(unittest.TestCase):
         runtime_content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
         self.assertIn("USER 0", runtime_content)
         self.assertLess(runtime_content.index("USER 0"), runtime_content.index("RUN apt-get update"))
+        self.assertNotIn("USER agent", runtime_content)
 
     def test_agent_cli_dockerfile_sets_root_home_before_provider_install_layers(self) -> None:
         # Provider install is now in the main Dockerfile, but base packages in base Dockerfile.
@@ -10525,6 +10553,36 @@ class DockerEntrypointTests(unittest.TestCase):
     def test_entrypoint_module_does_not_define_prepare_git_credentials(self) -> None:
         module = self._load_entrypoint_module()
         self.assertFalse(hasattr(module, "_prepare_git_credentials"))
+
+    def test_resolve_runtime_uid_gid_prefers_explicit_local_uid_gid_env(self) -> None:
+        module = self._load_entrypoint_module()
+        with patch.dict(
+            os.environ,
+            {
+                "LOCAL_UID": "2001",
+                "LOCAL_GID": "3001",
+                "CONTAINER_PROJECT_PATH": "",
+            },
+            clear=False,
+        ):
+            self.assertEqual(module._resolve_runtime_uid_gid(), (2001, 3001))
+
+    def test_drop_privileges_to_runtime_identity_uses_resolved_target(self) -> None:
+        module = self._load_entrypoint_module()
+        with patch.object(module.os, "getuid", return_value=0), patch.object(
+            module, "_resolve_runtime_uid_gid", return_value=(1002, 1007)
+        ), patch.object(
+            module.os, "setgroups", return_value=None
+        ) as setgroups_mock, patch.object(
+            module.os, "setgid", return_value=None
+        ) as setgid_mock, patch.object(
+            module.os, "setuid", return_value=None
+        ) as setuid_mock:
+            module._drop_privileges_to_runtime_identity()
+
+        setgroups_mock.assert_called_once_with([])
+        setgid_mock.assert_called_once_with(1007)
+        setuid_mock.assert_called_once_with(1002)
 
     def test_ensure_claude_native_command_path_creates_home_symlink(self) -> None:
         module = self._load_entrypoint_module()
