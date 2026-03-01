@@ -1259,7 +1259,7 @@ def _build_snapshot_setup_shell_script(
     if runtime_uid is not None and runtime_gid is not None:
         script += (
             "printf '%s\\n' '[agent_cli] snapshot bootstrap: running project setup script as runtime user'\n"
-            f"setpriv --reuid {runtime_uid} --regid {runtime_gid} --clear-groups bash -lc {shlex.quote(normalized_script)}\n"
+            f"setpriv --reuid {runtime_uid} --regid {runtime_gid} --keep-groups bash -lc {shlex.quote(normalized_script)}\n"
         )
     else:
         script += (
@@ -1286,7 +1286,7 @@ def _build_snapshot_setup_shell_script(
             f"for {runtime_uid}:{runtime_gid} at {target_project_path}'\n"
         )
         script += (
-            f"setpriv --reuid {runtime_uid} --regid {runtime_gid} --clear-groups "
+            f"setpriv --reuid {runtime_uid} --regid {runtime_gid} --keep-groups "
             f"bash -lc {shlex.quote(writable_probe_cmd)}\n"
         )
     return script
