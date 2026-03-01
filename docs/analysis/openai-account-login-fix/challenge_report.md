@@ -1,17 +1,14 @@
 ## Findings
-- [High] Callback 502 occurred when daemon host route was not represented by existing candidate hosts.
-- [Medium] Prior implementation lacked actionable callback-forward diagnostics.
-- [Medium] Upstream target logs risked exposing callback query values before redaction controls.
+- [LOW] Identity propagation was previously implicit in chat/snapshot command flow, making regressions hard to detect if execution context changes.
 
 ## Reproduction
-1. Create active browser-callback session.
-2. Force localhost/request/default candidates to fail while bridge host would succeed.
-3. Observe pre-fix HTTP 502 and missing bridge target.
+1. Inspect hub-generated `agent_cli` launch command before fix.
+2. Observe missing explicit `--local-uid/--local-gid` arguments.
+3. Verify identity depended on inherited process context.
 
 ## Suggested Fixes
-- Append deterministic bridge host candidates after existing hosts.
-- Add structured redacted logging for resolution decisions, upstream attempts, and failure reasons.
-- Add tests for redaction and error classification.
+- Pass explicit `--local-uid`/`--local-gid` from hub command assembly.
+- Add direct assertions in snapshot/chat command composition tests.
 
 ## Residual Concerns
-- Unusual network overlays may still need additional host discovery adapters.
+- Behavior still depends on hub process identity source (`os.getuid/os.getgid`) unless future settings allow user override.

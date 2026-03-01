@@ -1,46 +1,21 @@
 ## Summary
-Fixes OpenAI account login callback failures ending in `502 Bad Gateway` by adding deterministic callback forwarding with strong diagnostics and redaction, prioritizing direct CLI user reliability.
+Propagates explicit runtime identity (`uid/gid`) from hub into all hub-generated `agent_cli` launch commands so snapshot-backed chat project ownership and runtime user identity stay aligned.
 
 ## Changes
-- Root-cause fix for callback forwarding path:
-  - Added bridge-aware host discovery (Linux default route + Docker bridge gateway).
-  - Added in-container loopback callback forwarding via `docker exec` and made it primary.
-  - Preserved network host forwarding as fallback when container-loopback forwarding fails.
-- Added forwarding-context parsing from callback request headers:
-  - `Forwarded`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-Port`, `Host`, and client host normalization.
-- Added durable logging for the full flow:
-  - callback URL resolution decisions
-  - forwarded host/scheme/port parsing
-  - bridge routing diagnostics
-  - upstream request target + response status + timeout/error class
-  - explicit categorized terminal failure reason
-- Added secret-safety controls:
-  - callback query value summaries only
-  - redacted query values in logged target URLs
-  - no logging of code/code_verifier/access_token-like values
-- Hardened container-loopback forwarding runtime:
-  - switched exec launcher to `sh -lc` with `python3`/`python` fallback
-  - improved container exec failure categorization (`container_not_running`, `container_python_missing`)
-  - include `returncode` + stdout/stderr snippets in diagnostics
-- UI guardrail:
-  - disarm browser auto-open when submitting callback URL so submit cannot relaunch login tab
-- Added targeted tests for:
-  - callback success path
-  - 502-producing failure path + failure-category logs + redaction
-  - bridge fallback success path
-  - container-loopback primary success path
-  - network fallback when container-loopback fails
-  - callback host/port derivation edge cases (host:port, IPv6:port, invalid host)
-  - callback route forwarding-context parsing
+- Updated `HubState._prepare_agent_cli_command` to always append:
+  - `--local-uid <hub local uid>`
+  - `--local-gid <hub local gid>`
+- Added conditional propagation of `--local-supplementary-gids` when the hub has supplemental groups.
+- Added/updated targeted tests to assert uid/gid propagation in:
+  - snapshot command generation (`test_ensure_project_setup_snapshot_builds_once`)
+  - chat launch command generation (`test_start_chat_uses_claude_agent_command_when_selected`)
+- Updated run artifacts and verification docs under `docs/analysis/openai-account-login-fix/`.
 
 ## Validation
-- `/workspace/agent_hub_writable/.venv/bin/python - <<'PY' [pre-fix repro script]` -> PASS (observed `STATUS 502` with no bridge target attempted)
-- `/workspace/agent_hub_writable/.venv/bin/python - <<'PY' [post-fix repro script]` -> PASS (observed `STATUS 200`, target `http://172.17.0.1:1455`)
-- `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "forward_openai_account_callback"` -> PASS (`8 passed, 311 deselected`)
-- `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "openai_account_callback_route or parse_callback_forward_host_port"` -> PASS (`3 passed, 316 deselected`)
-- Incremental fix checks recorded in `docs/analysis/openai-account-login-fix/validation/manifest.txt`.
+- `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "test_start_chat_uses_claude_agent_command_when_selected or test_ensure_project_setup_snapshot_builds_once"` -> PASS (`2 passed, 319 deselected`)
+- `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "start_chat_uses_claude_agent_command_when_selected or start_chat_uses_gemini_agent_command_when_selected or ensure_project_setup_snapshot_builds_once or ensure_project_setup_snapshot_passes_git_identity_env_for_pat"` -> PASS (`4 passed, 317 deselected`)
+- `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "project_in_image and snapshot"` -> PASS (`3 passed, 318 deselected`)
 
 ## Risks
-- `docker exec` is now on the primary callback path; environments that restrict exec into runtime containers will rely on network fallback.
-- Non-standard network overlays may still require additional host discovery candidates.
-- Additional callback diagnostics increase log volume during auth attempts; logs remain request-scoped and values are redacted.
+- Runtime identity source is still hub process identity (`os.getuid/os.getgid`); environments expecting a different identity source may need explicit configuration support in future.
+- Supplementary gids are only passed when detected on hub startup; dynamic group membership changes after startup are out of scope.

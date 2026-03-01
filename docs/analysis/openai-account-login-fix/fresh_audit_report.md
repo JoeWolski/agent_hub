@@ -1,5 +1,5 @@
 ## Scope
-Independent implementation-vs-design audit for OpenAI callback 502 fix, direct-CLI primary strategy, and diagnostics.
+Independent implementation-vs-design audit for runtime UID/GID propagation in hub-generated chat/snapshot `agent_cli` launch commands.
 
 ## Inputs Reviewed
 - `docs/analysis/openai-account-login-fix/design_spec.md`
@@ -7,21 +7,18 @@ Independent implementation-vs-design audit for OpenAI callback 502 fix, direct-C
 - `.codex/tasks/analysis/openai-account-login-fix/task-01.md`
 - `docs/analysis/openai-account-login-fix/validation/manifest.txt`
 - `docs/analysis/openai-account-login-fix/verification_report.md`
-- Changed diff for `src/agent_hub/server.py` and `tests/test_hub_and_cli.py`
+- Changed-file diff for `src/agent_hub/server.py` and `tests/test_hub_and_cli.py`
 
 ## Criteria Check
-- Design goals implemented with no widening of auth semantics: PASS
-- Existing callback path behavior preserved for working hosts: PASS
-- Direct CLI reliability improved via container-loopback primary path: PASS
-- Bridge fallback retained for Docker-in-Docker mismatch: PASS
-- Failure classification and high-signal diagnostics: PASS
-- Query/secret redaction controls in logs: PASS
-- Required validation commands present in manifest: PASS
-- PR body sections/order requirements prepared: PASS
+- Design goals implemented without widening scope: PASS
+- Explicit uid/gid propagation present in shared hub command path: PASS
+- Snapshot and chat command regression coverage present: PASS
+- Required validation command evidence present in manifest: PASS
+- PR body section/order requirements prepared: PASS
 
 ## Findings
-- No blocking mismatches found between design intent and implemented behavior.
-- Residual risk is limited to environments that disallow `docker exec`; those use network fallback path.
+- No design/implementation drift found for this change.
+- Residual risk remains tied to hub runtime identity source (`os.getuid/os.getgid`) and is documented.
 
 ## Result
 PASS

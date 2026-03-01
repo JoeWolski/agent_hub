@@ -1,32 +1,23 @@
-# Verification Report: OpenAI Account Login Callback Fix
+# Verification Report: Runtime UID/GID Propagation
 
 ## Scope
-`src/agent_hub/server.py`, `tests/test_hub_and_cli.py`
+- `src/agent_hub/server.py`
+- `tests/test_hub_and_cli.py`
+- `docs/analysis/openai-account-login-fix/*`
 
 ## Inputs Reviewed
-- Design/verification artifacts under `docs/analysis/openai-account-login-fix/`
-- Task contract: `.codex/tasks/analysis/openai-account-login-fix/task-01.md`
-- Validation manifest and command outputs
+- `design_spec.md`
+- `verification.md`
+- `.codex/tasks/analysis/openai-account-login-fix/task-01.md`
+- `validation/manifest.txt`
+- `validation/validation_report.md`
 
 ## Findings
-- Root cause validated: callback forwarding candidate host set lacked deterministic Docker bridge gateway fallback when `host.docker.internal` resolution/routing failed.
-- Strategy updated for primary direct CLI reliability:
-  - callback forwarding now tries in-container loopback first (`docker exec` to `127.0.0.1:<callback_port>` in login container namespace)
-  - network candidate forwarding remains fallback for compatibility.
-- Durable diagnostics implemented:
-  - callback URL resolution decisions
-  - forwarded host/proto/port parsing context
-  - bridge routing discovery diagnostics
-  - upstream request target/status/error class
-  - explicit categorized failure reason in terminal error log and HTTP 502 detail
-- Secret safety verified:
-  - callback query values redacted in all new logs
-  - tests assert no secret query values are emitted
-
-## Validation Evidence
-- See `validation/manifest.txt` for exact commands and PASS/FAIL.
-- Final targeted suites PASS:
-  - `forward_openai_account_callback or forward_openai_callback_via_container_loopback or openai_account_callback_route or parse_callback_forward_host_port`: `13 passed, 308 deselected`
+- Hub command builder now passes explicit `--local-uid` and `--local-gid` for all `agent_cli` invocations produced via `_prepare_agent_cli_command`.
+- Supplementary gid propagation is explicit when available.
+- Snapshot command composition test now verifies uid/gid options are present and correctly valued.
+- Chat start command composition test now verifies uid/gid options are present and correctly valued.
+- No regressions observed in targeted project-in-image snapshot checks.
 
 ## Result
 PASS
