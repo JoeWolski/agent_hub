@@ -3226,6 +3226,32 @@ def _first_url_in_text(text: str, starts_with: str) -> str:
     return _clean_url_token(match.group(0)) if match else ""
 
 
+def _openai_login_url_in_text(text: str) -> str:
+    if not text:
+        return ""
+    for raw_match in re.finditer(r"https://[^\s]+", text):
+        candidate = _clean_url_token(raw_match.group(0))
+        if not candidate:
+            continue
+        parsed = urllib.parse.urlparse(candidate)
+        host = (parsed.hostname or "").strip().lower()
+        if not host:
+            continue
+        query = urllib.parse.parse_qs(parsed.query or "")
+        redirect_values = query.get("redirect_uri") or []
+        for redirect_value in redirect_values:
+            local_callback_url, _port, _path = _parse_local_callback(redirect_value)
+            if local_callback_url:
+                return candidate
+        if host in {"auth.openai.com", "auth.chatgpt.com"}:
+            return candidate
+        if host in {"chatgpt.com", "www.chatgpt.com"}:
+            normalized_path = (parsed.path or "").strip().lower()
+            if any(marker in normalized_path for marker in ("/auth", "/oauth", "/login")):
+                return candidate
+    return ""
+
+
 def _parse_local_callback(url_text: str) -> tuple[str, int, str]:
     cleaned = _clean_url_token(url_text)
     parsed = urllib.parse.urlparse(cleaned)
@@ -7897,7 +7923,7 @@ class HubState:
                             current.callback_port = callback_port
                             current.callback_path = callback_path
 
-                    login_url = _first_url_in_text(clean_line, "https://auth.openai.com/")
+                    login_url = _openai_login_url_in_text(clean_line)
                     if login_url:
                         current.login_url = login_url
                         if current.method == "browser_callback" and current.status in {"starting", "running"}:
