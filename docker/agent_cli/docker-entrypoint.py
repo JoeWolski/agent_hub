@@ -252,31 +252,6 @@ def _drop_privileges_to_runtime_identity() -> None:
     os.setgid(gid)
     os.setuid(uid)
 
-    try:
-        shadow_lines = shadow_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        shadow_lines = []
-    else:
-        if shadow_lines:
-            updated_shadow: list[str] = []
-            saw_shadow_user = False
-            for line in shadow_lines:
-                parts = line.split(":")
-                if parts and parts[0] == username:
-                    if len(parts) < 9:
-                        parts.extend([""] * (9 - len(parts)))
-                    parts[1] = parts[1] or ""
-                    updated_shadow.append(":".join(parts))
-                    saw_shadow_user = True
-                else:
-                    updated_shadow.append(line)
-            if not saw_shadow_user:
-                updated_shadow.append(f"{username}::19888:0:99999:7:::")
-            try:
-                shadow_path.write_text("\n".join(updated_shadow).rstrip("\n") + "\n", encoding="utf-8")
-            except OSError:
-                pass
-
 
 def _ensure_claude_native_command_path(*, command: list[str], home: str, source_path: Path | None = None) -> None:
     if not command:
