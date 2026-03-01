@@ -12,6 +12,7 @@ import json
 import logging
 import mimetypes
 import os
+import pwd
 import queue
 import re
 import secrets
@@ -102,6 +103,7 @@ AGENT_HUB_HOST_UID_ENV = "AGENT_HUB_HOST_UID"
 AGENT_HUB_HOST_GID_ENV = "AGENT_HUB_HOST_GID"
 AGENT_HUB_HOST_SUPP_GIDS_ENV = "AGENT_HUB_HOST_SUPPLEMENTARY_GIDS"
 AGENT_HUB_SHARED_ROOT_ENV = "AGENT_HUB_SHARED_ROOT"
+AGENT_HUB_HOST_USER_ENV = "AGENT_HUB_HOST_USER"
 AGENT_TOOLS_MCP_RUNTIME_DIR_NAME = "agent_hub"
 AGENT_TOOLS_MCP_RUNTIME_FILE_NAME = "agent_tools_mcp.py"
 AGENT_TOOLS_URL_ENV = "AGENT_HUB_AGENT_TOOLS_URL"
@@ -1735,6 +1737,7 @@ def _agent_capability_probe_docker_run_args(
     local_gid: int,
     local_supp_gids_csv: str,
     local_umask: str,
+    local_user: str,
     host_codex_dir: Path,
     config_file: Path,
 ) -> list[str]:
@@ -1753,6 +1756,8 @@ def _agent_capability_probe_docker_run_args(
         f"{config_file}:{container_home}/.codex/config.toml",
         "--env",
         f"LOCAL_UMASK={local_umask}",
+        "--env",
+        f"LOCAL_USER={local_user}",
         "--env",
         f"HOME={container_home}",
         "--env",
@@ -4215,6 +4220,19 @@ def _signal_process_group_winch(pid: int) -> None:
         pass
 
 
+def _resolve_hub_runtime_username(uid: int) -> str:
+    configured = str(os.environ.get(AGENT_HUB_HOST_USER_ENV, "")).strip()
+    if configured:
+        return configured
+    try:
+        return pwd.getpwuid(int(uid)).pw_name
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError(
+            "Host username resolution failed for runtime identity "
+            f"(uid={uid}). Set {AGENT_HUB_HOST_USER_ENV}."
+        ) from exc
+
+
 class HubState:
     def __init__(
         self,
@@ -4227,7 +4245,7 @@ class HubState:
         ui_lifecycle_debug: bool = False,
     ):
         self.local_uid, self.local_gid, self.local_supp_gids = _resolve_hub_runtime_identity()
-        self.local_user = f"uid-{self.local_uid}"
+        self.local_user = _resolve_hub_runtime_username(self.local_uid)
         self.local_umask = "0022"
         self.host_agent_home = (Path.home() / ".agent-home" / self.local_user).resolve()
         self.host_codex_dir = self.host_agent_home / ".codex"
@@ -4699,6 +4717,7 @@ class HubState:
             local_gid=self.local_gid,
             local_supp_gids_csv=self.local_supp_gids,
             local_umask=self.local_umask,
+            local_user=self.local_user,
             host_codex_dir=self.host_codex_dir,
             config_file=self.config_file,
         )
@@ -7416,6 +7435,8 @@ class HubState:
             "--local-gid",
             str(runtime_gid),
             "--bootstrap-as-root",
+            "--local-user",
+            self.local_user,
             "--no-alt-screen",
         ]
         if runtime_supp_gids:
@@ -8380,6 +8401,8 @@ class HubState:
             f"{self.config_file}:{container_home}/.codex/config.toml",
             "--env",
             f"LOCAL_UMASK={self.local_umask}",
+            "--env",
+            f"LOCAL_USER={self.local_user}",
             "--env",
             f"HOME={container_home}",
             "--env",
