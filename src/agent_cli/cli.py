@@ -1257,35 +1257,6 @@ def _repair_snapshot_project_ownership(
     )
 
 
-def _verify_snapshot_project_writable(
-    *,
-    container_name: str,
-    target_project_path: str,
-    uid: int,
-    gid: int,
-) -> None:
-    quoted_target_path = shlex.quote(target_project_path)
-    _run(
-        [
-            "docker",
-            "exec",
-            "--user",
-            f"{uid}:{gid}",
-            container_name,
-            "bash",
-            "-lc",
-            (
-                "set -euo pipefail; "
-                f"test -d {quoted_target_path}; "
-                f'project_path={quoted_target_path}; '
-                'probe_path="$project_path/.agent-cli-write-probe-$$"; '
-                ': > "$probe_path"; '
-                'rm -f "$probe_path"'
-            ),
-        ]
-    )
-
-
 def _parse_env_var(spec: str, label: str) -> str:
     if "=" not in spec:
         raise click.ClickException(f"Invalid {label}: {spec} (expected KEY=VALUE)")
@@ -1845,6 +1816,8 @@ def main(
     snapshot_tag = (snapshot_image_tag or "").strip()
     if project_in_image and not snapshot_tag:
         raise click.ClickException("--project-in-image requires --snapshot-image-tag")
+    if project_in_image and prepare_snapshot_only:
+        raise click.ClickException("--project-in-image cannot be combined with --prepare-snapshot-only")
     cached_snapshot_exists = bool(snapshot_tag) and _docker_image_exists(snapshot_tag)
     if cached_snapshot_exists:
         click.echo(f"Using cached setup snapshot image '{snapshot_tag}'")
@@ -2082,25 +2055,14 @@ def main(
                 setup_bootstrap_script,
             ]
             _docker_rm_force(container_name)
-            snapshot_workspace_copied_into_image = not use_project_bind_mount
             try:
                 _run(setup_cmd)
-                if snapshot_workspace_copied_into_image:
+                if project_in_image:
                     click.echo(
                         "[agent_cli] snapshot bootstrap: repairing in-image project ownership "
                         f"for {container_project_path} -> {uid}:{gid}"
                     )
                     _repair_snapshot_project_ownership(
-                        container_name=container_name,
-                        target_project_path=container_project_path,
-                        uid=uid,
-                        gid=gid,
-                    )
-                    click.echo(
-                        "[agent_cli] snapshot bootstrap: verifying in-image project path is writable "
-                        f"for {uid}:{gid} at {container_project_path}"
-                    )
-                    _verify_snapshot_project_writable(
                         container_name=container_name,
                         target_project_path=container_project_path,
                         uid=uid,
