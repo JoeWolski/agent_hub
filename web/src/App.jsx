@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Profiler, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
@@ -1883,6 +1883,19 @@ function HubApp() {
   const trace = useCallback((event, payload = {}) => {
     uiLifecycleTrace.log(event, payload);
   }, []);
+  const handleProfilerRender = useCallback(
+    (id, phase, actualDuration, baseDuration, startTime, commitTime) => {
+      trace("react_profiler_commit", {
+        profiler_id: id,
+        phase,
+        actual_duration_ms: Number(actualDuration.toFixed(2)),
+        base_duration_ms: Number(baseDuration.toFixed(2)),
+        start_time_ms: Number(startTime.toFixed(2)),
+        commit_time_ms: Number(commitTime.toFixed(2))
+      });
+    },
+    [trace]
+  );
   trace("hub_app_render", {
     render_seq: currentRenderSequence,
     projects: hubState.projects.length,
@@ -5908,9 +5921,11 @@ function HubApp() {
             </div>
           </section>
         ) : activeTab === "chats" ? (
-          <section className="panel chats-panel">
-            {renderChatsLayoutEngine()}
-          </section>
+          <Profiler id="chats_panel" onRender={handleProfilerRender}>
+            <section className="panel chats-panel">
+              {renderChatsLayoutEngine()}
+            </section>
+          </Profiler>
         ) : (
           <section className="panel settings-panel">
             <div className="settings-heading">
