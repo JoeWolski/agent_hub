@@ -114,8 +114,6 @@ def _ensure_user_in_passwd(*, username: str) -> None:
         return
 
     passwd_path = Path("/etc/passwd")
-    shadow_path = Path("/etc/shadow")
-
     try:
         passwd_lines = passwd_path.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -157,6 +155,43 @@ def _ensure_user_in_passwd(*, username: str) -> None:
     new_passwd = "\n".join(updated_lines).rstrip("\n") + "\n"
     try:
         passwd_path.write_text(new_passwd, encoding="utf-8")
+    except OSError:
+        return
+
+def _ensure_user_in_shadow(*, username: str) -> None:
+    uid = os.getuid()
+    if uid == 0:
+        return
+
+    shadow_path = Path("/etc/shadow")
+    try:
+        shadow_lines = shadow_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+
+    updated_lines: list[str] = []
+    found = False
+    for line in shadow_lines:
+        parts = line.split(":")
+        if not parts:
+            updated_lines.append(line)
+            continue
+        if parts[0] != username:
+            updated_lines.append(line)
+            continue
+        found = True
+        # Empty password field + no lock marker enables NOPASSWD sudo policy for mapped users.
+        rest = parts[2:]
+        while len(rest) < 7:
+            rest.append("")
+        updated_lines.append(":".join([username, "", *rest[:7]]))
+
+    if not found:
+        updated_lines.append(f"{username}::19793:0:99999:7:::")
+
+    new_shadow = "\n".join(updated_lines).rstrip("\n") + "\n"
+    try:
+        shadow_path.write_text(new_shadow, encoding="utf-8")
     except OSError:
         return
 
@@ -363,6 +398,7 @@ def _entrypoint_main() -> None:
     _ensure_workspace_tmp()
     _set_umask()
     _ensure_user_in_passwd(username=runtime_username)
+    _ensure_user_in_shadow(username=runtime_username)
     _ensure_workspace_permissions()
     _ensure_claude_native_command_path(command=command, home=os.environ["HOME"])
     _configure_git_auth_from_env()
