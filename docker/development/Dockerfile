@@ -61,7 +61,9 @@ RUN chmod +x \
       /opt/agent_hub/docker/development/verify-demo-tooling.sh \
  && UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv uv sync --frozen --no-dev \
  && cd /opt/agent_hub/web \
- && corepack yarn install --frozen-lockfile \
+ && (corepack yarn install --frozen-lockfile \
+     || (corepack yarn cache clean \
+         && corepack yarn install --frozen-lockfile)) \
  && cd /opt/agent_hub/tools/demo \
  && npm ci \
  && npx playwright install --with-deps firefox \
