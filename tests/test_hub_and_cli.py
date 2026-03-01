@@ -8075,6 +8075,80 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("--workdir", run_cmd)
             self.assertIn("/workspace/project", run_cmd)
 
+    def test_snapshot_runtime_project_in_image_repairs_project_ownership_before_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind", return_value="file"
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=False
+            ), patch(
+                "agent_cli.cli._docker_rm_force", return_value=None
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--snapshot-image-tag",
+                        "snapshot:test",
+                        "--project-in-image",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            expected_chown = f"chown -R {os.getuid()}:{os.getgid()} /workspace/project"
+            setup_cmd = next(
+                (
+                    cmd
+                    for cmd in commands
+                    if len(cmd) >= 2
+                    and cmd[:2] == ["docker", "run"]
+                    and "agent-runtime-setup-" in cmd[-4]
+                ),
+                None,
+            )
+            self.assertIsNotNone(setup_cmd)
+            chown_cmd = next(
+                (
+                    cmd
+                    for cmd in commands
+                    if len(cmd) >= 7
+                    and cmd[:2] == ["docker", "exec"]
+                    and cmd[2:4] == ["--user", "0:0"]
+                    and cmd[-3:] == ["bash", "-lc", expected_chown]
+                ),
+                None,
+            )
+            self.assertIsNotNone(chown_cmd)
+            commit_cmd = next((cmd for cmd in commands if len(cmd) >= 3 and cmd[0:2] == ["docker", "commit"]), None)
+            self.assertIsNotNone(commit_cmd)
+            assert setup_cmd is not None
+            assert chown_cmd is not None
+            assert commit_cmd is not None
+            self.assertLess(commands.index(setup_cmd), commands.index(chown_cmd))
+            self.assertLess(commands.index(chown_cmd), commands.index(commit_cmd))
+
     def test_ensure_runtime_image_built_if_missing_waits_for_concurrent_builder(self) -> None:
         target_image = "agent-runtime-claude-test"
         build_started = threading.Event()
