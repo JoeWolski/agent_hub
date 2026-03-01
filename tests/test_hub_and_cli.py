@@ -2169,6 +2169,7 @@ Gemini CLI
         self.assertIn("AGENT_ARTIFACT_TOKEN=artifact-token-test", cmd)
         self.assertIn("--snapshot-image-tag", cmd)
         self.assertIn(self.state._project_setup_snapshot_tag(project), cmd)
+        self.assertIn("--project-in-image", cmd)
         self.assertIn("--", cmd)
         self.assertIn("--model", cmd)
         self.assertIn("gpt-5", cmd)
@@ -6361,6 +6362,9 @@ class CliEnvVarTests(unittest.TestCase):
 
         self.assertIn("USER root", content)
         self.assertLess(content.index("USER root"), content.index("RUN apt-get update"))
+        runtime_content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
+        self.assertIn("USER 0", runtime_content)
+        self.assertLess(runtime_content.index("USER 0"), runtime_content.index("RUN apt-get update"))
 
     def test_agent_cli_dockerfile_sets_root_home_before_provider_install_layers(self) -> None:
         # Provider install is now in the main Dockerfile, but base packages in base Dockerfile.
@@ -6383,6 +6387,7 @@ class CliEnvVarTests(unittest.TestCase):
 
         self.assertEqual(exported_lines, [])
         self.assertIn("UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv uv sync --frozen --no-dev", content)
+        self.assertIn("corepack yarn cache clean", content)
 
     def test_development_dockerfile_uses_build_only_uv_project_environment(self) -> None:
         content = DEVELOPMENT_DOCKERFILE.read_text(encoding="utf-8")
@@ -6390,6 +6395,7 @@ class CliEnvVarTests(unittest.TestCase):
 
         self.assertEqual(exported_lines, [])
         self.assertIn("UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv uv sync --frozen --no-dev", content)
+        self.assertIn("corepack yarn cache clean", content)
 
     def test_development_dockerfile_runs_demo_tooling_verification_script(self) -> None:
         content = DEVELOPMENT_DOCKERFILE.read_text(encoding="utf-8")
@@ -6536,10 +6542,17 @@ class CliEnvVarTests(unittest.TestCase):
             image_cli._parse_env_var("NO_EQUALS", "--env-var")
 
     def test_snapshot_setup_script_prepares_workspace_tmp(self) -> None:
-        script = image_cli._build_snapshot_setup_shell_script("echo hello")
+        script = image_cli._build_snapshot_setup_shell_script(
+            "echo hello",
+            source_project_path="/workspace/.agent-hub-snapshot-source/project",
+            target_project_path="/workspace/repo",
+        )
 
         self.assertIn("snapshot bootstrap: preparing writable /workspace/tmp", script)
         self.assertIn("mkdir -p /workspace/tmp", script)
+        self.assertIn("snapshot bootstrap: copying repository into image workspace", script)
+        self.assertIn("cp -a /workspace/.agent-hub-snapshot-source/project/. /workspace/repo/", script)
+        self.assertIn("cd /workspace/repo", script)
         self.assertNotIn("chmod", script)
         self.assertLess(
             script.index("mkdir -p /workspace/tmp"),
@@ -6553,6 +6566,41 @@ class CliEnvVarTests(unittest.TestCase):
         self.assertTrue(first_runtime.startswith("agent-runtime-setup-"))
         self.assertTrue(second_runtime.startswith("agent-runtime-setup-"))
         self.assertNotEqual(first_runtime, second_runtime)
+
+    def test_prepare_daemon_visible_file_mount_source_fails_when_daemon_resolves_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "config.toml"
+            source.write_text("model='test'\n", encoding="utf-8")
+            with patch("agent_cli.cli._is_running_inside_container", return_value=True), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind",
+                return_value="dir",
+            ):
+                with self.assertRaises(ClickException) as exc:
+                    image_cli._prepare_daemon_visible_file_mount_source(
+                        source,
+                        label="--config-file",
+                    )
+            self.assertIn("must be daemon-visible as a file", str(exc.exception))
+            self.assertIn("resolved as 'dir'", str(exc.exception))
+
+    def test_prepare_daemon_visible_file_mount_source_accepts_direct_file_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "config.toml"
+            source.write_text("model='test'\n", encoding="utf-8")
+            with patch("agent_cli.cli._is_running_inside_container", return_value=True), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind",
+                return_value="file",
+            ):
+                resolved = image_cli._prepare_daemon_visible_file_mount_source(
+                    source,
+                    label="--config-file",
+                )
+            self.assertEqual(resolved, source.resolve())
 
     def test_snapshot_commit_resets_entrypoint_and_cmd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6570,6 +6618,10 @@ class CliEnvVarTests(unittest.TestCase):
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind", return_value="file"
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=False
@@ -6617,6 +6669,11 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertEqual(setup_cmd[-4], expected_setup_runtime)
             self.assertEqual(setup_cmd[-3], "bash")
             self.assertEqual(setup_cmd[-2], "-lc")
+            self.assertIn(
+                f"{project.resolve()}:{image_cli.SNAPSHOT_SOURCE_PROJECT_PATH}:ro",
+                setup_cmd,
+            )
+            self.assertNotIn(f"{project.resolve()}:/workspace/project", setup_cmd)
             setup_script = setup_cmd[-1]
             self.assertIn("set -o pipefail", setup_script)
             self.assertIn("git config --global --add safe.directory '*'", setup_script)
@@ -6629,7 +6686,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIsNotNone(commit_cmd)
             assert commit_cmd is not None
             self.assertIn("--change", commit_cmd)
-            self.assertIn("USER root", commit_cmd)
+            self.assertIn("USER 0", commit_cmd)
             self.assertIn("WORKDIR /workspace", commit_cmd)
             self.assertIn('ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]', commit_cmd)
             self.assertIn('CMD ["bash"]', commit_cmd)
@@ -6651,6 +6708,8 @@ class CliEnvVarTests(unittest.TestCase):
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
                 "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind", return_value="file"
             ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
@@ -7188,6 +7247,8 @@ class CliEnvVarTests(unittest.TestCase):
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
                 "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind", return_value="file"
             ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
@@ -7948,6 +8009,53 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
             self.assertIn(overlay_tag, run_cmd)
+
+    def test_snapshot_runtime_project_in_image_skips_project_bind_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind", return_value="file"
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--snapshot-image-tag",
+                        "snapshot:test",
+                        "--project-in-image",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            self.assertNotIn(f"{project.resolve()}:/workspace/project", run_cmd)
+            self.assertIn("--workdir", run_cmd)
+            self.assertIn("/workspace/project", run_cmd)
 
     def test_ensure_runtime_image_built_if_missing_waits_for_concurrent_builder(self) -> None:
         target_image = "agent-runtime-claude-test"
@@ -9537,6 +9645,32 @@ class DockerEntrypointTests(unittest.TestCase):
             module._configure_git_auth_from_env()
         run_mock.assert_not_called()
 
+    def test_configure_git_safe_directory_for_project_uses_container_project_path(self) -> None:
+        module = self._load_entrypoint_module()
+        with patch.object(module, "_run", return_value=SimpleNamespace(returncode=0)) as run_mock, patch.dict(
+            os.environ,
+            {"CONTAINER_PROJECT_PATH": "/workspace/demo-project"},
+            clear=False,
+        ):
+            module._configure_git_safe_directory_for_project()
+
+        run_mock.assert_called_once_with(
+            ["git", "config", "--global", "--add", "safe.directory", "/workspace/demo-project"]
+        )
+
+    def test_configure_git_safe_directory_for_project_falls_back_to_cwd(self) -> None:
+        module = self._load_entrypoint_module()
+        with self._temporary_exec_dir() as tmp:
+            cwd = Path(tmp).resolve()
+            with patch.object(module, "_run", return_value=SimpleNamespace(returncode=0)) as run_mock, patch.dict(
+                os.environ,
+                {"CONTAINER_PROJECT_PATH": ""},
+                clear=False,
+            ), patch.object(module.Path, "cwd", return_value=cwd):
+                module._configure_git_safe_directory_for_project()
+
+        run_mock.assert_called_once_with(["git", "config", "--global", "--add", "safe.directory", str(cwd)])
+
     def test_entrypoint_module_does_not_define_prepare_git_credentials(self) -> None:
         module = self._load_entrypoint_module()
         self.assertFalse(hasattr(module, "_prepare_git_credentials"))
@@ -9589,13 +9723,21 @@ class DockerEntrypointTests(unittest.TestCase):
         ) as ensure_workspace_tmp, patch.object(
             module, "_configure_git_identity", return_value=None
         ) as configure_git, patch.object(
+            module, "_configure_git_safe_directory_for_project", return_value=None
+        ) as configure_safe_directory, patch.object(
+            module, "_configure_git_auth_from_env", return_value=None
+        ) as configure_git_auth, patch.object(
+            module, "_ack_runtime_ready", return_value=None
+        ), patch.object(
             module.os, "execvp", side_effect=SystemExit(0)
         ) as execvp:
             with self.assertRaises(SystemExit):
                 module._entrypoint_main()
 
         ensure_workspace_tmp.assert_called_once_with()
+        configure_git_auth.assert_called_once_with()
         configure_git.assert_called_once_with()
+        configure_safe_directory.assert_called_once_with()
         execvp.assert_called_once_with("codex", ["codex"])
 
     def test_entrypoint_main_execs_requested_command(self) -> None:
@@ -9613,6 +9755,12 @@ class DockerEntrypointTests(unittest.TestCase):
             module, "_ensure_workspace_tmp", return_value=None
         ) as ensure_workspace_tmp, patch.object(
             module, "_configure_git_identity", return_value=None
+        ) as configure_git, patch.object(
+            module, "_configure_git_safe_directory_for_project", return_value=None
+        ) as configure_safe_directory, patch.object(
+            module, "_configure_git_auth_from_env", return_value=None
+        ) as configure_git_auth, patch.object(
+            module, "_ack_runtime_ready", return_value=None
         ), patch.object(
             module.os, "execvp", side_effect=SystemExit(0)
         ) as execvp:
@@ -9623,6 +9771,9 @@ class DockerEntrypointTests(unittest.TestCase):
         self.assertEqual(observed_home, "/tmp/entrypoint-local-home")
         execvp.assert_called_once_with("bash", ["bash", "-lc", "echo ok"])
         ensure_workspace_tmp.assert_called_once_with()
+        configure_git_auth.assert_called_once_with()
+        configure_git.assert_called_once_with()
+        configure_safe_directory.assert_called_once_with()
 
     def test_entrypoint_main_bootstraps_claude_native_command_path(self) -> None:
         module = self._load_entrypoint_module()
@@ -9639,6 +9790,12 @@ class DockerEntrypointTests(unittest.TestCase):
             module, "_ensure_claude_native_command_path", return_value=None
         ) as ensure_claude_native_path, patch.object(
             module, "_configure_git_identity", return_value=None
+        ) as configure_git, patch.object(
+            module, "_configure_git_safe_directory_for_project", return_value=None
+        ) as configure_safe_directory, patch.object(
+            module, "_configure_git_auth_from_env", return_value=None
+        ) as configure_git_auth, patch.object(
+            module, "_ack_runtime_ready", return_value=None
         ), patch.object(
             module.os, "execvp", side_effect=SystemExit(0)
         ) as execvp:
@@ -9650,6 +9807,9 @@ class DockerEntrypointTests(unittest.TestCase):
             command=["claude", "--help"],
             home="/tmp/entrypoint-home",
         )
+        configure_git_auth.assert_called_once_with()
+        configure_git.assert_called_once_with()
+        configure_safe_directory.assert_called_once_with()
         execvp.assert_called_once_with("claude", ["claude", "--help"])
 
     def test_entrypoint_ensure_workspace_tmp(self) -> None:

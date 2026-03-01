@@ -46,3 +46,27 @@ Purpose: record recurring high-cost failures and first-try fixes.
   - absolute workspace file (`/workspace/<repo>/<file>`)
   - without host path mapping/rewrite logic
 - Scope: artifact submission from runtime MCP tool in Docker-in-Docker path-mismatch environments.
+
+### Hooks installed in setup snapshot are missing in new chats
+
+- Symptom: setup build logs show `pre-commit installed at .git/hooks/pre-commit`, but fresh chats do not have hooks.
+- Root cause: runtime mounted host checkout over container repo path, and chat clones do not inherit `.git/hooks`.
+- First-try fix: use snapshot-backed image workspace mode (`--project-in-image`) so setup copies repo into image and runs hook install there.
+- Verification: create two fresh chats on same snapshot and confirm `.git/hooks/pre-commit` exists in both without re-running setup.
+- Scope: snapshot-based chat launches where hook state must be shared across chats.
+
+### Runtime image build fails with `unable to find user root`
+
+- Symptom: `docker build` fails in `docker/agent_cli/Dockerfile` at apt layers with `unable to find user root: no matching entries in passwd file`.
+- Root cause: the chosen `BASE_IMAGE` declares `User=root` but does not include a `root` passwd entry; `USER root` username resolution fails before package-install layers.
+- First-try fix: use numeric root (`USER 0`) in runtime Dockerfile and snapshot commit metadata.
+- Verification: build setup runtime with a base image missing `root` passwd entry and confirm apt layers execute.
+- Scope: setup/runtime image builds using non-standard base images.
+
+### Yarn install fails after transient `@esbuild/*` registry errors
+
+- Symptom: `corepack yarn install --frozen-lockfile` shows `502 Bad Gateway` for `@esbuild/*` tarballs and can follow with `ENOENT ... .yarn-metadata.json` during linking.
+- Root cause: transient package fetch failure leaves Yarn v1 cache state unusable for the same install attempt.
+- First-try fix: retry install once after `corepack yarn cache clean` in Docker build steps.
+- Verification: inject a failing first install attempt and confirm second pass succeeds with cleaned cache.
+- Scope: Docker builds running Yarn v1 installs for `web/` dependencies.

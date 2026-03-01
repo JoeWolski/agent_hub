@@ -1,7 +1,7 @@
 ARG BASE_IMAGE=agent-cli-base
 FROM ${BASE_IMAGE}
 ARG AGENT_PROVIDER=codex
-USER root
+USER 0
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \

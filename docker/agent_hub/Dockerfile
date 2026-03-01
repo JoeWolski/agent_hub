@@ -8,7 +8,9 @@ WORKDIR /opt/agent_hub/web
 COPY web/package.json web/yarn.lock web/index.html web/vite.config.js ./
 COPY web/src ./src
 RUN corepack enable \
- && corepack yarn install --frozen-lockfile \
+ && (corepack yarn install --frozen-lockfile \
+     || (corepack yarn cache clean \
+         && corepack yarn install --frozen-lockfile)) \
  && corepack yarn build
 
 FROM ${PYTHON_IMAGE} AS production
