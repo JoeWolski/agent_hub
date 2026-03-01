@@ -1845,8 +1845,6 @@ def main(
     snapshot_tag = (snapshot_image_tag or "").strip()
     if project_in_image and not snapshot_tag:
         raise click.ClickException("--project-in-image requires --snapshot-image-tag")
-    if project_in_image and prepare_snapshot_only:
-        raise click.ClickException("--project-in-image cannot be combined with --prepare-snapshot-only")
     cached_snapshot_exists = bool(snapshot_tag) and _docker_image_exists(snapshot_tag)
     if cached_snapshot_exists:
         click.echo(f"Using cached setup snapshot image '{snapshot_tag}'")
