@@ -140,13 +140,45 @@ class HubStateTests(unittest.TestCase):
             os.environ,
             {
                 hub_server.AGENT_HUB_HOST_UID_ENV: "not-an-int",
+                hub_server.AGENT_HUB_HOST_GID_ENV: "1007",
             },
             clear=False,
         ):
             with self.assertRaisesRegex(RuntimeError, "Invalid AGENT_HUB_HOST_UID"):
                 hub_server.HubState(self.tmp_path / "hub-invalid-uid", self.config_file)
 
-    def test_runtime_identity_for_workspace_uses_workspace_owner(self) -> None:
+    def test_hub_state_rejects_partial_host_identity_override(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                hub_server.AGENT_HUB_HOST_UID_ENV: "1234",
+                hub_server.AGENT_HUB_HOST_GID_ENV: "",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "must be set together"):
+                hub_server.HubState(self.tmp_path / "hub-invalid-partial", self.config_file)
+
+    def test_hub_state_uses_shared_root_owner_when_host_identity_env_not_set(self) -> None:
+        shared_root = self.tmp_path / "shared-root"
+        shared_root.mkdir(parents=True, exist_ok=True)
+        owner = shared_root.stat()
+        with patch.dict(
+            os.environ,
+            {
+                hub_server.AGENT_HUB_HOST_UID_ENV: "",
+                hub_server.AGENT_HUB_HOST_GID_ENV: "",
+                hub_server.AGENT_HUB_HOST_SUPP_GIDS_ENV: "",
+                hub_server.AGENT_HUB_SHARED_ROOT_ENV: str(shared_root),
+            },
+            clear=False,
+        ):
+            override_state = hub_server.HubState(self.tmp_path / "hub-shared-root", self.config_file)
+
+        self.assertEqual(override_state.local_uid, int(owner.st_uid))
+        self.assertEqual(override_state.local_gid, int(owner.st_gid))
+
+    def test_runtime_identity_for_workspace_uses_hub_identity(self) -> None:
         class _Resolved:
             def stat(self):
                 return SimpleNamespace(st_uid=9001, st_gid=9002)
@@ -156,23 +188,10 @@ class HubStateTests(unittest.TestCase):
                 return _Resolved()
 
         uid, gid, supp = self.state._runtime_identity_for_workspace(_Workspace())  # type: ignore[arg-type]
-        self.assertEqual(uid, 9001)
-        self.assertEqual(gid, 9002)
-        self.assertEqual(supp, "")
-
-    def test_runtime_identity_for_workspace_falls_back_to_hub_identity(self) -> None:
-        class _Resolved:
-            def stat(self):
-                raise OSError("boom")
-
-        class _Workspace:
-            def resolve(self):
-                return _Resolved()
-
-        uid, gid, supp = self.state._runtime_identity_for_workspace(_Workspace())  # type: ignore[arg-type]
         self.assertEqual(uid, self.state.local_uid)
         self.assertEqual(gid, self.state.local_gid)
         self.assertEqual(supp, self.state.local_supp_gids)
+
     def _connect_github_app(self) -> dict[str, object]:
         with patch.object(
             hub_server.HubState,
