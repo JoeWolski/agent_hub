@@ -66,6 +66,7 @@ AGENT_TOOLS_TOKEN_ENV = "AGENT_HUB_AGENT_TOOLS_TOKEN"
 AGENT_TOOLS_PROJECT_ID_ENV = "AGENT_HUB_AGENT_TOOLS_PROJECT_ID"
 AGENT_TOOLS_CHAT_ID_ENV = "AGENT_HUB_AGENT_TOOLS_CHAT_ID"
 AGENT_TOOLS_READY_ACK_GUID_ENV = "AGENT_HUB_READY_ACK_GUID"
+AGENT_HUB_TMP_HOST_PATH_ENV = "AGENT_HUB_TMP_HOST_PATH"
 AGENT_TOOLS_TOKEN_HEADER = "x-agent-hub-agent-tools-token"
 AGENT_TOOLS_MCP_RUNTIME_DIR_NAME = "agent_hub"
 AGENT_TOOLS_MCP_RUNTIME_FILE_NAME = "agent_tools_mcp.py"
@@ -78,6 +79,7 @@ AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH = str(
 GIT_CREDENTIAL_DEFAULT_SCHEME = "https"
 GIT_CREDENTIAL_ALLOWED_SCHEMES = {"http", "https"}
 RUNTIME_IMAGE_BUILD_LOCK_DIR = Path(tempfile.gettempdir()) / "agent-cli-image-build-locks"
+DAEMON_TMP_MOUNT_ROOT = Path("/workspace/tmp")
 
 
 def _cli_arg_matches_option(arg: str, *, long_option: str, short_option: str | None = None) -> bool:
@@ -1032,6 +1034,20 @@ def _daemon_mount_source_kind(path: Path) -> str:
     return "unknown"
 
 
+def _daemon_visible_mount_source(path: Path) -> Path:
+    source = path.resolve()
+    if not _is_running_inside_container():
+        return source
+    mapped_root = str(os.environ.get(AGENT_HUB_TMP_HOST_PATH_ENV) or "").strip()
+    if not mapped_root:
+        return source
+    try:
+        relative = source.relative_to(DAEMON_TMP_MOUNT_ROOT.resolve())
+    except ValueError:
+        return source
+    return Path(mapped_root) / relative
+
+
 def _prepare_daemon_visible_file_mount_source(
     source: Path,
     *,
@@ -1043,10 +1059,16 @@ def _prepare_daemon_visible_file_mount_source(
     _validate_daemon_visible_mount_source(source_path, label=label)
     if not _is_running_inside_container():
         return source_path
-
-    source_kind = _daemon_mount_source_kind(source_path)
-    if source_kind == "file":
-        return source_path
+    candidates = [_daemon_visible_mount_source(source_path), source_path]
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        source_kind = _daemon_mount_source_kind(candidate)
+        if source_kind == "file":
+            return candidate
     raise click.ClickException(
         f"{label} must be daemon-visible as a file but resolved as '{source_kind}': {source_path}. "
         "Fix host/container path mapping before retrying."
@@ -1212,12 +1234,15 @@ def _build_snapshot_setup_shell_script(
     *,
     source_project_path: str,
     target_project_path: str,
+    runtime_uid: int | None = None,
+    runtime_gid: int | None = None,
+    enforce_project_writable_for_runtime_user: bool = False,
 ) -> str:
     normalized_script = (setup_script or "").strip() or ":"
     source_path = shlex.quote(source_project_path)
     target_path = shlex.quote(target_project_path)
     target_parent = shlex.quote(str(PurePosixPath(target_project_path).parent))
-    return (
+    script = (
         "set -e\n"
         "set -o pipefail\n"
         "printf '%s\\n' '[agent_cli] snapshot bootstrap: preparing writable /workspace/tmp'\n"
@@ -1230,31 +1255,41 @@ def _build_snapshot_setup_shell_script(
         f"mkdir -p {target_path}\n"
         f"cp -a {source_path}/. {target_path}/\n"
         f"cd {target_path}\n"
-        "printf '%s\\n' '[agent_cli] snapshot bootstrap: running project setup script'\n"
-        + normalized_script
-        + "\n"
     )
-
-
-def _repair_snapshot_project_ownership(
-    *,
-    container_name: str,
-    target_project_path: str,
-    uid: int,
-    gid: int,
-) -> None:
-    _run(
-        [
-            "docker",
-            "exec",
-            "--user",
-            "0:0",
-            container_name,
-            "bash",
-            "-lc",
-            f"chown -R {uid}:{gid} {shlex.quote(target_project_path)}",
-        ]
-    )
+    if runtime_uid is not None and runtime_gid is not None:
+        script += (
+            "printf '%s\\n' '[agent_cli] snapshot bootstrap: running project setup script as runtime user'\n"
+            f"setpriv --reuid {runtime_uid} --regid {runtime_gid} --clear-groups bash -lc {shlex.quote(normalized_script)}\n"
+        )
+    else:
+        script += (
+            "printf '%s\\n' '[agent_cli] snapshot bootstrap: running project setup script'\n"
+            + normalized_script
+            + "\n"
+        )
+    if enforce_project_writable_for_runtime_user and runtime_uid is not None and runtime_gid is not None:
+        writable_probe_cmd = (
+            "set -euo pipefail; "
+            f"test -d {target_path}; "
+            f'project_path={target_path}; '
+            'probe_path="$project_path/.agent-cli-write-probe-$$"; '
+            ': > "$probe_path"; '
+            'rm -f "$probe_path"'
+        )
+        script += (
+            "printf '%s\\n' '[agent_cli] snapshot bootstrap: repairing in-image project ownership "
+            f"for {target_project_path} -> {runtime_uid}:{runtime_gid}'\n"
+        )
+        script += f"chown -R {runtime_uid}:{runtime_gid} {target_path}\n"
+        script += (
+            "printf '%s\\n' '[agent_cli] snapshot bootstrap: verifying in-image project path is writable "
+            f"for {runtime_uid}:{runtime_gid} at {target_project_path}'\n"
+        )
+        script += (
+            f"setpriv --reuid {runtime_uid} --regid {runtime_gid} --clear-groups "
+            f"bash -lc {shlex.quote(writable_probe_cmd)}\n"
+        )
+    return script
 
 
 def _parse_env_var(spec: str, label: str) -> str:
@@ -1726,6 +1761,7 @@ def main(
     if not project_path.is_dir():
         raise click.ClickException(f"Project path does not exist: {project_path}")
     _validate_daemon_visible_mount_source(project_path, label="--project")
+    daemon_project_path = _daemon_visible_mount_source(project_path)
 
     config_path = _to_absolute(config_file, cwd)
     if not config_path.is_file():
@@ -1816,8 +1852,6 @@ def main(
     snapshot_tag = (snapshot_image_tag or "").strip()
     if project_in_image and not snapshot_tag:
         raise click.ClickException("--project-in-image requires --snapshot-image-tag")
-    if project_in_image and prepare_snapshot_only:
-        raise click.ClickException("--project-in-image cannot be combined with --prepare-snapshot-only")
     cached_snapshot_exists = bool(snapshot_tag) and _docker_image_exists(snapshot_tag)
     if cached_snapshot_exists:
         click.echo(f"Using cached setup snapshot image '{snapshot_tag}'")
@@ -1864,15 +1898,17 @@ def main(
     for mount in ro_mounts:
         _reject_mount_inside_project_path(spec=mount, label="--ro-mount", container_project_path=container_project_root)
         host, container = _parse_mount(mount, "--ro-mount")
-        _validate_daemon_visible_mount_source(Path(host), label="--ro-mount")
-        ro_mount_flags.append(f"{host}:{container}:ro")
+        host_path = Path(host)
+        _validate_daemon_visible_mount_source(host_path, label="--ro-mount")
+        ro_mount_flags.append(f"{_daemon_visible_mount_source(host_path)}:{container}:ro")
 
     for mount in rw_mounts:
         _reject_mount_inside_project_path(spec=mount, label="--rw-mount", container_project_path=container_project_root)
         host, container = _parse_mount(mount, "--rw-mount")
-        _validate_daemon_visible_mount_source(Path(host), label="--rw-mount")
-        rw_mount_flags.append(f"{host}:{container}")
-        rw_mount_specs.append((Path(host), container))
+        host_path = Path(host)
+        _validate_daemon_visible_mount_source(host_path, label="--rw-mount")
+        rw_mount_flags.append(f"{_daemon_visible_mount_source(host_path)}:{container}")
+        rw_mount_specs.append((host_path, container))
 
     parsed_env_vars: list[str] = []
     for entry in env_vars:
@@ -1943,7 +1979,11 @@ def main(
         else None
     )
     config_mount_entry = f"{mounted_config_path}:{config_mount_target}"
-    project_mount_entry = f"{project_path}:{container_project_path}"
+    daemon_host_codex_dir = _daemon_visible_mount_source(host_codex_dir)
+    daemon_host_claude_dir = _daemon_visible_mount_source(host_claude_dir)
+    daemon_host_claude_config_dir = _daemon_visible_mount_source(host_claude_config_dir)
+    daemon_host_gemini_dir = _daemon_visible_mount_source(host_gemini_dir)
+    project_mount_entry = f"{daemon_project_path}:{container_project_path}"
     use_project_bind_mount = not (bool(snapshot_tag) and (prepare_snapshot_only or project_in_image))
     run_args = [
         "--init",
@@ -1956,15 +1996,15 @@ def main(
         "--volume",
         f"{DOCKER_SOCKET_PATH}:{DOCKER_SOCKET_PATH}",
         "--volume",
-        f"{host_codex_dir}:{container_home_path}/.codex",
+        f"{daemon_host_codex_dir}:{container_home_path}/.codex",
         "--volume",
-        f"{host_claude_dir}:{container_home_path}/.claude",
+        f"{daemon_host_claude_dir}:{container_home_path}/.claude",
         "--volume",
         f"{mounted_claude_json_path}:{container_home_path}/.claude.json",
         "--volume",
-        f"{host_claude_config_dir}:{container_home_path}/.config/claude",
+        f"{daemon_host_claude_config_dir}:{container_home_path}/.config/claude",
         "--volume",
-        f"{host_gemini_dir}:{container_home_path}/.gemini",
+        f"{daemon_host_gemini_dir}:{container_home_path}/.gemini",
         "--volume",
         config_mount_entry,
         *(
@@ -2031,10 +2071,14 @@ def main(
                 agent_provider=AGENT_PROVIDER_NONE,
             )
             script = (setup_script or "").strip() or ":"
+            snapshot_workspace_copied_into_image = not use_project_bind_mount
             setup_bootstrap_script = _build_snapshot_setup_shell_script(
                 script,
                 source_project_path=SNAPSHOT_SOURCE_PROJECT_PATH,
                 target_project_path=container_project_path,
+                runtime_uid=uid if snapshot_workspace_copied_into_image else None,
+                runtime_gid=gid if snapshot_workspace_copied_into_image else None,
+                enforce_project_writable_for_runtime_user=snapshot_workspace_copied_into_image,
             )
             click.echo(f"Building setup snapshot image '{snapshot_tag}'")
             container_name = (
@@ -2042,7 +2086,10 @@ def main(
                 f"{_short_hash(snapshot_tag + script)}"
             )
             setup_run_args = list(run_args)
-            setup_run_args.extend(["--volume", f"{project_path}:{SNAPSHOT_SOURCE_PROJECT_PATH}:ro"])
+            if snapshot_workspace_copied_into_image:
+                user_arg_index = setup_run_args.index("--user")
+                setup_run_args[user_arg_index + 1] = "0:0"
+            setup_run_args.extend(["--volume", f"{daemon_project_path}:{SNAPSHOT_SOURCE_PROJECT_PATH}:ro"])
             setup_cmd = [
                 "docker",
                 "run",
@@ -2057,17 +2104,6 @@ def main(
             _docker_rm_force(container_name)
             try:
                 _run(setup_cmd)
-                if project_in_image:
-                    click.echo(
-                        "[agent_cli] snapshot bootstrap: repairing in-image project ownership "
-                        f"for {container_project_path} -> {uid}:{gid}"
-                    )
-                    _repair_snapshot_project_ownership(
-                        container_name=container_name,
-                        target_project_path=container_project_path,
-                        uid=uid,
-                        gid=gid,
-                    )
                 _run(
                     [
                         "docker",
