@@ -10,12 +10,14 @@
 
 ## Findings
 - Root cause validated: callback forwarding candidate host set lacked deterministic Docker bridge gateway fallback when `host.docker.internal` resolution/routing failed.
-- Fix implemented: bridge gateway discovery from Linux default route and Docker bridge network inspection, appended after existing host candidates.
+- Strategy updated for primary direct CLI reliability:
+  - callback forwarding now tries in-container loopback first (`docker exec` to `127.0.0.1:<callback_port>` in login container namespace)
+  - network candidate forwarding remains fallback for compatibility.
 - Durable diagnostics implemented:
   - callback URL resolution decisions
   - forwarded host/proto/port parsing context
-  - container/runtime bridge routing discovery diagnostics
-  - upstream request target + response status + timeout/error class
+  - bridge routing discovery diagnostics
+  - upstream request target/status/error class
   - explicit categorized failure reason in terminal error log and HTTP 502 detail
 - Secret safety verified:
   - callback query values redacted in all new logs
@@ -23,7 +25,9 @@
 
 ## Validation Evidence
 - See `validation/manifest.txt` for exact commands and PASS/FAIL.
-- Final targeted suite PASS: `9 passed, 308 deselected`.
+- Final targeted suites PASS:
+  - `forward_openai_account_callback`: `8 passed, 311 deselected`
+  - `openai_account_callback_route or parse_callback_forward_host_port`: `3 passed, 316 deselected`
 
 ## Result
 PASS

@@ -1,5 +1,5 @@
 ## Scope
-Independent implementation-vs-design audit for OpenAI callback 502 fix and diagnostics.
+Independent implementation-vs-design audit for OpenAI callback 502 fix, direct-CLI primary strategy, and diagnostics.
 
 ## Inputs Reviewed
 - `docs/analysis/openai-account-login-fix/design_spec.md`
@@ -12,7 +12,8 @@ Independent implementation-vs-design audit for OpenAI callback 502 fix and diagn
 ## Criteria Check
 - Design goals implemented with no widening of auth semantics: PASS
 - Existing callback path behavior preserved for working hosts: PASS
-- Bridge fallback added for Docker-in-Docker mismatch: PASS
+- Direct CLI reliability improved via container-loopback primary path: PASS
+- Bridge fallback retained for Docker-in-Docker mismatch: PASS
 - Failure classification and high-signal diagnostics: PASS
 - Query/secret redaction controls in logs: PASS
 - Required validation commands present in manifest: PASS
@@ -20,7 +21,7 @@ Independent implementation-vs-design audit for OpenAI callback 502 fix and diagn
 
 ## Findings
 - No blocking mismatches found between design intent and implemented behavior.
-- Residual risk remains limited to atypical networks outside discovered route/bridge candidates; diagnostics now expose exact failure path deterministically.
+- Residual risk is limited to environments that disallow `docker exec`; those use network fallback path.
 
 ## Result
 PASS

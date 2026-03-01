@@ -1,14 +1,14 @@
 ## Summary
-Fixes OpenAI account login callback failures that ended in `502 Bad Gateway` by adding deterministic Docker bridge fallback routing and comprehensive redacted diagnostics across callback resolution/forwarding.
+Fixes OpenAI account login callback failures ending in `502 Bad Gateway` by adding deterministic callback forwarding with strong diagnostics and redaction, prioritizing direct CLI user reliability.
 
 ## Changes
-- Root-cause fix in callback forwarding path:
-  - Added bridge-aware fallback host discovery when localhost/request/default hosts fail.
-  - Added Linux default-route gateway and Docker bridge gateway discovery.
-  - Preserved existing host candidate order and behavior for currently working flows.
+- Root-cause fix for callback forwarding path:
+  - Added bridge-aware host discovery (Linux default route + Docker bridge gateway).
+  - Added in-container loopback callback forwarding via `docker exec` and made it primary.
+  - Preserved network host forwarding as fallback when container-loopback forwarding fails.
 - Added forwarding-context parsing from callback request headers:
   - `Forwarded`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-Port`, `Host`, and client host normalization.
-- Added durable logging for the entire flow:
+- Added durable logging for the full flow:
   - callback URL resolution decisions
   - forwarded host/scheme/port parsing
   - bridge routing diagnostics
@@ -22,15 +22,19 @@ Fixes OpenAI account login callback failures that ended in `502 Bad Gateway` by 
   - callback success path
   - 502-producing failure path + failure-category logs + redaction
   - bridge fallback success path
+  - container-loopback primary success path
+  - network fallback when container-loopback fails
   - callback host/port derivation edge cases (host:port, IPv6:port, invalid host)
   - callback route forwarding-context parsing
 
 ## Validation
 - `/workspace/agent_hub_writable/.venv/bin/python - <<'PY' [pre-fix repro script]` -> PASS (observed `STATUS 502` with no bridge target attempted)
 - `/workspace/agent_hub_writable/.venv/bin/python - <<'PY' [post-fix repro script]` -> PASS (observed `STATUS 200`, target `http://172.17.0.1:1455`)
-- `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "forward_openai_account_callback or openai_account_callback_route or parse_callback_forward_host_port"` -> PASS (`9 passed, 308 deselected`)
+- `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "forward_openai_account_callback"` -> PASS (`8 passed, 311 deselected`)
+- `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "openai_account_callback_route or parse_callback_forward_host_port"` -> PASS (`3 passed, 316 deselected`)
 - Incremental fix checks recorded in `docs/analysis/openai-account-login-fix/validation/manifest.txt`.
 
 ## Risks
-- Network environments with non-standard host routing beyond default-route/bridge detection may still require additional fallback candidates.
-- Additional callback diagnostics increase log volume during auth attempts; logs remain bounded by request scope and values are redacted.
+- `docker exec` is now on the primary callback path; environments that restrict exec into runtime containers will rely on network fallback.
+- Non-standard network overlays may still require additional host discovery candidates.
+- Additional callback diagnostics increase log volume during auth attempts; logs remain request-scoped and values are redacted.
