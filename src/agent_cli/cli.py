@@ -1236,6 +1236,27 @@ def _build_snapshot_setup_shell_script(
     )
 
 
+def _repair_snapshot_project_ownership(
+    *,
+    container_name: str,
+    target_project_path: str,
+    uid: int,
+    gid: int,
+) -> None:
+    _run(
+        [
+            "docker",
+            "exec",
+            "--user",
+            "0:0",
+            container_name,
+            "bash",
+            "-lc",
+            f"chown -R {uid}:{gid} {shlex.quote(target_project_path)}",
+        ]
+    )
+
+
 def _parse_env_var(spec: str, label: str) -> str:
     if "=" not in spec:
         raise click.ClickException(f"Invalid {label}: {spec} (expected KEY=VALUE)")
@@ -2030,6 +2051,17 @@ def main(
             _docker_rm_force(container_name)
             try:
                 _run(setup_cmd)
+                if project_in_image:
+                    click.echo(
+                        "[agent_cli] snapshot bootstrap: repairing in-image project ownership "
+                        f"for {container_project_path} -> {uid}:{gid}"
+                    )
+                    _repair_snapshot_project_ownership(
+                        container_name=container_name,
+                        target_project_path=container_project_path,
+                        uid=uid,
+                        gid=gid,
+                    )
                 _run(
                     [
                         "docker",
