@@ -7,6 +7,15 @@
 - Added task contracts with explicit allowed paths and validation commands.
 - Added adversarial findings focused on silent regression and insufficient end-to-end coverage.
 
+## Revision 2 (Implementation)
+- Implemented hub snapshot command wiring to always pass `project_in_image=True` in setup snapshot builds.
+- Refactored CLI ownership repair trigger to follow in-image workspace-copy semantics instead of launch-flag coupling.
+- Added runtime UID:GID writability probe before snapshot commit.
+- Added regression tests for:
+  - hub prepare-snapshot command includes `--project-in-image`,
+  - ownership repair + writability probe ordering,
+  - prepare-snapshot-only path also enforces repair+probe.
+- Captured validation manifest and verification/fresh-audit reports.
+
 ## Open Questions
-- Should ownership be normalized to hub-local UID/GID only, or configurable per project/chat profile for mixed-user environments?
-- Should snapshot schema be incremented again as part of final implementation to guarantee invalidation in all deployed states?
+- Whether to add a dedicated real-daemon end-to-end integration test in a follow-up change for chat-start write checks.
