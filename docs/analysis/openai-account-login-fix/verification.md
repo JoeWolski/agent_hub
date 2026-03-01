@@ -1,36 +1,31 @@
-# Verification Plan: OpenAI Account Callback Fix
+# Verification Plan: Runtime UID/GID Propagation
 
 ## Scope
-Callback forwarding success/failure handling, host derivation, and log diagnostics.
+Hub-to-agent_cli identity propagation for snapshot/chat launch command construction.
 
 ## Assumptions
-- Docker-in-Docker route mismatch can require bridge gateway fallback.
-- OAuth callback query values must not be logged.
+- Hub `local_uid/local_gid` represent intended runtime identity.
+- `agent_cli` respects explicit `--local-uid/--local-gid` when provided.
 
 ## Hazards
-- False-negative callback routing causing 502.
-- Silent failures without diagnosable context.
-- Secrets appearing in logs.
+- Snapshot project ownership diverges from runtime user.
+- Chat runtime runs with implicit process identity rather than explicit intended identity.
+- Regression to prior mount/snapshot behavior.
 
 ## Failure Modes
-- `host.docker.internal` unresolved or unreachable.
-- Request-host mismatch in proxied environments.
-- Upstream callback listener unavailable.
+- Missing uid/gid args in hub-generated `agent_cli` command.
+- Supplementary groups omitted unexpectedly.
+- Tests only checking partial command structure miss identity regressions.
 
 ## Required Controls
-- Stable candidate host order with additional bridge candidates.
-- Forwarded header parsing and logging of derived context.
-- Error classification and explicit failure reason in logs.
-- Redacted query values in all callback-forward logs.
+- Always emit `--local-uid` and `--local-gid` in hub launch commands.
+- Emit `--local-supplementary-gids` when available.
+- Validate both snapshot and chat launch command paths in tests.
 
 ## Verification Mapping
-- Baseline repro script: confirms pre-fix 502 scenario.
-- Post-fix repro script: confirms bridge-host success.
-- Pytest targeted suite:
-  - callback success path
-  - 502-producing failure path
-  - host/port derivation edge cases
-  - logging coverage for decisions and failure reason
+- `test_ensure_project_setup_snapshot_builds_once` asserts uid/gid args.
+- `test_start_chat_uses_claude_agent_command_when_selected` asserts uid/gid args.
+- Focused `pytest` suites cover snapshot/chat command composition and project-in-image snapshot wiring.
 
 ## Residual Risk
-- Environment-specific routing outside known host/bridge paths may still fail; diagnostics now identify exact attempted targets and error classes deterministically.
+- If hub starts under a different OS user than expected, explicit propagation will still reflect hub runtime identity.

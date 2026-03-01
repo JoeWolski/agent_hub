@@ -1,18 +1,18 @@
-# Feature Plan: OpenAI Account Login Callback Fix
+# Feature Plan: Runtime UID/GID Propagation for Chat Launches
 
 ## Objective
-Eliminate `502 Bad Gateway` failures on `/api/settings/auth/openai/account/callback` in Docker-in-Docker and proxied deployments, while adding durable diagnostics that immediately identify callback forwarding failures.
+Ensure chat runtime and snapshot setup always run with the hub runtime user's UID/GID so project ownership inside snapshot-backed chats matches the effective runtime user.
 
 ## Scope
-- Callback host/port derivation and forwarding path for OpenAI account login.
-- Structured/redacted logging across callback resolution, bridge discovery, upstream attempts, and failure categorization.
-- Targeted tests for success, failure, and host-derivation edge cases.
+- Agent CLI command assembly in hub chat/snapshot launch paths.
+- Explicit propagation of local UID/GID (and supplementary gids when present).
+- Targeted regression tests for chat launch and snapshot command composition.
 
 ## Non-Scope
-- Changing OpenAI OAuth semantics.
-- Changing login container startup mode or auth provider behavior outside callback forwarding.
+- Changing OpenAI login callback forwarding behavior.
+- Changing container mount topology, snapshot copy strategy, or bridge-network fallback logic.
 
 ## Evidence Plan
-- Reproduce baseline 502 with deterministic script (expected failure path).
-- Verify post-fix success with deterministic bridge-host fallback script.
-- Run targeted pytest suite covering callback routing, failure path, and parsing/logging.
+- Verify snapshot launch command includes `--local-uid` and `--local-gid`.
+- Verify chat start command includes `--local-uid` and `--local-gid`.
+- Run focused `pytest` suites for changed command-building paths.

@@ -1,44 +1,30 @@
-# Design Spec: OpenAI Account Callback Forwarding
+# Design Spec: Runtime UID/GID Propagation for Chat Runtime
 
 ## Design Goals
-- Preserve existing working callback host resolution order.
-- Add deterministic bridge-route fallback for Docker-in-Docker host-network callback targets.
-- Emit actionable, redacted diagnostics for every callback forwarding decision and failure.
+- Keep runtime identity deterministic by passing explicit UID/GID from hub into `agent_cli`.
+- Preserve existing Docker-in-Docker mount and snapshot robustness behavior.
+- Avoid behavior drift across snapshot prepare and chat start paths.
 
 ## Non-Goals
-- No behavior changes to successful existing auth paths beyond additional fallback attempts and logging.
-- No secret-bearing log output.
+- No change to callback forwarding/auth behavior.
+- No change to container image build layers or entrypoint user mapping logic.
 
 ## Interfaces
-- Added request context parsing:
-  - `_openai_callback_request_context_from_request(request)`
-- Added forwarding utilities:
-  - `_parse_callback_forward_host_port(...)`
-  - `_discover_openai_callback_bridge_hosts(...)`
-  - `_classify_openai_callback_forward_error(...)`
-  - `_redact_url_query_values(...)`
-- Extended callback forward method:
-  - `HubState.forward_openai_account_callback(..., request_context: dict[str, Any] | None = None)`
+- Updated `HubState._prepare_agent_cli_command(...)` to include:
+  - `--local-uid <self.local_uid>`
+  - `--local-gid <self.local_gid>`
+  - `--local-supplementary-gids <self.local_supp_gids>` (only when non-empty)
 
 ## Data Flow
-1. Callback API route parses forwarded/proxy headers and normalized host/port context.
-2. Callback forwarder builds candidate hosts in stable order:
-   - `127.0.0.1`, `localhost`, request/client/forwarded hosts, artifact host, default alias/resolution.
-3. If unresolved, bridge discovery appends Linux default gateway and Docker bridge gateway.
-4. Upstream callback request attempts each candidate with timeout.
-5. Structured logs capture:
-   - callback URL resolution and candidates
-   - forwarded host/scheme/port parsing
-   - bridge discovery metadata
-   - upstream target/status/error class
-   - explicit final failure reason category
-6. Sensitive query values remain redacted in all log lines.
+1. Hub computes local identity (`self.local_uid`, `self.local_gid`, `self.local_supp_gids`) at startup.
+2. Every hub-generated `agent_cli` launch command now carries explicit local identity args.
+3. `agent_cli` uses those values to set `docker run --user <uid>:<gid>` and runtime setup ownership behavior.
+4. Snapshot copied-in-image setup keeps project ownership aligned with final runtime user.
 
 ## Build/Test Impact
 - `src/agent_hub/server.py`
 - `tests/test_hub_and_cli.py`
 
 ## Rollback Plan
-- Revert callback-forward helper additions and signature extension.
-- Keep route passing only `request_host`.
-- Remove new tests tied to bridge fallback and diagnostics.
+- Revert `HubState._prepare_agent_cli_command` identity argument additions.
+- Revert associated command-composition tests.

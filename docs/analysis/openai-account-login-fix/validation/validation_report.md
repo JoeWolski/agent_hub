@@ -1,40 +1,19 @@
-# Validation Report: OpenAI Account Login Callback Fix
+# Validation Report: Runtime UID/GID Propagation
 
 ## Scope
-- Callback success forwarding path.
-- 502 failure path classification.
-- Callback host/port derivation edge cases.
-- Durable logging coverage with redaction controls.
-- Primary callback strategy for direct CLI user flow.
+- Hub command generation for snapshot setup and chat start.
+- Runtime identity propagation (`--local-uid`, `--local-gid`, supplementary gids).
 
-## Baseline Reproduction (Before Fix Behavior)
-- Deterministic script reproduced callback forwarding failure:
-  - `STATUS 502`
-  - Attempted origins: `127.0.0.1`, `localhost`, request host, `host.docker.internal`
-  - Bridge gateway host was not attempted.
+## Results
+- Focused identity regression checks passed for snapshot and chat command paths.
+- Broader targeted command-composition checks passed for claude/gemini launch and snapshot flow.
+- Project-in-image snapshot command-path checks passed.
 
-## Post-Fix Verification
-- Deterministic script with bridge discovery path confirmed success:
-  - `STATUS 200`
-  - `TARGET http://172.17.0.1:1455`
-  - Attempt list includes bridge gateway fallback target.
-- Strategy update validated:
-  - Callback now attempts in-container loopback first (primary), then network candidates.
-  - Network candidate path remains as fallback when container-exec path fails.
-
-## Test Results
-- Callback forwarding targeted suite (updated strategy): `8 passed, 311 deselected`.
-- Route and parsing targeted suite: `3 passed, 316 deselected`.
-- Coverage includes:
-  - callback proxy success path
-  - fallback to request/artifact/default/bridge hosts
-  - explicit 502 classification and logging assertions
-  - forwarded-header context parsing
-  - host/port parsing edge coverage (host:port, IPv6:port, invalid host)
-  - container-loopback primary success path
-  - network fallback after container-loopback failure
+## Commands
+- `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "test_start_chat_uses_claude_agent_command_when_selected or test_ensure_project_setup_snapshot_builds_once"` -> PASS (`2 passed, 319 deselected`)
+- `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "start_chat_uses_claude_agent_command_when_selected or start_chat_uses_gemini_agent_command_when_selected or ensure_project_setup_snapshot_builds_once or ensure_project_setup_snapshot_passes_git_identity_env_for_pat"` -> PASS (`4 passed, 317 deselected`)
+- `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "project_in_image and snapshot"` -> PASS (`3 passed, 318 deselected`)
 
 ## Notes
-- During implementation, one incremental failure was intentionally caught and fixed:
-  - unredacted query values appeared in target URL logs.
-  - resolved by redacting logged query values while preserving upstream target visibility.
+- No UI rendering changes were introduced.
+- No mount-path or snapshot strategy behavior was changed; only identity argument propagation at hub command construction.

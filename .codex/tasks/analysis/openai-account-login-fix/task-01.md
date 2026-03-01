@@ -1,13 +1,12 @@
-# Task 01: OpenAI Account Callback 502 Root Cause and Fix
+# Task 01: Propagate Runtime UID/GID into Chat and Snapshot Launch Commands
 
 ## Status
 REVISED_COMPLETE
 
 ## Scope
-- Implement robust callback forwarding fallback for Docker-in-Docker bridge routing.
-- Add durable redacted diagnostics across callback resolution and forwarding.
-- Prioritize direct CLI user reliability by making container loopback forwarding primary.
-- Add targeted tests for success, failure, edge derivation, and logging.
+- Ensure all hub-generated `agent_cli` launch commands include explicit local runtime UID/GID.
+- Keep supplementary gids propagation explicit when present.
+- Add regression assertions in snapshot and chat command tests.
 
 ## Allowed Edit Paths
 - `src/agent_hub/server.py`
@@ -15,16 +14,9 @@ REVISED_COMPLETE
 - `docs/analysis/openai-account-login-fix/**`
 
 ## Incremental Validation Log
-1. `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "forward_openai_account_callback_uses_resolved_default_host_for_default_startup"` -> PASS
-2. Baseline deterministic repro script (pre-fix behavior) -> PASS (observed HTTP 502 as expected)
-3. `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "forward_openai_account_callback"` -> FAIL initially (log redaction gap), then PASS after fix
-4. `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "openai_account_callback_route"` -> PASS
-5. `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "parse_callback_forward_host_port"` -> PASS
-6. Post-fix deterministic repro script with bridge fallback patch -> PASS (observed HTTP 200)
-7. `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "forward_openai_account_callback or openai_account_callback_route or parse_callback_forward_host_port"` -> PASS
-8. Strategy revision validation: `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "forward_openai_account_callback"` -> PASS
-9. Strategy revision validation: `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "openai_account_callback_route or parse_callback_forward_host_port"` -> PASS
+1. `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "test_start_chat_uses_claude_agent_command_when_selected or test_ensure_project_setup_snapshot_builds_once"` -> PASS (`2 passed, 319 deselected`)
+2. `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "start_chat_uses_claude_agent_command_when_selected or start_chat_uses_gemini_agent_command_when_selected or ensure_project_setup_snapshot_builds_once or ensure_project_setup_snapshot_passes_git_identity_env_for_pat"` -> PASS (`4 passed, 317 deselected`)
+3. `/workspace/agent_hub_writable/.venv/bin/pytest -q tests/test_hub_and_cli.py -k "project_in_image and snapshot"` -> PASS (`3 passed, 318 deselected`)
 
 ## Remaining Risks
-- Unexpected network topologies beyond current bridge/default-route discovery may still require additional host candidates.
-- Environments that disallow `docker exec` rely on network fallback path.
+- Runtime identity remains anchored to hub runtime process identity (`os.getuid/os.getgid`) unless future configuration adds explicit overrides.

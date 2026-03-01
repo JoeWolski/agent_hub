@@ -7365,8 +7365,14 @@ class HubState:
             str(runtime_config_file),
             "--system-prompt-file",
             str(self.system_prompt_file),
+            "--local-uid",
+            str(self.local_uid),
+            "--local-gid",
+            str(self.local_gid),
             "--no-alt-screen",
         ]
+        if self.local_supp_gids:
+            cmd.extend(["--local-supplementary-gids", self.local_supp_gids])
         if not allocate_tty:
             cmd.append("--no-tty")
         if resume and agent_type == AGENT_TYPE_CODEX:

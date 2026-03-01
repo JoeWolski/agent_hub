@@ -1,4 +1,4 @@
-# Gates: OpenAI Account Login Fix
+# Gates: Runtime UID/GID Propagation
 
 - intake: PASS
 - design_review: PASS
