@@ -54,18 +54,6 @@ def _configure_git_auth_from_env() -> None:
     _run(["git", "config", "--global", "--add", f"url.{git_prefix}.insteadOf", f"ssh://git@{host_name}/"])
 
 
-def _configure_git_safe_directory_for_project() -> None:
-    raw_project_path = str(os.environ.get("CONTAINER_PROJECT_PATH") or "").strip()
-    if raw_project_path:
-        project_path = Path(raw_project_path)
-    else:
-        project_path = Path.cwd()
-    normalized = str(project_path if project_path.is_absolute() else project_path.resolve())
-    if not normalized:
-        return
-    _run(["git", "config", "--global", "--add", "safe.directory", normalized])
-
-
 def _ensure_workspace_tmp(*, workspace_tmp: Path | None = None) -> None:
     target = workspace_tmp or Path("/workspace/tmp")
     try:
@@ -225,7 +213,6 @@ def _entrypoint_main() -> None:
     _ensure_claude_native_command_path(command=command, home=os.environ["HOME"])
     _configure_git_auth_from_env()
     _configure_git_identity()
-    _configure_git_safe_directory_for_project()
     _ack_runtime_ready()
 
     os.execvp(command[0], command)
