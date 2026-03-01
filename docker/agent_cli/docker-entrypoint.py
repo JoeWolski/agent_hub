@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 from pathlib import Path
 import subprocess
 import sys
@@ -93,17 +94,71 @@ def _ensure_workspace_permissions() -> None:
         pass
 
 
-def _ensure_user_in_passwd() -> None:
+def _resolve_runtime_username(uid: int) -> str:
+    local_user = os.environ.get("LOCAL_USER", "").strip()
+    if local_user:
+        return local_user
+    try:
+        return pwd.getpwuid(int(uid)).pw_name
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError(
+            "Unable to resolve runtime username. Set LOCAL_USER to the host username "
+            f"for uid={uid}."
+        ) from exc
+
+
+def _ensure_user_in_passwd(*, username: str) -> None:
     uid = os.getuid()
     gid = os.getgid()
     if uid == 0:
         return
+
+    passwd_path = Path("/etc/passwd")
+    shadow_path = Path("/etc/shadow")
+
     try:
-        passwd_content = Path("/etc/passwd").read_text()
-        if f":x:{uid}:{gid}:" in passwd_content:
-            return
+        passwd_lines = passwd_path.read_text(encoding="utf-8").splitlines()
     except OSError:
-        pass
+        passwd_lines = []
+
+    entry_for_uid = ""
+    matched_username = False
+    updated_lines: list[str] = []
+    for line in passwd_lines:
+        parts = line.split(":")
+        if len(parts) < 7:
+            updated_lines.append(line)
+            continue
+        if parts[0] == username and parts[2] == str(uid):
+            matched_username = True
+            parts[3] = str(gid)
+            parts[4] = "Mapped Runtime User"
+            parts[5] = "/workspace"
+            parts[6] = "/bin/bash"
+            updated_lines.append(":".join(parts))
+            continue
+        if parts[2] == str(uid):
+            entry_for_uid = line
+            parts[0] = username
+            parts[3] = str(gid)
+            parts[4] = "Mapped Runtime User"
+            parts[5] = "/workspace"
+            parts[6] = "/bin/bash"
+            updated_lines.append(":".join(parts))
+            matched_username = True
+            continue
+        updated_lines.append(line)
+
+    if not matched_username:
+        if entry_for_uid:
+            return
+        updated_lines.append(f"{username}:x:{uid}:{gid}:Mapped Runtime User:/workspace:/bin/bash")
+
+    new_passwd = "\n".join(updated_lines).rstrip("\n") + "\n"
+    try:
+        passwd_path.write_text(new_passwd, encoding="utf-8")
+    except OSError:
+        return
 
 
 def _parse_non_negative_int(raw_value: str) -> int | None:
@@ -198,16 +253,29 @@ def _drop_privileges_to_runtime_identity() -> None:
     os.setuid(uid)
 
     try:
-        with Path("/etc/passwd").open("a") as f:
-            f.write(f"agentuser:x:{uid}:{gid}:Mapped Runtime User:/workspace:/bin/bash\n")
+        shadow_lines = shadow_path.read_text(encoding="utf-8").splitlines()
     except OSError:
-        pass
-
-    try:
-        with Path("/etc/shadow").open("a") as f:
-            f.write(f"agentuser::19888:0:99999:7:::\n")
-    except OSError:
-        pass
+        shadow_lines = []
+    else:
+        if shadow_lines:
+            updated_shadow: list[str] = []
+            saw_shadow_user = False
+            for line in shadow_lines:
+                parts = line.split(":")
+                if parts and parts[0] == username:
+                    if len(parts) < 9:
+                        parts.extend([""] * (9 - len(parts)))
+                    parts[1] = parts[1] or ""
+                    updated_shadow.append(":".join(parts))
+                    saw_shadow_user = True
+                else:
+                    updated_shadow.append(line)
+            if not saw_shadow_user:
+                updated_shadow.append(f"{username}::19888:0:99999:7:::")
+            try:
+                shadow_path.write_text("\n".join(updated_shadow).rstrip("\n") + "\n", encoding="utf-8")
+            except OSError:
+                pass
 
 
 def _ensure_claude_native_command_path(*, command: list[str], home: str, source_path: Path | None = None) -> None:
@@ -306,9 +374,12 @@ def _ack_runtime_ready() -> None:
 
 def _entrypoint_main() -> None:
     command = list(sys.argv[1:]) if sys.argv[1:] else ["codex"]
+    runtime_username = _resolve_runtime_username(os.getuid())
     local_home = os.environ.get("LOCAL_HOME", "").strip() or os.environ.get("HOME", "").strip() or "/tmp"
     if not os.environ.get("HOME"):
         os.environ["HOME"] = local_home
+    os.environ["USER"] = runtime_username
+    os.environ["LOGNAME"] = runtime_username
 
     if command and Path(command[0]).name == "claude":
         _ensure_claude_json_file(Path(os.environ["HOME"]) / ".claude.json")
@@ -316,7 +387,7 @@ def _entrypoint_main() -> None:
     _drop_privileges_to_runtime_identity()
     _ensure_workspace_tmp()
     _set_umask()
-    _ensure_user_in_passwd()
+    _ensure_user_in_passwd(username=runtime_username)
     _ensure_workspace_permissions()
     _ensure_claude_native_command_path(command=command, home=os.environ["HOME"])
     _configure_git_auth_from_env()

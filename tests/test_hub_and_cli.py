@@ -84,6 +84,7 @@ class HubStateTests(unittest.TestCase):
                 hub_server.GITHUB_APP_SLUG_ENV: "",
                 hub_server.GITHUB_APP_PRIVATE_KEY_ENV: "",
                 hub_server.GITHUB_APP_PRIVATE_KEY_FILE_ENV: "",
+                hub_server.AGENT_HUB_HOST_USER_ENV: "host-user",
             },
             clear=False,
         )
@@ -634,6 +635,7 @@ class HubStateTests(unittest.TestCase):
             local_gid=1007,
             local_supp_gids_csv="1007,2000",
             local_umask="0022",
+            local_user="host-user",
             host_codex_dir=Path("/host/codex"),
             config_file=Path("/host/agent.config.toml"),
         )
@@ -643,6 +645,7 @@ class HubStateTests(unittest.TestCase):
         self.assertIn(hub_server.TMP_DIR_TMPFS_SPEC, run_args)
         self.assertIn("/host/codex:/workspace/.codex", run_args)
         self.assertIn("/host/agent.config.toml:/workspace/.codex/config.toml", run_args)
+        self.assertIn("LOCAL_USER=host-user", run_args)
         self.assertIn("HOME=/workspace", run_args)
         self.assertIn("NPM_CONFIG_CACHE=/tmp/.npm", run_args)
         self.assertIn("CONTAINER_HOME=/workspace", run_args)
@@ -6953,6 +6956,20 @@ class AgentToolsCredentialResolveToolTests(unittest.TestCase):
 
 
 class CliEnvVarTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.local_user_patcher = patch.dict(
+            os.environ,
+            {
+                "LOCAL_USER": "host-user",
+                hub_server.AGENT_HUB_HOST_USER_ENV: "host-user",
+            },
+            clear=False,
+        )
+        self.local_user_patcher.start()
+
+    def tearDown(self) -> None:
+        self.local_user_patcher.stop()
+
     def test_agent_cli_default_base_image_uses_agent_cli_base(self) -> None:
         content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
 
@@ -10000,8 +10017,15 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         self.config = self.tmp_path / "agent.config.toml"
         self.config.write_text("model = 'test'\n", encoding="utf-8")
         self.runner = CliRunner()
+        self.host_user_patcher = patch.dict(
+            os.environ,
+            {hub_server.AGENT_HUB_HOST_USER_ENV: "host-user"},
+            clear=False,
+        )
+        self.host_user_patcher.start()
 
     def tearDown(self) -> None:
+        self.host_user_patcher.stop()
         self.tmp.cleanup()
 
     def _build_app(self):
@@ -10701,6 +10725,7 @@ class DockerEntrypointTests(unittest.TestCase):
             {
                 "HOME": "/tmp/entrypoint-home",
                 "LOCAL_UMASK": "0022",
+                "LOCAL_USER": "host-user",
             },
             clear=False,
         ), patch.object(module.sys, "argv", ["docker-entrypoint.py"]), patch.object(
@@ -10734,6 +10759,7 @@ class DockerEntrypointTests(unittest.TestCase):
                 "HOME": "",
                 "LOCAL_HOME": "/tmp/entrypoint-local-home",
                 "LOCAL_UMASK": "0022",
+                "LOCAL_USER": "host-user",
             },
             clear=False,
         ), patch.object(module.sys, "argv", ["docker-entrypoint.py", "bash", "-lc", "echo ok"]), patch.object(
@@ -10767,6 +10793,7 @@ class DockerEntrypointTests(unittest.TestCase):
             {
                 "HOME": "/tmp/entrypoint-home",
                 "LOCAL_UMASK": "0022",
+                "LOCAL_USER": "host-user",
             },
             clear=False,
         ), patch.object(module.sys, "argv", ["docker-entrypoint.py", "claude", "--help"]), patch.object(

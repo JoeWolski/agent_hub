@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import posixpath
 import re
 import shlex
@@ -125,6 +126,21 @@ def _resolved_runtime_colorterm(env: dict[str, str] | None = None) -> str:
     if not candidate:
         return DEFAULT_RUNTIME_COLORTERM
     return candidate
+
+
+def _resolve_local_username(explicit_user: str | None, uid: int) -> str:
+    user = str(explicit_user or "").strip()
+    if user:
+        return user
+    local_user_env = str(os.environ.get("LOCAL_USER", "")).strip()
+    if local_user_env:
+        return local_user_env
+    try:
+        return pwd.getpwuid(int(uid)).pw_name
+    except (KeyError, ValueError) as exc:
+        raise click.ClickException(
+            f"Unable to resolve host username for uid={uid}. Pass --local-user explicitly."
+        ) from exc
 
 
 def _toml_basic_string_literal(value: str) -> str:
@@ -1804,7 +1820,7 @@ def main(
         )
 
     uid = local_uid if local_uid is not None else os.getuid()
-    user = str(local_user or "").strip() or f"uid-{uid}"
+    user = _resolve_local_username(local_user, uid)
     if local_gid is not None:
         gid = local_gid
     elif local_group:
@@ -2021,6 +2037,8 @@ def main(
         ),
         "--env",
         f"LOCAL_UMASK={local_umask}",
+        "--env",
+        f"LOCAL_USER={user}",
         "--env",
         f"HOME={container_home_path}",
         "--env",
