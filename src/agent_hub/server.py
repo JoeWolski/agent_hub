@@ -3695,7 +3695,6 @@ class HubState:
         hub_host: str = DEFAULT_HOST,
         hub_port: int = DEFAULT_PORT,
         artifact_publish_base_url: str | None = None,
-        ui_lifecycle_debug: bool = False,
     ):
         self.local_uid = os.getuid()
         self.local_user = f"uid-{self.local_uid}"
@@ -3718,7 +3717,6 @@ class HubState:
             artifact_publish_base_url,
             self.hub_port,
         )
-        self.ui_lifecycle_debug = bool(ui_lifecycle_debug)
         self.state_file = self.data_dir / STATE_FILE_NAME
         self.agent_capabilities_cache_file = self.data_dir / AGENT_CAPABILITIES_CACHE_FILE_NAME
         self.project_dir = self.data_dir / "projects"
@@ -4515,11 +4513,6 @@ class HubState:
     def settings_payload(self) -> dict[str, Any]:
         state = self.load()
         return _normalize_hub_settings_payload(state.get("settings"))
-
-    def runtime_flags_payload(self) -> dict[str, Any]:
-        return {
-            "ui_lifecycle_debug": bool(self.ui_lifecycle_debug),
-        }
 
     def default_chat_agent_type(self) -> str:
         settings = self.settings_payload()
@@ -11096,7 +11089,7 @@ class HubState:
             chat_copy.pop("artifact_publish_token_issued_at", None)
             chat_copy.pop("agent_tools_token_hash", None)
             chat_copy.pop("agent_tools_token_issued_at", None)
-            chat_copy["create_request_id"] = _compact_whitespace(str(chat_copy.get("create_request_id") or "")).strip()
+            chat_copy.pop("create_request_id", None)
             running = _is_process_running(pid)
             normalized_status = _normalize_chat_status(chat_copy.get("status"))
             if running:
@@ -12124,12 +12117,6 @@ def _html_page() -> str:
     type=click.Choice(HUB_LOG_LEVEL_CHOICES, case_sensitive=False),
     help="Hub logging verbosity (applies to Agent Hub logs and Uvicorn).",
 )
-@click.option(
-    "--ui-lifecycle-debug/--no-ui-lifecycle-debug",
-    default=False,
-    show_default=True,
-    help="Enable verbose frontend lifecycle and redraw logging in the browser console.",
-)
 @click.option("--reload", is_flag=True, default=False)
 def main(
     data_dir: Path,
@@ -12141,7 +12128,6 @@ def main(
     frontend_build: bool,
     clean_start: bool,
     log_level: str,
-    ui_lifecycle_debug: bool,
     reload: bool,
 ) -> None:
     normalized_log_level = _normalize_log_level(log_level)
@@ -12162,7 +12148,6 @@ def main(
             hub_host=host,
             hub_port=port,
             artifact_publish_base_url=artifact_publish_base_url,
-            ui_lifecycle_debug=ui_lifecycle_debug,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -12258,10 +12243,6 @@ def main(
     @app.get("/api/settings")
     def api_settings() -> dict[str, Any]:
         return {"settings": state.settings_payload()}
-
-    @app.get("/api/runtime-flags")
-    def api_runtime_flags() -> dict[str, Any]:
-        return state.runtime_flags_payload()
 
     @app.patch("/api/settings")
     async def api_update_settings(request: Request) -> dict[str, Any]:
