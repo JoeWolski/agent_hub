@@ -1993,6 +1993,9 @@ Gemini CLI
             with patch("agent_hub.server._is_process_running", return_value=True), patch(
                 "agent_hub.server._discover_openai_callback_bridge_hosts",
                 return_value=([], {"bridge_hosts": []}),
+            ), patch(
+                "agent_hub.server._forward_openai_callback_via_container_loopback",
+                return_value=hub_server.OpenAICallbackContainerForwardResult(attempted=False),
             ):
                 result = self.state.forward_openai_account_callback("code=abc&state=xyz", path="/auth/callback")
             self.assertTrue(result["forwarded"])
@@ -2045,6 +2048,9 @@ Gemini CLI
         ), patch(
             "agent_hub.server._discover_openai_callback_bridge_hosts",
             return_value=([], {"bridge_hosts": []}),
+        ), patch(
+            "agent_hub.server._forward_openai_callback_via_container_loopback",
+            return_value=hub_server.OpenAICallbackContainerForwardResult(attempted=False),
         ):
             result = self.state.forward_openai_account_callback(
                 "code=abc&state=xyz",
@@ -2107,6 +2113,9 @@ Gemini CLI
         ), patch(
             "agent_hub.server._discover_openai_callback_bridge_hosts",
             return_value=([], {"bridge_hosts": []}),
+        ), patch(
+            "agent_hub.server._forward_openai_callback_via_container_loopback",
+            return_value=hub_server.OpenAICallbackContainerForwardResult(attempted=False),
         ), patch("agent_hub.server.socket.gethostbyname", return_value="172.17.0.1"):
             result = self.state.forward_openai_account_callback(
                 "code=abc&state=xyz",
@@ -2170,6 +2179,9 @@ Gemini CLI
         ), patch(
             "agent_hub.server._discover_openai_callback_bridge_hosts",
             return_value=([], {"bridge_hosts": []}),
+        ), patch(
+            "agent_hub.server._forward_openai_callback_via_container_loopback",
+            return_value=hub_server.OpenAICallbackContainerForwardResult(attempted=False),
         ), patch("agent_hub.server.socket.gethostbyname", return_value="172.17.0.1"):
             result = self.state.forward_openai_account_callback(
                 "code=abc&state=xyz",
@@ -2235,6 +2247,9 @@ Gemini CLI
         ), patch(
             "agent_hub.server._discover_openai_callback_bridge_hosts",
             return_value=(["172.17.0.1"], {"bridge_hosts": ["172.17.0.1"]}),
+        ), patch(
+            "agent_hub.server._forward_openai_callback_via_container_loopback",
+            return_value=hub_server.OpenAICallbackContainerForwardResult(attempted=False),
         ):
             result = self.state.forward_openai_account_callback(
                 "code=abc&state=xyz",
@@ -2280,6 +2295,9 @@ Gemini CLI
         ), patch(
             "agent_hub.server._discover_openai_callback_bridge_hosts",
             return_value=([], {"bridge_hosts": []}),
+        ), patch(
+            "agent_hub.server._forward_openai_callback_via_container_loopback",
+            return_value=hub_server.OpenAICallbackContainerForwardResult(attempted=False),
         ), self.assertLogs("agent_hub", level="INFO") as captured_logs:
             with self.assertRaises(HTTPException) as ctx:
                 self.state.forward_openai_account_callback(
@@ -2308,6 +2326,113 @@ Gemini CLI
         invalid_host, invalid_port = hub_server._parse_callback_forward_host_port("bad host:9999")
         self.assertEqual(invalid_host, "")
         self.assertIsNone(invalid_port)
+
+    def test_forward_openai_account_callback_uses_container_loopback_fallback_when_network_hosts_fail(self) -> None:
+        self.state._openai_login_session = hub_server.OpenAIAccountLoginSession(
+            id="session-container-loopback",
+            process=SimpleNamespace(pid=9997, poll=lambda: None),
+            container_name="container-loopback",
+            started_at="2026-02-21T00:00:00Z",
+            status="waiting_for_browser",
+            callback_port=1455,
+            callback_path="/auth/callback",
+        )
+
+        def fake_urlopen(_request: urllib.request.Request, timeout: float = 0.0):
+            del timeout
+            raise urllib.error.URLError(ConnectionRefusedError("refused"))
+
+        with patch("agent_hub.server._is_process_running", return_value=True), patch(
+            "agent_hub.server.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ) as urlopen_mock, patch(
+            "agent_hub.server.socket.gethostbyname",
+            side_effect=OSError("name not resolved"),
+        ), patch(
+            "agent_hub.server._discover_openai_callback_bridge_hosts",
+            return_value=([], {"bridge_hosts": []}),
+        ), patch(
+            "agent_hub.server._forward_openai_callback_via_container_loopback",
+            return_value=hub_server.OpenAICallbackContainerForwardResult(
+                attempted=True,
+                ok=True,
+                status_code=200,
+                response_body="ok",
+            ),
+        ) as container_forward:
+            result = self.state.forward_openai_account_callback(
+                "code=abc&state=xyz",
+                path="/auth/callback",
+                request_host="10.0.1.1",
+            )
+
+        self.assertTrue(result["forwarded"])
+        self.assertEqual(result["status_code"], 200)
+        self.assertEqual(result["target_origin"], "container://container-loopback/127.0.0.1:1455")
+        urlopen_mock.assert_not_called()
+        container_forward.assert_called_once_with(
+            "container-loopback",
+            callback_port=1455,
+            callback_path="/auth/callback",
+            query="code=abc&state=xyz",
+        )
+
+    def test_forward_openai_account_callback_falls_back_to_network_when_container_loopback_fails(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                del exc_type, exc, tb
+                return False
+
+            def getcode(self) -> int:
+                return 200
+
+            def read(self) -> bytes:
+                return b"ok"
+
+        self.state._openai_login_session = hub_server.OpenAIAccountLoginSession(
+            id="session-network-after-container-failure",
+            process=SimpleNamespace(pid=9998, poll=lambda: None),
+            container_name="container-network-after-failure",
+            started_at="2026-02-21T00:00:00Z",
+            status="waiting_for_browser",
+            callback_port=1455,
+            callback_path="/auth/callback",
+        )
+        attempted_urls: list[str] = []
+
+        def fake_urlopen(request: urllib.request.Request, timeout: float = 0.0):
+            del timeout
+            attempted_urls.append(str(request.full_url))
+            return FakeResponse()
+
+        with patch("agent_hub.server._is_process_running", return_value=True), patch(
+            "agent_hub.server.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ), patch(
+            "agent_hub.server._discover_openai_callback_bridge_hosts",
+            return_value=([], {"bridge_hosts": []}),
+        ), patch(
+            "agent_hub.server._forward_openai_callback_via_container_loopback",
+            return_value=hub_server.OpenAICallbackContainerForwardResult(
+                attempted=True,
+                ok=False,
+                error_class="container_exec_failed",
+                error_detail="exec failed",
+            ),
+        ):
+            result = self.state.forward_openai_account_callback(
+                "code=abc&state=xyz",
+                path="/auth/callback",
+                request_host="10.0.1.1",
+            )
+
+        self.assertTrue(result["forwarded"])
+        self.assertEqual(result["status_code"], 200)
+        self.assertEqual(result["target_origin"], "http://127.0.0.1:1455")
+        self.assertEqual(attempted_urls[0], "http://127.0.0.1:1455/auth/callback?code=abc&state=xyz")
 
     def test_parse_env_vars_rejects_openai_api_key(self) -> None:
         with self.assertRaises(HTTPException):

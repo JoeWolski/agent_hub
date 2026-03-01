@@ -487,6 +487,16 @@ class OpenAIAccountLoginSession:
 
 
 @dataclass
+class OpenAICallbackContainerForwardResult:
+    attempted: bool = False
+    ok: bool = False
+    status_code: int = 0
+    response_body: str = ""
+    error_class: str = ""
+    error_detail: str = ""
+
+
+@dataclass
 class AutoConfigRequestState:
     request_id: str
     process: subprocess.Popen[str] | None = None
@@ -3589,6 +3599,123 @@ def _classify_openai_callback_forward_error(exc: BaseException) -> str:
             return "connection_refused"
         return "os_error"
     return "unknown_transport_error"
+
+
+def _forward_openai_callback_via_container_loopback(
+    container_name: str,
+    callback_port: int,
+    callback_path: str,
+    query: str,
+) -> OpenAICallbackContainerForwardResult:
+    if not container_name:
+        return OpenAICallbackContainerForwardResult(attempted=False)
+    if shutil.which("docker") is None:
+        return OpenAICallbackContainerForwardResult(
+            attempted=False,
+            error_class="docker_unavailable",
+            error_detail="docker command not found",
+        )
+
+    script = (
+        "import json, os, urllib.error, urllib.request\n"
+        "port = int(os.environ.get('AGENT_HUB_CALLBACK_PORT', '1455'))\n"
+        "path = os.environ.get('AGENT_HUB_CALLBACK_PATH', '/auth/callback')\n"
+        "query = os.environ.get('AGENT_HUB_CALLBACK_QUERY', '')\n"
+        "timeout = max(0.5, float(os.environ.get('AGENT_HUB_CALLBACK_TIMEOUT', '8.0')))\n"
+        "url = f'http://127.0.0.1:{port}{path}'\n"
+        "if query:\n"
+        "    url = f'{url}?{query}'\n"
+        "status = 0\n"
+        "body = ''\n"
+        "try:\n"
+        "    with urllib.request.urlopen(url, timeout=timeout) as response:\n"
+        "        status = int(response.getcode() or 0)\n"
+        "        body = response.read().decode('utf-8', errors='ignore')\n"
+        "except urllib.error.HTTPError as exc:\n"
+        "    status = int(exc.code or 0)\n"
+        "    body = exc.read().decode('utf-8', errors='ignore')\n"
+        "print(json.dumps({'status_code': status, 'body': body}))\n"
+    )
+    cmd = [
+        "docker",
+        "exec",
+        "--env",
+        f"AGENT_HUB_CALLBACK_PORT={int(callback_port)}",
+        "--env",
+        f"AGENT_HUB_CALLBACK_PATH={callback_path}",
+        "--env",
+        f"AGENT_HUB_CALLBACK_QUERY={query}",
+        "--env",
+        f"AGENT_HUB_CALLBACK_TIMEOUT={OPENAI_ACCOUNT_CALLBACK_FORWARD_TIMEOUT_SECONDS}",
+        container_name,
+        "python3",
+        "-c",
+        script,
+    ]
+    try:
+        process = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(2.0, OPENAI_ACCOUNT_CALLBACK_FORWARD_TIMEOUT_SECONDS + 2.0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return OpenAICallbackContainerForwardResult(
+            attempted=True,
+            error_class="container_exec_timeout",
+            error_detail=f"{type(exc).__name__}: {exc}",
+        )
+    except OSError as exc:
+        return OpenAICallbackContainerForwardResult(
+            attempted=True,
+            error_class="container_exec_os_error",
+            error_detail=f"{type(exc).__name__}: {exc}",
+        )
+
+    if process.returncode != 0:
+        stderr = str(process.stderr or "").strip()
+        if "executable file not found" in stderr.lower() and "python3" in stderr.lower():
+            return OpenAICallbackContainerForwardResult(
+                attempted=True,
+                error_class="container_python_missing",
+                error_detail=stderr[:220],
+            )
+        return OpenAICallbackContainerForwardResult(
+            attempted=True,
+            error_class="container_exec_failed",
+            error_detail=stderr[:220],
+        )
+
+    stdout = str(process.stdout or "").strip()
+    if not stdout:
+        return OpenAICallbackContainerForwardResult(
+            attempted=True,
+            error_class="container_exec_empty_output",
+            error_detail="empty stdout",
+        )
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        return OpenAICallbackContainerForwardResult(
+            attempted=True,
+            error_class="container_exec_invalid_output",
+            error_detail=f"{type(exc).__name__}: {exc}",
+        )
+    if not isinstance(payload, dict):
+        return OpenAICallbackContainerForwardResult(
+            attempted=True,
+            error_class="container_exec_invalid_output",
+            error_detail="stdout payload is not object",
+        )
+    status_code = int(payload.get("status_code") or 0)
+    response_body = str(payload.get("body") or "")
+    return OpenAICallbackContainerForwardResult(
+        attempted=True,
+        ok=True,
+        status_code=status_code,
+        response_body=response_body,
+    )
 
 
 def _host_port_netloc(host: str, port: int) -> str:
@@ -8482,7 +8609,65 @@ class HubState:
         target_origin = ""
         last_exc: BaseException | None = None
         failure_categories: list[str] = []
+        forwarded_successfully = False
+
+        LOGGER.info(
+            (
+                "OpenAI callback forward attempting container loopback primary "
+                "session_id=%s container=%s target=http://127.0.0.1:%s%s"
+            ),
+            session.id,
+            session.container_name,
+            callback_port,
+            callback_path,
+        )
+        container_fallback = _forward_openai_callback_via_container_loopback(
+            session.container_name,
+            callback_port=callback_port,
+            callback_path=callback_path,
+            query=query,
+        )
+        if container_fallback.ok:
+            status_code = int(container_fallback.status_code or 0)
+            response_body = container_fallback.response_body
+            target_origin = f"container://{session.container_name}/127.0.0.1:{callback_port}"
+            forwarded_successfully = True
+            LOGGER.info(
+                (
+                    "OpenAI callback forward container loopback response session_id=%s "
+                    "container=%s status=%s error_class=none"
+                ),
+                session.id,
+                session.container_name,
+                status_code,
+            )
+        elif container_fallback.attempted:
+            error_class = str(container_fallback.error_class or "container_exec_failed")
+            failure_categories.append(error_class)
+            LOGGER.warning(
+                (
+                    "OpenAI callback forward container loopback error session_id=%s "
+                    "container=%s error_class=%s detail=%s"
+                ),
+                session.id,
+                session.container_name,
+                error_class,
+                container_fallback.error_detail,
+            )
+        else:
+            LOGGER.info(
+                (
+                    "OpenAI callback forward container loopback skipped "
+                    "session_id=%s container=%s reason=%s"
+                ),
+                session.id,
+                session.container_name,
+                container_fallback.error_class or "not_attempted",
+            )
+
         for candidate_host in candidate_hosts:
+            if forwarded_successfully:
+                break
             target_url = urllib.parse.urlunparse(
                 ("http", _host_port_netloc(candidate_host, callback_port), callback_path, "", query, "")
             )
@@ -8505,6 +8690,7 @@ class HubState:
                     redacted_target_url,
                     status_code,
                 )
+                forwarded_successfully = True
                 break
             except urllib.error.HTTPError as exc:
                 status_code = int(exc.code or 0)
@@ -8519,6 +8705,7 @@ class HubState:
                     redacted_target_url,
                     status_code,
                 )
+                forwarded_successfully = True
                 break
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_exc = exc
@@ -8536,8 +8723,11 @@ class HubState:
                     str(exc),
                 )
                 continue
-        else:
+
+        if not forwarded_successfully:
             attempted = ", ".join(f"http://{_host_port_netloc(host, callback_port)}" for host in candidate_hosts)
+            if session.container_name:
+                attempted = f"{attempted}, container://{session.container_name}/127.0.0.1:{callback_port}"
             failure_reason = "all_upstream_targets_failed"
             if failure_categories:
                 failure_reason = "+".join(sorted(set(failure_categories)))
