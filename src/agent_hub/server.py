@@ -44,6 +44,9 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile, WebSocket, WebS
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from agent_core import ConfigError, load_agent_runtime_config
+from agent_core import shared as core_shared
+
 
 STATE_FILE_NAME = "state.json"
 AGENT_CAPABILITIES_CACHE_FILE_NAME = "agent_capabilities_cache.json"
@@ -2052,18 +2055,13 @@ def _normalize_github_installation_id(raw_value: Any) -> int:
 
 
 def _split_host_port(host: str) -> tuple[str, int | None]:
-    candidate = str(host or "").strip().lower()
-    if not candidate:
-        return "", None
-    if ":" not in candidate:
-        return candidate, None
-    hostname, port_text = candidate.rsplit(":", 1)
-    if not hostname or not port_text.isdigit():
-        raise HTTPException(status_code=400, detail=f"Invalid host: {host}")
-    port_value = int(port_text)
-    if port_value <= 0 or port_value > 65535:
-        raise HTTPException(status_code=400, detail=f"Invalid host: {host}")
-    return hostname, port_value
+    try:
+        return core_shared.split_host_port(
+            host,
+            error_factory=lambda _message: HTTPException(status_code=400, detail=f"Invalid host: {host}"),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid host: {host}") from exc
 
 
 def _normalize_github_credential_scheme(raw_value: Any, field_name: str = "scheme") -> str:
@@ -3864,10 +3862,7 @@ def _default_supplementary_gids() -> str:
 
 
 def _normalize_csv(value: str | None) -> str:
-    if value is None:
-        return ""
-    values = [part.strip() for part in value.split(",") if part.strip()]
-    return ",".join(values)
+    return core_shared.normalize_csv(value)
 
 
 def _parse_non_negative_int_env(var_name: str, fallback: int) -> int:
@@ -3910,20 +3905,11 @@ def _resolve_hub_runtime_identity() -> tuple[int, int, str]:
 
 
 def _parse_gid_csv(value: str) -> list[int]:
-    gids: list[int] = []
-    seen: set[int] = set()
-    for raw in value.split(","):
-        token = raw.strip()
-        if not token:
-            continue
-        if not token.isdigit():
-            continue
-        gid = int(token, 10)
-        if gid in seen:
-            continue
-        gids.append(gid)
-        seen.add(gid)
-    return gids
+    return core_shared.parse_gid_csv(
+        value,
+        strict=False,
+        error_factory=lambda message: RuntimeError(message),
+    )
 
 
 def _read_codex_auth(path: Path) -> tuple[bool, str]:
@@ -12940,6 +12926,10 @@ def main(
         raise click.ClickException(f"Missing config file: {config_file}")
     if _default_system_prompt_file() and not Path(system_prompt_file).exists():
         raise click.ClickException(f"Missing system prompt file: {system_prompt_file}")
+    try:
+        load_agent_runtime_config(config_file)
+    except ConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
     if frontend_build:
         _ensure_frontend_built(data_dir)
 

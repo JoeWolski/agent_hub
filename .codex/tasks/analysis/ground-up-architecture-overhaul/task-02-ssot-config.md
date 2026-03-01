@@ -57,15 +57,18 @@ uv run pytest tests/test_hub_and_cli.py -k "prepare_chat_runtime_config" -q
 - [ ] Invalid config fails startup deterministically.
 
 ## Status
-Status: TODO
+Status: IN_PROGRESS
 
 ## Execution Log
 ```text
-command: pending
-result: pending
-notes: pending
+command: uv run pytest tests/test_agent_core_config.py -q
+result: 4 passed in 0.02s
+notes: typed config schema/loader foundation validated
+
+command: uv run pytest tests/test_hub_and_cli.py -k "config or settings_payload" -q
+result: 49 passed, 280 deselected
+notes: startup/config payload behavior stable after fail-fast parse hooks
 ```
 
 ## Remaining Risks
 - Backward compatibility pressure from legacy env-based flows.
-

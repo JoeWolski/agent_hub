@@ -26,6 +26,8 @@ from typing import Any, Iterable, Iterator, Tuple
 import click
 
 from agent_cli import providers as agent_providers
+from agent_core import ConfigError, load_agent_runtime_config
+from agent_core import shared as core_shared
 
 
 DEFAULT_AGENT_CLI_BASE_DOCKERFILE = "docker/agent_cli/Dockerfile.base"
@@ -248,34 +250,15 @@ def _sync_gemini_shared_context_file(*, host_gemini_dir: Path, shared_prompt_con
 
 
 def _repo_root() -> Path:
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "pyproject.toml").exists():
-            return parent
-    return Path(__file__).resolve().parent.parent.parent
+    return core_shared.repo_root(Path(__file__))
 
 
 def _default_config_file() -> Path:
-    config_file = _repo_root() / "config" / "agent.config.toml"
-    if config_file.exists():
-        return config_file
-
-    fallback = Path.cwd() / "config" / "agent.config.toml"
-    if fallback.exists():
-        return fallback
-
-    return config_file
+    return core_shared.default_config_file(_repo_root(), cwd=Path.cwd())
 
 
 def _default_system_prompt_file() -> Path:
-    prompt_file = _repo_root() / SYSTEM_PROMPT_FILE_NAME
-    if prompt_file.exists():
-        return prompt_file
-
-    fallback = Path.cwd() / SYSTEM_PROMPT_FILE_NAME
-    if fallback.exists():
-        return fallback
-
-    return prompt_file
+    return core_shared.default_system_prompt_file(_repo_root(), SYSTEM_PROMPT_FILE_NAME, cwd=Path.cwd())
 
 
 def _default_credentials_file() -> Path:
@@ -291,18 +274,10 @@ def _default_agent_hub_git_credentials_dir() -> Path:
 
 
 def _split_host_port(host: str) -> tuple[str, int | None]:
-    candidate = str(host or "").strip().lower()
-    if not candidate:
-        return "", None
-    if ":" not in candidate:
-        return candidate, None
-    hostname, port_text = candidate.rsplit(":", 1)
-    if not hostname or not port_text.isdigit():
-        raise click.ClickException(f"Invalid git credential host: {host}")
-    port = int(port_text)
-    if port <= 0 or port > 65535:
-        raise click.ClickException(f"Invalid git credential host: {host}")
-    return hostname, port
+    return core_shared.split_host_port(
+        host,
+        error_factory=lambda message: click.ClickException(message),
+    )
 
 
 def _normalize_git_credential_scheme(raw_value: str) -> str:
@@ -916,13 +891,7 @@ def _run(cmd: Iterable[str], cwd: Path | None = None) -> None:
 
 
 def _docker_image_exists(tag: str) -> bool:
-    result = subprocess.run(
-        ["docker", "image", "inspect", tag],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    return result.returncode == 0
+    return core_shared.docker_image_exists(tag)
 
 
 def _docker_rm_force(container_name: str) -> None:
@@ -935,27 +904,15 @@ def _docker_rm_force(container_name: str) -> None:
 
 
 def _normalize_csv(value: str | None) -> str:
-    if value is None:
-        return ""
-    values = [part.strip() for part in value.split(",") if part.strip()]
-    return ",".join(values)
+    return core_shared.normalize_csv(value)
 
 
 def _parse_gid_csv(value: str) -> list[int]:
-    gids: list[int] = []
-    seen: set[int] = set()
-    for raw in value.split(","):
-        token = raw.strip()
-        if not token:
-            continue
-        if not token.isdigit():
-            raise click.ClickException(f"Invalid supplemental GID: {token!r}")
-        gid = int(token, 10)
-        if gid in seen:
-            continue
-        gids.append(gid)
-        seen.add(gid)
-    return gids
+    return core_shared.parse_gid_csv(
+        value,
+        strict=True,
+        error_factory=lambda message: click.ClickException(message),
+    )
 
 
 def _group_names_to_gid_csv(value: str | None) -> str:
@@ -1795,6 +1752,10 @@ def main(
             raise click.ClickException(f"Agent config file does not exist: {config_path}")
     if not config_path.is_file():
         raise click.ClickException(f"Agent config file does not exist: {config_path}")
+    try:
+        load_agent_runtime_config(config_path)
+    except ConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
     _validate_daemon_visible_mount_source(config_path, label="--config-file")
 
     system_prompt_path = _to_absolute(system_prompt_file, cwd)
