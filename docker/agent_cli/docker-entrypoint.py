@@ -44,7 +44,7 @@ def _configure_git_auth_from_env() -> None:
     username = os.environ.get("GITHUB_ACTOR", "").strip() or "x-access-token"
     encoded_username = urllib.parse.quote(username, safe="")
     encoded_token = urllib.parse.quote(github_token, safe="")
-    credential_file = Path("/tmp/agent_hub_git_credentials")
+    credential_file = Path("/workspace/tmp/agent_hub_git_credentials")
     credential_file.write_text(f"{scheme}://{encoded_username}:{encoded_token}@{host}\n", encoding="utf-8")
     os.chmod(credential_file, 0o600)
 
@@ -385,7 +385,7 @@ def _ack_runtime_ready() -> None:
 def _entrypoint_main() -> None:
     command = list(sys.argv[1:]) if sys.argv[1:] else ["codex"]
     runtime_username = _resolve_runtime_username(os.getuid())
-    local_home = os.environ.get("LOCAL_HOME", "").strip() or os.environ.get("HOME", "").strip() or "/tmp"
+    local_home = os.environ.get("LOCAL_HOME", "").strip() or os.environ.get("HOME", "").strip() or "/workspace/tmp/home"
     if not os.environ.get("HOME"):
         os.environ["HOME"] = local_home
     os.environ["USER"] = runtime_username

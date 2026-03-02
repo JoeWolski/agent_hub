@@ -31,6 +31,7 @@ DOCKER_ENTRYPOINT = ROOT / "docker" / "agent_cli" / "docker-entrypoint.py"
 AGENT_CLI_DOCKERFILE = ROOT / "docker" / "agent_cli" / "Dockerfile"
 AGENT_CLI_BASE_DOCKERFILE = ROOT / "docker" / "agent_cli" / "Dockerfile.base"
 AGENT_HUB_DOCKERFILE = ROOT / "docker" / "agent_hub" / "Dockerfile"
+AGENT_HUB_RUN_SCRIPT = ROOT / "docker" / "agent_hub" / "run-agent-hub.sh"
 DEVELOPMENT_DOCKERFILE = ROOT / "docker" / "development" / "Dockerfile"
 DEVELOPMENT_VERIFY_SCRIPT = ROOT / "docker" / "development" / "verify-demo-tooling.sh"
 if str(SRC) not in sys.path:
@@ -39,6 +40,11 @@ if str(SRC) not in sys.path:
 import agent_hub.server as hub_server
 import agent_hub.agent_tools_mcp as agent_tools_mcp
 import agent_cli.cli as image_cli
+from agent_cli.services import SnapshotService
+from agent_core import identity as core_identity
+from agent_core.errors import IdentityError
+from agent_core.errors import RuntimeCommandError
+from agent_core import launch as core_launch
 
 
 TEST_GITHUB_INSTALLATION_ID = 424242
@@ -76,7 +82,7 @@ class HubStateTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self.tmp.name)
         self.config_file = self.tmp_path / "config.toml"
-        self.config_file.write_text("model = 'test'\n", encoding="utf-8")
+        self.config_file.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
         self.github_env_patcher = patch.dict(
             os.environ,
             {
@@ -136,6 +142,49 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(override_state.local_gid, 4343)
         self.assertEqual(override_state.local_supp_gids, "4343,5000,5001")
 
+    def test_agent_hub_data_dir_default_uses_local_share_agent_hub(self) -> None:
+        home_dir = self.tmp_path / "custom-home"
+        with patch("agent_hub.server.Path.home", return_value=home_dir):
+            default_data_dir = hub_server._default_data_dir()
+        self.assertEqual(default_data_dir, home_dir / ".local" / "share" / "agent_hub")
+
+    def test_agent_hub_data_dir_uses_canonical_path_when_legacy_has_state(self) -> None:
+        home_dir = self.tmp_path / "custom-home-legacy"
+        default_dir = home_dir / ".local" / "share" / "agent_hub"
+        legacy_dir = home_dir / ".local" / "share" / "agent-hub"
+        default_dir.mkdir(parents=True, exist_ok=True)
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        (legacy_dir / hub_server.STATE_FILE_NAME).write_text("{}", encoding="utf-8")
+        with patch("agent_hub.server.Path.home", return_value=home_dir):
+            selected = hub_server._default_data_dir()
+        self.assertEqual(selected, default_dir)
+
+    def test_host_agent_home_defaults_under_data_dir(self) -> None:
+        expected = (self.state.data_dir / "agent-home" / self.state.local_user).resolve()
+        self.assertEqual(self.state.host_agent_home, expected)
+
+    def test_run_agent_hub_default_shared_root_path(self) -> None:
+        content = AGENT_HUB_RUN_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("AGENT_HUB_SHARED_ROOT:-/workspace/tmp/agent_hub_shared", content)
+
+    def test_github_app_jwt_signing_uses_hub_secrets_temp_root(self) -> None:
+        with patch("agent_hub.server._github_app_jwt", return_value="jwt-test-token") as jwt_mock, patch(
+            "agent_hub.server.urllib.request.urlopen",
+            side_effect=urllib.error.HTTPError(
+                url="https://api.github.com/app/installations",
+                code=401,
+                msg="Unauthorized",
+                hdrs=None,
+                fp=io.BytesIO(b'{"message":"bad credentials"}'),
+            ),
+        ):
+            with self.assertRaises(HTTPException):
+                self.state._github_api_request("GET", "/app/installations")
+
+        self.assertEqual(jwt_mock.call_count, 1)
+        args = jwt_mock.call_args.args
+        self.assertEqual(args[1], self.state.secrets_dir / "tmp")
+
     def test_hub_state_rejects_invalid_host_uid_override(self) -> None:
         with patch.dict(
             os.environ,
@@ -159,6 +208,150 @@ class HubStateTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "must be set together"):
                 hub_server.HubState(self.tmp_path / "hub-invalid-partial", self.config_file)
+
+    def test_hub_state_with_runtime_config_ignores_host_identity_env_overrides(self) -> None:
+        config_file = self.tmp_path / "identity-canonical.config.toml"
+        config_file.write_text(
+            (
+                "[identity]\nuid = 5010\ngid = 5020\nusername = 'config-user'\n\n"
+                "[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n"
+            ),
+            encoding="utf-8",
+        )
+        runtime_config = hub_server.load_agent_runtime_config(config_file)
+        with patch.dict(
+            os.environ,
+            {
+                hub_server.AGENT_HUB_HOST_UID_ENV: "6010",
+                hub_server.AGENT_HUB_HOST_GID_ENV: "6020",
+                hub_server.AGENT_HUB_HOST_USER_ENV: "env-user",
+                hub_server.AGENT_HUB_HOST_SUPP_GIDS_ENV: "6020,7001",
+            },
+            clear=False,
+        ):
+            state = hub_server.HubState(
+                self.tmp_path / "hub-config-priority",
+                config_file,
+                runtime_config=runtime_config,
+            )
+
+        self.assertEqual(state.local_uid, 5010)
+        self.assertEqual(state.local_gid, 5020)
+        self.assertEqual(state.local_user, "config-user")
+
+    def test_hub_state_rejects_runtime_config_with_strict_mode_disabled(self) -> None:
+        config_file = self.tmp_path / "strict-mode-disabled.config.toml"
+        config_file.write_text(
+            (
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nstrict_mode = false\n"
+            ),
+            encoding="utf-8",
+        )
+        runtime_config = hub_server.load_agent_runtime_config(config_file)
+
+        with self.assertRaisesRegex(hub_server.ConfigError, "runtime.strict_mode=true"):
+            hub_server.HubState(self.tmp_path / "hub-strict-disabled", config_file, runtime_config=runtime_config)
+
+    def test_runtime_identity_with_config_uid_gid_preserves_env_supplementary_gids(self) -> None:
+        config_file = self.tmp_path / "identity.config.toml"
+        config_file.write_text(
+            (
+                "[identity]\n"
+                "uid = 1234\n"
+                "gid = 2345\n\n"
+                "[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n"
+            ),
+            encoding="utf-8",
+        )
+        runtime_config = hub_server.load_agent_runtime_config(config_file)
+        with patch.dict(
+            os.environ,
+            {
+                hub_server.AGENT_HUB_HOST_SUPP_GIDS_ENV: "2345,3000,3001",
+            },
+            clear=False,
+        ):
+            uid, gid, supplementary = hub_server._resolve_hub_runtime_identity(
+                runtime_config,
+                hub_server._runtime_identity_env_overrides(),
+            )
+
+        self.assertEqual(uid, 1234)
+        self.assertEqual(gid, 2345)
+        self.assertEqual(supplementary, "2345,3000,3001")
+
+    def test_resolve_hub_runtime_identity_delegates_to_core_resolver(self) -> None:
+        expected = core_identity.RuntimeIdentity(
+            username="ignored",
+            uid=1234,
+            gid=2345,
+            supplementary_gids="3000,3001",
+        )
+        with patch("agent_hub.server.core_identity.resolve_runtime_identity", return_value=expected) as resolve_mock:
+            uid, gid, supplementary = hub_server._resolve_hub_runtime_identity()
+
+        self.assertEqual(uid, 1234)
+        self.assertEqual(gid, 2345)
+        self.assertEqual(supplementary, "3000,3001")
+        resolve_mock.assert_called_once()
+
+    def test_runtime_identity_with_config_partial_uid_gid_is_rejected(self) -> None:
+        config_file = self.tmp_path / "identity-partial.config.toml"
+        config_file.write_text(
+            (
+                "[identity]\nuid = 1234\n\n"
+                "[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n"
+            ),
+            encoding="utf-8",
+        )
+        runtime_config = hub_server.load_agent_runtime_config(config_file)
+        with self.assertRaisesRegex(RuntimeError, "identity.uid and identity.gid must be set together"):
+            hub_server._resolve_hub_runtime_identity(runtime_config)
+
+    def test_resolve_hub_runtime_username_prefers_config_identity_username(self) -> None:
+        config_file = self.tmp_path / "identity-user.config.toml"
+        config_file.write_text(
+            (
+                "[identity]\nusername = 'config-user'\n\n"
+                "[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n"
+            ),
+            encoding="utf-8",
+        )
+        runtime_config = hub_server.load_agent_runtime_config(config_file)
+        self.assertEqual(
+            hub_server._resolve_hub_runtime_username(
+                1234,
+                runtime_config,
+                hub_server._runtime_identity_env_overrides(),
+            ),
+            "config-user",
+        )
+
+    def test_parse_gid_csv_rejects_invalid_tokens(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "Invalid supplemental GID"):
+            hub_server._parse_gid_csv("1000,invalid-token")
+
+    def test_hub_state_rejects_non_docker_effective_runtime_mode(self) -> None:
+        config_file = self.tmp_path / "native.config.toml"
+        config_file.write_text(
+            (
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nrun_mode = 'native'\n"
+            ),
+            encoding="utf-8",
+        )
+        runtime_config = hub_server.load_agent_runtime_config(config_file)
+        with self.assertRaisesRegex(hub_server.ConfigError, "effective docker runtime mode"):
+            hub_server.HubState(
+                self.tmp_path / "hub-native-run-mode",
+                config_file,
+                runtime_config=runtime_config,
+            )
 
     def test_hub_state_uses_shared_root_owner_when_host_identity_env_not_set(self) -> None:
         shared_root = self.tmp_path / "shared-root"
@@ -467,6 +660,26 @@ class HubStateTests(unittest.TestCase):
         updated = next(item for item in updated_payload["projects"] if item["id"] == project["id"])
         self.assertTrue(updated["has_build_log"])
 
+    def test_load_renames_corrupt_json_state_and_fails(self) -> None:
+        self.state.state_file.write_text("{invalid-json", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "State file is corrupt JSON"):
+            self.state.load()
+
+        self.assertFalse(self.state.state_file.exists())
+        preserved = list(self.state.data_dir.glob(f"{hub_server.STATE_FILE_NAME}.corrupt-*"))
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved[0].read_text(encoding="utf-8"), "{invalid-json")
+
+    def test_load_renames_non_object_json_state_and_fails(self) -> None:
+        self.state.state_file.write_text(json.dumps(["bad", "state"]), encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "must contain a JSON object"):
+            self.state.load()
+
+        self.assertFalse(self.state.state_file.exists())
+        preserved = list(self.state.data_dir.glob(f"{hub_server.STATE_FILE_NAME}.corrupt-*"))
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved[0].read_text(encoding="utf-8"), json.dumps(["bad", "state"]))
+
     def test_settings_persist_and_are_exposed(self) -> None:
         initial_settings = self.state.settings_payload()
         self.assertEqual(initial_settings["default_agent_type"], hub_server.DEFAULT_CHAT_AGENT_TYPE)
@@ -521,6 +734,34 @@ class HubStateTests(unittest.TestCase):
             self.state.update_settings({"git_user_name": "Agent User"})
         self.assertEqual(exc.exception.status_code, 400)
         self.assertIn("must both be set or both be empty", str(exc.exception.detail))
+
+    def test_settings_reject_invalid_default_agent_type(self) -> None:
+        with self.assertRaises(HTTPException) as exc:
+            self.state.update_settings({"default_agent_type": "invalid-agent"})
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("agent_type must be one of", str(exc.exception.detail))
+
+    def test_settings_reject_git_identity_control_chars(self) -> None:
+        with self.assertRaises(HTTPException) as exc:
+            self.state.update_settings(
+                {
+                    "git_user_name": "bad\nname",
+                    "git_user_email": "agent@example.com",
+                }
+            )
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("must not contain control characters", str(exc.exception.detail))
+
+    def test_settings_reject_git_identity_overflow(self) -> None:
+        with self.assertRaises(HTTPException) as exc:
+            self.state.update_settings(
+                {
+                    "git_user_name": "x" * 257,
+                    "git_user_email": "agent@example.com",
+                }
+            )
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("must be 256 characters or fewer", str(exc.exception.detail))
 
     def test_auto_config_analysis_model_prefers_explicit_model(self) -> None:
         self.assertEqual(
@@ -583,19 +824,25 @@ class HubStateTests(unittest.TestCase):
     def test_ensure_agent_capability_runtime_image_uses_default_runtime_tag(self) -> None:
         expected_runtime_image = "agent-ubuntu2204-gemini:latest"
         with patch(
-            "agent_hub.server.agent_cli_image._default_runtime_image_for_provider",
+            "agent_hub.server._default_runtime_image_for_provider",
             return_value=expected_runtime_image,
         ) as default_runtime_image, patch(
-            "agent_hub.server.agent_cli_image._ensure_runtime_image_built_if_missing",
+            "agent_hub.server._ensure_runtime_image_built_if_missing",
         ) as ensure_runtime_image:
             runtime_image = hub_server._ensure_agent_capability_runtime_image(hub_server.AGENT_TYPE_GEMINI)
         self.assertEqual(runtime_image, expected_runtime_image)
         default_runtime_image.assert_called_once_with(hub_server.AGENT_TYPE_GEMINI)
         ensure_runtime_image.assert_called_once_with(
-            base_image=hub_server.agent_cli_image.DEFAULT_BASE_IMAGE,
+            base_image=hub_server.AGENT_CLI_BASE_IMAGE,
             target_image="agent-ubuntu2204-gemini:latest",
             agent_provider=hub_server.AGENT_TYPE_GEMINI,
         )
+
+    def test_ensure_agent_capability_runtime_image_rejects_unsupported_provider(self) -> None:
+        with self.assertRaises(HTTPException) as exc:
+            hub_server._ensure_agent_capability_runtime_image("unsupported-provider")
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("agent_type must be one of", str(exc.exception.detail))
 
     def test_run_agent_capability_probe_executes_inside_runtime_container(self) -> None:
         runtime_image = "agent-hub-capability-claude-test"
@@ -804,13 +1051,6 @@ Gemini CLI
             calls,
             [
                 ["codex", "--help"],
-                [
-                    "codex",
-                    "exec",
-                    "-c",
-                    'model_reasoning_effort="__agent_hub_invalid_reasoning__"',
-                    "capability-probe",
-                ],
                 ["claude", "--help"],
                 ["gemini", "--help"],
             ],
@@ -1095,7 +1335,7 @@ Gemini CLI
             hub_server.AGENT_CAPABILITY_DEFAULT_REASONING_BY_TYPE[hub_server.AGENT_TYPE_CODEX],
         )
 
-    def test_agent_capabilities_discovery_preserves_codex_docs_error_when_reasoning_fallback_succeeds(self) -> None:
+    def test_agent_capabilities_discovery_does_not_use_codex_docs_or_reasoning_fallback(self) -> None:
         def fake_probe(
             cmd: list[str],
             _timeout: float,
@@ -1103,14 +1343,6 @@ Gemini CLI
         ) -> tuple[int, str]:
             if cmd == ["codex", "--help"]:
                 return 0, "Codex CLI"
-            if cmd == list(hub_server.AGENT_CAPABILITY_CODEX_REASONING_FALLBACK_COMMAND):
-                return (
-                    1,
-                    (
-                        "Error loading config.toml: expected one of `none`, `minimal`, `low`, `medium`, `high`, "
-                        "`xhigh` in `model_reasoning_effort`"
-                    ),
-                )
             if cmd == ["claude", "--help"]:
                 return 127, ""
             if cmd == ["gemini", "--help"]:
@@ -1137,9 +1369,9 @@ Gemini CLI
         )
         self.assertEqual(
             codex["reasoning_modes"],
-            ["default", "minimal", "low", "medium", "high", "xhigh"],
+            ["default"],
         )
-        self.assertIn("failed to fetch codex docs", codex["last_error"])
+        self.assertEqual(codex["last_error"], "")
 
     def test_openai_credentials_round_trip_status(self) -> None:
         initial = self.state.openai_auth_status()
@@ -1926,6 +2158,12 @@ Gemini CLI
         self.assertEqual(callback_path, "/auth/callback")
         self.assertTrue(local_url.startswith("http://localhost:1455"))
 
+    def test_parse_local_callback_rejects_invalid_port_instead_of_fallback(self) -> None:
+        local_url, callback_port, callback_path = hub_server._parse_local_callback("http://localhost:99999/auth/callback")
+        self.assertEqual(local_url, "")
+        self.assertEqual(callback_port, 0)
+        self.assertEqual(callback_path, "")
+
     def test_openai_auth_status_reports_account_credentials(self) -> None:
         self.state.openai_codex_auth_file.parent.mkdir(parents=True, exist_ok=True)
         self.state.openai_codex_auth_file.write_text(
@@ -1978,8 +2216,8 @@ Gemini CLI
             "agent_hub.server.subprocess.Popen",
             side_effect=fake_popen,
         ), patch.object(
-            hub_server.HubState,
-            "_start_openai_login_reader",
+            self.state.openai_account_service,
+            "start_openai_login_reader",
             return_value=None,
         ):
             payload = self.state.start_openai_account_login(method="browser_callback")
@@ -2027,8 +2265,8 @@ Gemini CLI
             "agent_hub.server.subprocess.Popen",
             side_effect=fake_popen,
         ), patch.object(
-            hub_server.HubState,
-            "_start_openai_login_reader",
+            self.state.openai_account_service,
+            "start_openai_login_reader",
             return_value=None,
         ):
             payload = self.state.start_openai_account_login(method="device_auth")
@@ -2058,6 +2296,7 @@ Gemini CLI
 
         try:
             callback_port = int(server.server_address[1])
+            self.state.artifact_publish_base_url = f"http://127.0.0.1:{callback_port}"
             self.state._openai_login_session = hub_server.OpenAIAccountLoginSession(
                 id="session-test",
                 process=SimpleNamespace(pid=9991, poll=lambda: None),
@@ -2083,7 +2322,7 @@ Gemini CLI
             server.server_close()
             thread.join(timeout=1.0)
 
-    def test_forward_openai_account_callback_falls_back_to_request_host(self) -> None:
+    def test_forward_openai_account_callback_uses_configured_host_not_request_host(self) -> None:
         class FakeResponse:
             def __enter__(self):
                 return self
@@ -2104,12 +2343,11 @@ Gemini CLI
             del timeout
             url = str(request.full_url)
             attempted_urls.append(url)
-            if "127.0.0.1:1455" in url or "localhost:1455" in url:
-                raise urllib.error.URLError("connection refused")
             if "10.0.1.1:1455" in url:
                 return FakeResponse()
             raise AssertionError(f"Unexpected callback URL: {url}")
 
+        self.state.artifact_publish_base_url = "http://10.0.1.1:8765"
         self.state._openai_login_session = hub_server.OpenAIAccountLoginSession(
             id="session-fallback",
             process=SimpleNamespace(pid=9992, poll=lambda: None),
@@ -2132,7 +2370,7 @@ Gemini CLI
             result = self.state.forward_openai_account_callback(
                 "code=abc&state=xyz",
                 path="/auth/callback",
-                request_host="10.0.1.1",
+                request_host="10.200.1.9",
             )
 
         self.assertTrue(result["forwarded"])
@@ -2141,8 +2379,6 @@ Gemini CLI
         self.assertEqual(
             attempted_urls,
             [
-                "http://127.0.0.1:1455/auth/callback?code=abc&state=xyz",
-                "http://localhost:1455/auth/callback?code=abc&state=xyz",
                 "http://10.0.1.1:1455/auth/callback?code=abc&state=xyz",
             ],
         )
@@ -2168,8 +2404,6 @@ Gemini CLI
             del timeout
             url = str(request.full_url)
             attempted_urls.append(url)
-            if "127.0.0.1:1455" in url or "localhost:1455" in url:
-                raise urllib.error.URLError("connection refused")
             if "10.88.0.4:1455" in url:
                 return FakeResponse()
             raise AssertionError(f"Unexpected callback URL: {url}")
@@ -2206,13 +2440,11 @@ Gemini CLI
         self.assertEqual(
             attempted_urls,
             [
-                "http://127.0.0.1:1455/auth/callback?code=abc&state=xyz",
-                "http://localhost:1455/auth/callback?code=abc&state=xyz",
                 "http://10.88.0.4:1455/auth/callback?code=abc&state=xyz",
             ],
         )
 
-    def test_forward_openai_account_callback_uses_resolved_default_host_for_default_startup(self) -> None:
+    def test_forward_openai_account_callback_uses_default_configured_host_for_default_startup(self) -> None:
         class FakeResponse:
             def __enter__(self):
                 return self
@@ -2233,9 +2465,7 @@ Gemini CLI
             del timeout
             url = str(request.full_url)
             attempted_urls.append(url)
-            if "127.0.0.1:1455" in url or "localhost:1455" in url or "10.0.1.1:1455" in url or "host.docker.internal:1455" in url:
-                raise urllib.error.URLError("connection refused")
-            if "172.17.0.1:1455" in url:
+            if "host.docker.internal:1455" in url:
                 return FakeResponse()
             raise AssertionError(f"Unexpected callback URL: {url}")
 
@@ -2259,7 +2489,7 @@ Gemini CLI
         ), patch(
             "agent_hub.server._forward_openai_callback_via_container_loopback",
             return_value=hub_server.OpenAICallbackContainerForwardResult(attempted=False),
-        ), patch("agent_hub.server.socket.gethostbyname", return_value="172.17.0.1"):
+        ):
             result = self.state.forward_openai_account_callback(
                 "code=abc&state=xyz",
                 path="/auth/callback",
@@ -2268,15 +2498,11 @@ Gemini CLI
 
         self.assertTrue(result["forwarded"])
         self.assertEqual(result["status_code"], 200)
-        self.assertEqual(result["target_origin"], "http://172.17.0.1:1455")
+        self.assertEqual(result["target_origin"], "http://host.docker.internal:1455")
         self.assertEqual(
             attempted_urls,
             [
-                "http://127.0.0.1:1455/auth/callback?code=abc&state=xyz",
-                "http://localhost:1455/auth/callback?code=abc&state=xyz",
-                "http://10.0.1.1:1455/auth/callback?code=abc&state=xyz",
                 "http://host.docker.internal:1455/auth/callback?code=abc&state=xyz",
-                "http://172.17.0.1:1455/auth/callback?code=abc&state=xyz",
             ],
         )
 
@@ -2319,9 +2545,6 @@ Gemini CLI
             "agent_hub.server.urllib.request.urlopen",
             side_effect=fake_urlopen,
         ), patch(
-            "agent_hub.server.socket.gethostbyname",
-            side_effect=OSError("name not resolved"),
-        ), patch(
             "agent_hub.server._discover_openai_callback_bridge_hosts",
             return_value=(["172.17.0.1"], {"bridge_hosts": ["172.17.0.1"]}),
         ), patch(
@@ -2340,9 +2563,6 @@ Gemini CLI
         self.assertEqual(
             attempted_urls,
             [
-                "http://127.0.0.1:1455/auth/callback?code=abc&state=xyz",
-                "http://localhost:1455/auth/callback?code=abc&state=xyz",
-                "http://10.0.1.1:1455/auth/callback?code=abc&state=xyz",
                 "http://host.docker.internal:1455/auth/callback?code=abc&state=xyz",
                 "http://172.17.0.1:1455/auth/callback?code=abc&state=xyz",
             ],
@@ -2367,24 +2587,20 @@ Gemini CLI
             "agent_hub.server.urllib.request.urlopen",
             side_effect=fake_urlopen,
         ), patch(
-            "agent_hub.server.socket.gethostbyname",
-            side_effect=OSError("name not resolved"),
-        ), patch(
             "agent_hub.server._discover_openai_callback_bridge_hosts",
             return_value=([], {"bridge_hosts": []}),
         ), patch(
             "agent_hub.server._forward_openai_callback_via_container_loopback",
             return_value=hub_server.OpenAICallbackContainerForwardResult(attempted=False),
         ), self.assertLogs("agent_hub", level="INFO") as captured_logs:
-            with self.assertRaises(HTTPException) as ctx:
+            with self.assertRaises(hub_server.NetworkReachabilityError) as ctx:
                 self.state.forward_openai_account_callback(
                     "code=abc&state=xyz&code_verifier=secret-value",
                     path="/auth/callback",
                     request_host="10.0.1.1",
                 )
 
-        self.assertEqual(ctx.exception.status_code, 502)
-        self.assertIn("Reason: connection_refused", str(ctx.exception.detail))
+        self.assertIn("Reason: connection_refused", str(ctx.exception))
         merged_logs = "\n".join(captured_logs.output)
         self.assertIn("OpenAI callback forward resolution", merged_logs)
         self.assertIn("failure_reason=connection_refused", merged_logs)
@@ -2404,7 +2620,7 @@ Gemini CLI
         self.assertEqual(invalid_host, "")
         self.assertIsNone(invalid_port)
 
-    def test_forward_openai_account_callback_uses_container_loopback_fallback_when_network_hosts_fail(self) -> None:
+    def test_forward_openai_account_callback_fails_when_network_hosts_fail(self) -> None:
         self.state._openai_login_session = hub_server.OpenAIAccountLoginSession(
             id="session-container-loopback",
             process=SimpleNamespace(pid=9997, poll=lambda: None),
@@ -2423,38 +2639,23 @@ Gemini CLI
             "agent_hub.server.urllib.request.urlopen",
             side_effect=fake_urlopen,
         ) as urlopen_mock, patch(
-            "agent_hub.server.socket.gethostbyname",
-            side_effect=OSError("name not resolved"),
-        ), patch(
             "agent_hub.server._discover_openai_callback_bridge_hosts",
             return_value=([], {"bridge_hosts": []}),
         ), patch(
             "agent_hub.server._forward_openai_callback_via_container_loopback",
-            return_value=hub_server.OpenAICallbackContainerForwardResult(
-                attempted=True,
-                ok=True,
-                status_code=200,
-                response_body="ok",
-            ),
-        ) as container_forward:
-            result = self.state.forward_openai_account_callback(
-                "code=abc&state=xyz",
-                path="/auth/callback",
-                request_host="10.0.1.1",
-            )
+            side_effect=AssertionError("container loopback fallback must not be used"),
+        ):
+            with self.assertRaises(hub_server.NetworkReachabilityError) as ctx:
+                self.state.forward_openai_account_callback(
+                    "code=abc&state=xyz",
+                    path="/auth/callback",
+                    request_host="10.0.1.1",
+                )
 
-        self.assertTrue(result["forwarded"])
-        self.assertEqual(result["status_code"], 200)
-        self.assertEqual(result["target_origin"], "container://container-loopback/127.0.0.1:1455")
-        urlopen_mock.assert_not_called()
-        container_forward.assert_called_once_with(
-            "container-loopback",
-            callback_port=1455,
-            callback_path="/auth/callback",
-            query="code=abc&state=xyz",
-        )
+        self.assertIn("Reason: connection_refused", str(ctx.exception))
+        urlopen_mock.assert_called_once()
 
-    def test_forward_openai_account_callback_falls_back_to_network_when_container_loopback_fails(self) -> None:
+    def test_forward_openai_account_callback_uses_network_without_container_loopback(self) -> None:
         class FakeResponse:
             def __enter__(self):
                 return self
@@ -2493,12 +2694,7 @@ Gemini CLI
             return_value=([], {"bridge_hosts": []}),
         ), patch(
             "agent_hub.server._forward_openai_callback_via_container_loopback",
-            return_value=hub_server.OpenAICallbackContainerForwardResult(
-                attempted=True,
-                ok=False,
-                error_class="container_exec_failed",
-                error_detail="exec failed",
-            ),
+            side_effect=AssertionError("container loopback fallback must not be used"),
         ):
             result = self.state.forward_openai_account_callback(
                 "code=abc&state=xyz",
@@ -2508,8 +2704,77 @@ Gemini CLI
 
         self.assertTrue(result["forwarded"])
         self.assertEqual(result["status_code"], 200)
-        self.assertEqual(result["target_origin"], "http://127.0.0.1:1455")
-        self.assertEqual(attempted_urls[0], "http://127.0.0.1:1455/auth/callback?code=abc&state=xyz")
+        self.assertEqual(result["target_origin"], "http://host.docker.internal:1455")
+        self.assertEqual(attempted_urls[0], "http://host.docker.internal:1455/auth/callback?code=abc&state=xyz")
+
+    def test_forward_openai_account_callback_does_not_fallback_to_request_hosts(self) -> None:
+        self.state.artifact_publish_base_url = "http://10.0.1.1:8765"
+        self.state._openai_login_session = hub_server.OpenAIAccountLoginSession(
+            id="session-forwarded-request-host-fallback",
+            process=SimpleNamespace(pid=9999, poll=lambda: None),
+            container_name="container-forwarded-request-host-fallback",
+            started_at="2026-02-21T00:00:00Z",
+            status="waiting_for_browser",
+            callback_port=1455,
+            callback_path="/auth/callback",
+        )
+        attempted_urls: list[str] = []
+
+        def fake_urlopen(request: urllib.request.Request, timeout: float = 0.0):
+            del timeout
+            attempted_urls.append(str(request.full_url))
+            raise urllib.error.URLError("configured host unreachable")
+
+        with patch("agent_hub.server._is_process_running", return_value=True), patch(
+            "agent_hub.server.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ), patch(
+            "agent_hub.server._discover_openai_callback_bridge_hosts",
+            return_value=([], {"bridge_hosts": []}),
+        ), patch(
+            "agent_hub.server._forward_openai_callback_via_container_loopback",
+            return_value=hub_server.OpenAICallbackContainerForwardResult(attempted=False),
+        ):
+            with self.assertRaises(hub_server.NetworkReachabilityError) as ctx:
+                self.state.forward_openai_account_callback(
+                    "code=abc&state=xyz",
+                    path="/auth/callback",
+                    request_host="10.200.1.9",
+                    request_context={"forwarded_host": "198.51.100.20"},
+                )
+
+        self.assertIn("Reason: url_error", str(ctx.exception))
+        self.assertEqual(
+            attempted_urls,
+            ["http://10.0.1.1:1455/auth/callback?code=abc&state=xyz"],
+        )
+
+    def test_forward_openai_account_callback_rejects_invalid_session_callback_metadata(self) -> None:
+        self.state._openai_login_session = hub_server.OpenAIAccountLoginSession(
+            id="session-invalid-callback-metadata",
+            process=SimpleNamespace(pid=10001, poll=lambda: None),
+            container_name="container-invalid-callback-metadata",
+            started_at="2026-02-21T00:00:00Z",
+            status="waiting_for_browser",
+            callback_port=0,
+            callback_path="auth/callback",
+        )
+        with patch("agent_hub.server._is_process_running", return_value=True):
+            with self.assertRaises(HTTPException) as raised:
+                self.state.forward_openai_account_callback("code=abc&state=xyz", path="/auth/callback")
+        self.assertEqual(raised.exception.status_code, 409)
+
+    def test_discover_openai_callback_bridge_hosts_uses_docker_bridge_only(self) -> None:
+        with patch(
+            "agent_hub.server._discover_linux_default_gateway_host",
+            return_value=("172.18.0.1", {"status": "resolved"}),
+        ), patch(
+            "agent_hub.server._discover_docker_bridge_gateway_host",
+            return_value=("172.17.0.1", {"status": "resolved"}),
+        ):
+            hosts, diagnostics = hub_server._discover_openai_callback_bridge_hosts()
+        self.assertEqual(hosts, ["172.17.0.1"])
+        self.assertEqual(diagnostics["bridge_hosts"], ["172.17.0.1"])
 
     def test_forward_openai_callback_via_container_loopback_reports_python_missing(self) -> None:
         fake_process = SimpleNamespace(returncode=127, stdout="", stderr="python runtime unavailable in login container")
@@ -2555,7 +2820,7 @@ Gemini CLI
     def test_prepare_chat_runtime_config_materializes_agent_tools_mcp_script(self) -> None:
         self.config_file.write_text(
             (
-                "model = 'test'\n"
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n"
                 "\n"
                 "[mcp_servers.agent_tools]\n"
                 "command = 'python3'\n"
@@ -2594,8 +2859,32 @@ Gemini CLI
         )
         self.assertEqual(self.state.agent_tools_mcp_runtime_script.stat().st_mode & 0o700, 0o600)
 
+    def test_prepare_chat_runtime_config_fails_when_existing_mcp_script_read_fails(self) -> None:
+        self.state.agent_tools_mcp_runtime_script.parent.mkdir(parents=True, exist_ok=True)
+        self.state.agent_tools_mcp_runtime_script.write_text("# stale", encoding="utf-8")
+        original_read_text = Path.read_text
+
+        def failing_read_text(path_obj: Path, *args: Any, **kwargs: Any) -> str:
+            if path_obj == self.state.agent_tools_mcp_runtime_script:
+                raise OSError("permission denied")
+            return original_read_text(path_obj, *args, **kwargs)
+
+        with patch("pathlib.Path.read_text", autospec=True, side_effect=failing_read_text):
+            with self.assertRaisesRegex(
+                hub_server.ConfigError,
+                "Failed to read existing agent_tools MCP runtime script",
+            ):
+                self.state._prepare_chat_runtime_config(
+                    "chat-mcp-read-fail",
+                    agent_type="codex",
+                    agent_tools_url="http://host.docker.internal:8765/api/chats/chat-mcp-read-fail/agent-tools",
+                    agent_tools_token="mcp-token-test",
+                    agent_tools_project_id="project-mcp-test",
+                    agent_tools_chat_id="chat-mcp-read-fail",
+                )
+
     def test_prepare_chat_runtime_config_uses_json_for_gemini(self) -> None:
-        self.config_file.write_text("model = 'test'\n", encoding="utf-8")
+        self.config_file.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
         runtime_config_file = self.state._prepare_chat_runtime_config(
             "chat-gemini-json",
             agent_type="gemini",
@@ -2614,7 +2903,7 @@ Gemini CLI
     def test_prepare_chat_runtime_config_adds_codex_project_trust_for_container_workspace(self) -> None:
         self.config_file.write_text(
             (
-                "model = 'test'\n"
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n"
                 'projects."/workspace/other".trust_level = "trusted"\n'
                 'projects."/workspace/agent_hub".trust_level = "untrusted"\n'
             ),
@@ -2635,6 +2924,18 @@ Gemini CLI
         expected_line = 'projects."/workspace/agent_hub".trust_level = "trusted"'
         self.assertIn(expected_line, runtime_text)
         self.assertEqual(runtime_text.count(expected_line), 1)
+
+    def test_prepare_chat_runtime_config_fails_fast_when_agent_tools_url_missing(self) -> None:
+        with self.assertRaises(hub_server.ConfigError) as ctx:
+            self.state._prepare_chat_runtime_config(
+                "chat-missing-agent-tools-url",
+                agent_type="codex",
+                agent_tools_url="",
+                agent_tools_token="mcp-token-test",
+                agent_tools_project_id="project-mcp-test",
+                agent_tools_chat_id="chat-missing-agent-tools-url",
+            )
+        self.assertIn(hub_server.AGENT_TOOLS_URL_ENV, str(ctx.exception))
 
     def test_start_chat_filters_reserved_openai_env_vars(self) -> None:
         project = self.state.add_project(
@@ -2743,6 +3044,8 @@ Gemini CLI
         self.assertIn(str(self.state.host_agent_home), cmd)
         self.assertIn("--agent-command", cmd)
         self.assertIn("codex", cmd)
+        self.assertIn("--run-mode", cmd)
+        self.assertEqual(cmd[cmd.index("--run-mode") + 1], "docker")
         self.assertIn("--container-project-name", cmd)
         container_name_index = cmd.index("--container-project-name")
         self.assertEqual(cmd[container_name_index + 1], "repo")
@@ -2995,6 +3298,294 @@ Gemini CLI
         self.assertIn("--resume", cmd)
         self.assertNotIn("--", cmd)
         self.assertNotIn("gpt-5.3-codex", cmd)
+
+    def test_prepare_agent_cli_command_launch_profile_preserves_deterministic_command_invariants(self) -> None:
+        workspace = self.tmp_path / "workspace-launch-profile"
+        workspace.mkdir(parents=True, exist_ok=True)
+        runtime_config_file = self.tmp_path / "runtime.launch-profile.toml"
+        runtime_config_file.write_text("[runtime]\n", encoding="utf-8")
+        runtime_tmp_mount = self.tmp_path / "runtime-tmp-launch-profile"
+        runtime_tmp_mount.mkdir(parents=True, exist_ok=True)
+
+        cmd = self.state._prepare_agent_cli_command(
+            workspace=workspace,
+            container_project_name="project-launch-profile",
+            runtime_config_file=runtime_config_file,
+            agent_type="codex",
+            run_mode="docker",
+            agent_tools_url="http://127.0.0.1:8876/api/agent-tools/sessions/session-1",
+            agent_tools_token="agent-tools-token-1",
+            agent_tools_project_id="project-1",
+            agent_tools_chat_id="chat-1",
+            ready_ack_guid="ready-ack-1",
+            ro_mounts=["/host/ro-a:/container/ro-a"],
+            rw_mounts=["/host/rw-a:/container/rw-a"],
+            env_vars=[
+                "EXTRA_ENV_A=1",
+                f"{hub_server.AGENT_HUB_TMP_HOST_PATH_ENV}=/ignored/override",
+            ],
+            artifacts_url="http://127.0.0.1:8876/api/chats/chat-1/artifacts",
+            artifacts_token="artifact-token-1",
+            runtime_tmp_mount=str(runtime_tmp_mount),
+            extra_args=["--model", "gpt-5.3-codex"],
+        )
+
+        self.assertEqual(cmd[:5], ["uv", "run", "--project", str(hub_server._repo_root()), "agent_cli"])
+        self.assertIn("--", cmd)
+        self.assertEqual(cmd[cmd.index("--") + 1 :], ["--model", "gpt-5.3-codex"])
+
+        profile = self.state._launch_profile_from_command(
+            mode="chat_start",
+            command=cmd,
+            workspace=workspace,
+            runtime_config_file=runtime_config_file,
+            container_project_name="project-launch-profile",
+            agent_type="codex",
+            snapshot_tag="snapshot-launch-profile",
+            prepare_snapshot_only=False,
+        )
+
+        self.assertEqual(profile["mode"], "chat_start")
+        self.assertEqual(profile["workspace"], str(workspace))
+        self.assertEqual(profile["runtime_config_file"], str(runtime_config_file))
+        self.assertEqual(profile["container_project_name"], "project-launch-profile")
+        self.assertEqual(profile["agent_type"], "codex")
+        self.assertEqual(profile["snapshot_tag"], "snapshot-launch-profile")
+        self.assertEqual(profile["runtime_image"], "snapshot-launch-profile")
+        self.assertFalse(profile["prepare_snapshot_only"])
+        self.assertEqual(profile["ro_mounts"], ["/host/ro-a:/container/ro-a"])
+        self.assertIn("/host/rw-a:/container/rw-a", profile["rw_mounts"])
+        self.assertIn(f"{runtime_tmp_mount}:{hub_server.DEFAULT_CONTAINER_TMP_DIR}", profile["rw_mounts"])
+        self.assertEqual(profile["container_args"], ["--model", "gpt-5.3-codex"])
+        self.assertIn("EXTRA_ENV_A=1", profile["env_vars"])
+        self.assertIn(f"{hub_server.AGENT_HUB_TMP_HOST_PATH_ENV}={runtime_tmp_mount}", profile["env_vars"])
+        self.assertNotIn(f"{hub_server.AGENT_HUB_TMP_HOST_PATH_ENV}=/ignored/override", profile["env_vars"])
+        self.assertEqual(profile["command"], cmd)
+
+    def test_prepare_agent_cli_command_launch_profile_snapshot_runtime_image_invariants(self) -> None:
+        workspace = self.tmp_path / "workspace-snapshot-launch-profile"
+        workspace.mkdir(parents=True, exist_ok=True)
+        runtime_config_file = self.tmp_path / "runtime.snapshot-launch-profile.toml"
+        runtime_config_file.write_text("[runtime]\n", encoding="utf-8")
+        snapshot_tag = "ghcr.io/example/project:snapshot-sha-1234"
+
+        cmd = self.state._prepare_agent_cli_command(
+            workspace=workspace,
+            container_project_name="project-snapshot-launch-profile",
+            runtime_config_file=runtime_config_file,
+            agent_type="codex",
+            run_mode="docker",
+            agent_tools_url="http://127.0.0.1:8876/api/projects/project-1/agent-tools",
+            agent_tools_token="agent-tools-token-snapshot",
+            agent_tools_project_id="project-1",
+            project={
+                "base_image_mode": "tag",
+                "base_image_value": "ghcr.io/example/base:latest",
+            },
+            snapshot_tag=snapshot_tag,
+            prepare_snapshot_only=True,
+            project_in_image=True,
+            extra_args=["exec"],
+        )
+        profile = self.state._launch_profile_from_command(
+            mode="project_snapshot",
+            command=cmd,
+            workspace=workspace,
+            runtime_config_file=runtime_config_file,
+            container_project_name="project-snapshot-launch-profile",
+            agent_type="codex",
+            snapshot_tag=snapshot_tag,
+            prepare_snapshot_only=True,
+        )
+
+        expected_runtime_image = hub_server._snapshot_setup_runtime_image_for_snapshot(snapshot_tag)
+        self.assertEqual(profile["mode"], "project_snapshot")
+        self.assertEqual(profile["snapshot_tag"], snapshot_tag)
+        self.assertEqual(profile["runtime_image"], expected_runtime_image)
+        self.assertTrue(profile["prepare_snapshot_only"])
+        self.assertEqual(profile["container_args"], ["exec"])
+        self.assertEqual(profile["command"], cmd)
+
+    def test_launch_profile_core_compiler_parity_with_prepare_agent_cli_command(self) -> None:
+        workspace = self.tmp_path / "workspace-compiler-parity"
+        workspace.mkdir(parents=True, exist_ok=True)
+        runtime_config_file = self.tmp_path / "runtime.compiler-parity.toml"
+        runtime_config_file.write_text("[runtime]\n", encoding="utf-8")
+        runtime_tmp_mount = self.tmp_path / "runtime-tmp-compiler-parity"
+        runtime_tmp_mount.mkdir(parents=True, exist_ok=True)
+
+        compiled_via_hub = self.state._prepare_agent_cli_command(
+            workspace=workspace,
+            container_project_name="project-compiler-parity",
+            runtime_config_file=runtime_config_file,
+            agent_type="codex",
+            run_mode="docker",
+            agent_tools_url="http://127.0.0.1:8876/api/chats/chat-1/agent-tools",
+            agent_tools_token="agent-tools-token-compiler-parity",
+            agent_tools_project_id="project-1",
+            agent_tools_chat_id="chat-1",
+            ready_ack_guid="ready-ack-compiler-parity",
+            ro_mounts=["/host/ro-compiler:/container/ro-compiler"],
+            rw_mounts=["/host/rw-compiler:/container/rw-compiler"],
+            env_vars=["EXTRA_ENV_PARITY=1"],
+            artifacts_url="http://127.0.0.1:8876/api/chats/chat-1/artifacts",
+            artifacts_token="artifact-token-compiler-parity",
+            resume=True,
+            runtime_tmp_mount=str(runtime_tmp_mount),
+            extra_args=["--model", "gpt-5.3-codex"],
+        )
+
+        spec = core_launch.LaunchSpec(
+            repo_root=hub_server._repo_root(),
+            workspace=workspace,
+            container_project_name="project-compiler-parity",
+            agent_home_path=self.state.host_agent_home,
+            runtime_config_file=runtime_config_file,
+            system_prompt_file=self.state.system_prompt_file,
+            agent_command="codex",
+            run_mode="docker",
+            local_uid=self.state.local_uid,
+            local_gid=self.state.local_gid,
+            local_user=self.state.local_user,
+            local_supplementary_gids=self.state.local_supp_gids,
+            allocate_tty=True,
+            resume=True,
+            snapshot_tag="",
+            ro_mounts=("/host/ro-compiler:/container/ro-compiler",),
+            rw_mounts=(
+                "/host/rw-compiler:/container/rw-compiler",
+                f"{runtime_tmp_mount}:{hub_server.DEFAULT_CONTAINER_TMP_DIR}",
+            ),
+            env_vars=(
+                "AGENT_ARTIFACTS_URL=http://127.0.0.1:8876/api/chats/chat-1/artifacts",
+                "AGENT_ARTIFACT_TOKEN=artifact-token-compiler-parity",
+                "AGENT_HUB_AGENT_TOOLS_URL=http://127.0.0.1:8876/api/chats/chat-1/agent-tools",
+                "AGENT_HUB_AGENT_TOOLS_TOKEN=agent-tools-token-compiler-parity",
+                "AGENT_HUB_AGENT_TOOLS_PROJECT_ID=project-1",
+                "AGENT_HUB_AGENT_TOOLS_CHAT_ID=chat-1",
+                f"{hub_server.AGENT_HUB_TMP_HOST_PATH_ENV}={runtime_tmp_mount}",
+                "AGENT_HUB_READY_ACK_GUID=ready-ack-compiler-parity",
+                "EXTRA_ENV_PARITY=1",
+            ),
+            extra_args=("--model", "gpt-5.3-codex"),
+            openai_credentials_args=tuple(self.state._openai_credentials_arg()),
+        )
+        compiled_via_core = core_launch.compile_agent_cli_command(spec)
+        self.assertEqual(compiled_via_core, compiled_via_hub)
+
+        parsed = core_launch.parse_compiled_agent_cli_command(compiled_via_core)
+        self.assertEqual(parsed.ro_mounts, ("/host/ro-compiler:/container/ro-compiler",))
+        self.assertIn("/host/rw-compiler:/container/rw-compiler", parsed.rw_mounts)
+        self.assertIn(f"{runtime_tmp_mount}:{hub_server.DEFAULT_CONTAINER_TMP_DIR}", parsed.rw_mounts)
+        self.assertIn("EXTRA_ENV_PARITY=1", parsed.env_vars)
+        self.assertEqual(parsed.container_args, ("--model", "gpt-5.3-codex"))
+
+    def test_launch_profile_core_compiler_agent_process_command_parity(self) -> None:
+        with_explicit_args = core_launch.compile_agent_process_command(
+            core_launch.AgentProcessLaunchPlan(
+                agent_command="codex",
+                runtime_flags=("--sandbox", "danger-full-access"),
+                explicit_container_args=("--model", "gpt-5.3-codex"),
+                resume=True,
+                resume_shell_command="codex resume",
+            )
+        )
+        self.assertEqual(
+            with_explicit_args,
+            ["codex", "--sandbox", "danger-full-access", "--model", "gpt-5.3-codex"],
+        )
+
+        resume_without_explicit_args = core_launch.compile_agent_process_command(
+            core_launch.AgentProcessLaunchPlan(
+                agent_command="codex",
+                runtime_flags=("--sandbox", "danger-full-access"),
+                explicit_container_args=(),
+                resume=True,
+                resume_shell_command="codex resume --sandbox danger-full-access",
+            )
+        )
+        self.assertEqual(
+            resume_without_explicit_args,
+            ["bash", "-lc", "codex resume --sandbox danger-full-access"],
+        )
+
+    def test_start_chat_invalid_agent_type_fails_without_default_fallback(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+            agent_type="codex",
+        )
+        state_payload = self.state.load()
+        state_payload["chats"][chat["id"]]["agent_type"] = "invalid-agent-type"
+        self.state.save(state_payload, reason="test_invalid_agent_type")
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+        ) as spawn_process:
+            with self.assertRaises(hub_server.ConfigError) as ctx:
+                self.state.start_chat(chat["id"])
+
+        self.assertIn("agent_type must be one of", str(ctx.exception))
+        spawn_process.assert_not_called()
+
+    def test_create_chat_invalid_agent_type_fails_fast(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            self.state.create_chat(
+                project["id"],
+                profile="",
+                ro_mounts=[],
+                rw_mounts=[],
+                env_vars=[],
+                agent_args=[],
+                agent_type="not-supported",
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("agent_type must be one of", str(ctx.exception.detail))
+
+    def test_update_chat_invalid_agent_type_fails_fast(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+            agent_type="codex",
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            self.state.update_chat(chat["id"], {"agent_type": "not-supported"})
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("agent_type must be one of", str(ctx.exception.detail))
 
     def test_start_chat_resume_for_claude_adds_continue_flag(self) -> None:
         project = self.state.add_project(
@@ -3439,12 +4030,29 @@ Gemini CLI
         self.assertEqual(captured["cmd"][system_prompt_index + 1], str(self.state.system_prompt_file))
 
     def test_hub_state_rejects_invalid_artifact_publish_base_url(self) -> None:
-        with self.assertRaises(ValueError):
+        with self.assertRaises(hub_server.ConfigError):
             hub_server.HubState(
                 data_dir=self.tmp_path / "hub-invalid-artifacts-base",
                 config_file=self.config_file,
                 artifact_publish_base_url="host.docker.internal:8765",
             )
+
+    def test_hub_state_ignores_artifact_publish_base_url_env_fallback(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"AGENT_ARTIFACT_BASE_URL": "not-a-valid-url"},
+            clear=False,
+        ):
+            state = hub_server.HubState(
+                data_dir=self.tmp_path / "hub-artifacts-base-no-env-fallback",
+                config_file=self.config_file,
+                hub_port=8899,
+            )
+
+        self.assertEqual(
+            state.artifact_publish_base_url,
+            hub_server._default_artifact_publish_base_url(8899),
+        )
 
     def test_start_chat_rejects_base_path_outside_workspace(self) -> None:
         project = self.state.add_project(
@@ -3699,6 +4307,107 @@ Gemini CLI
 
         loaded = self.state.load()["chats"][chat["id"]]
         self.assertEqual(loaded["artifact_current_ids"], ["artifact-legacy"])
+        persisted = json.loads(self.state.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["chats"][chat["id"]]["artifact_current_ids"], ["artifact-legacy"])
+
+    def test_load_fails_fast_on_invalid_root_shapes(self) -> None:
+        self.state.state_file.write_text(
+            json.dumps({"version": 1, "projects": [], "chats": "invalid", "settings": {}}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(hub_server.ConfigError) as ctx:
+            self.state.load()
+        self.assertIn("projects", str(ctx.exception))
+
+    def test_load_fails_fast_on_invalid_project_entry_shape(self) -> None:
+        self.state.state_file.write_text(
+            json.dumps({"version": 1, "projects": {"project-1": 123}, "chats": {}, "settings": {}}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(hub_server.ConfigError) as ctx:
+            self.state.load()
+        self.assertIn("project-1", str(ctx.exception))
+
+    def test_load_fails_fast_on_invalid_chat_entry_shape(self) -> None:
+        self.state.state_file.write_text(
+            json.dumps({"version": 1, "projects": {}, "chats": {"chat-1": "oops"}, "settings": {}}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(hub_server.ConfigError) as ctx:
+            self.state.load()
+        self.assertIn("chat-1", str(ctx.exception))
+
+    def test_load_fails_fast_on_legacy_codex_args(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+
+        state_data = self.state.load()
+        legacy_chat = state_data["chats"][chat["id"]]
+        legacy_chat.pop("agent_args", None)
+        legacy_chat["codex_args"] = ["--model", "gpt-5.3-codex"]
+        self.state.save(state_data)
+
+        with self.assertRaises(hub_server.ConfigError) as ctx:
+            self.state.load()
+        self.assertIn("codex_args is no longer supported", str(ctx.exception))
+
+    def test_load_fails_fast_when_agent_args_is_not_array(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+
+        state_data = self.state.load()
+        target_chat = state_data["chats"][chat["id"]]
+        target_chat["agent_args"] = "not-a-list"
+        self.state.save(state_data)
+
+        with self.assertRaises(hub_server.ConfigError) as ctx:
+            self.state.load()
+        self.assertIn("agent_args must be an array", str(ctx.exception))
+
+    def test_load_fails_fast_on_invalid_persisted_agent_type(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["agent_type"] = "not-a-valid-agent-type"
+        self.state.save(state_data)
+
+        with self.assertRaises(hub_server.ConfigError) as ctx:
+            self.state.load()
+        self.assertIn("Invalid chat state", str(ctx.exception))
 
     def test_publish_chat_artifact_rejects_invalid_token(self) -> None:
         project = self.state.add_project(
@@ -3818,7 +4527,7 @@ Gemini CLI
         self.assertEqual(captured["started_chat_id"], "chat-created")
         self.assertEqual(result["id"], "chat-created")
 
-    def test_create_and_start_chat_preserves_failed_chat_when_start_raises(self) -> None:
+    def test_create_and_start_chat_fails_fast_when_start_raises(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
             default_branch="main",
@@ -3829,16 +4538,11 @@ Gemini CLI
             hub_server.HubState,
             "start_chat",
             side_effect=HTTPException(status_code=500, detail="synthetic start failure"),
-        ):
-            result = self.state.create_and_start_chat(project["id"])
+        ), self.assertRaises(HTTPException) as ctx:
+            self.state.create_and_start_chat(project["id"])
 
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["status_reason"], "chat_start_failed_during_create")
-        self.assertEqual(result["start_error"], "synthetic start failure")
-        reloaded = self.state.load()["chats"][result["id"]]
-        self.assertEqual(reloaded["status"], "failed")
-        self.assertEqual(reloaded["status_reason"], "chat_start_failed_during_create")
-        self.assertEqual(reloaded["start_error"], "synthetic start failure")
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertEqual(str(ctx.exception.detail), "synthetic start failure")
 
     def test_create_and_start_chat_reuses_existing_request_id_chat(self) -> None:
         project = self.state.add_project(
@@ -4368,6 +5072,8 @@ Gemini CLI
         self.assertIn("--prepare-snapshot-only", cmd)
         self.assertIn("--project-in-image", cmd)
         self.assertIn("--snapshot-image-tag", cmd)
+        self.assertIn("--run-mode", cmd)
+        self.assertEqual(cmd[cmd.index("--run-mode") + 1], "docker")
         self.assertIn("--setup-script", cmd)
         self.assertIn("--container-project-name", cmd)
         container_name_index = cmd.index("--container-project-name")
@@ -4560,33 +5266,27 @@ Gemini CLI
             hub_server,
             "LOGGER",
         ) as fake_logger:
-            with self.assertRaises(HTTPException) as context:
+            with self.assertRaises(RuntimeCommandError) as context:
                 hub_server._run_logged(["uv", "run", "agent_hub"], log_path=log_path, check=True)
 
         contents = log_path.read_text(encoding="utf-8")
         self.assertIn("$ exit_code=7", contents)
-        self.assertEqual(str(context.exception.detail), "Command failed (uv) with exit code 7")
+        self.assertEqual(str(context.exception), f"Command failed (uv run agent_hub) with exit code 7: See log at {log_path}")
+        self.assertEqual(context.exception.error_code, "RUNTIME_COMMAND_ERROR")
+        self.assertEqual(context.exception.http_status, 400)
         self.assertTrue(fake_logger.warning.called)
 
-    def test_delete_path_retries_after_permission_repair(self) -> None:
+    def test_delete_path_fails_fast_on_permission_error(self) -> None:
         path = self.tmp_path / "workspace-delete"
         path.mkdir(parents=True, exist_ok=True)
 
-        attempts = {"count": 0}
+        with patch("agent_hub.server.shutil.rmtree", side_effect=PermissionError("permission denied")) as rmtree_call:
+            with self.assertRaises(HTTPException) as ctx:
+                self.state._delete_path(path)
 
-        def fake_rmtree(target_path: Path) -> None:
-            self.assertEqual(target_path, path)
-            attempts["count"] += 1
-            if attempts["count"] == 1:
-                raise PermissionError("permission denied")
-
-        with patch("agent_hub.server.shutil.rmtree", side_effect=fake_rmtree) as rmtree_call, patch(
-            "agent_hub.server._docker_fix_path_ownership"
-        ) as repair_call:
-            self.state._delete_path(path)
-
-        self.assertEqual(rmtree_call.call_count, 2)
-        repair_call.assert_called_once_with(path, self.state.local_uid, self.state.local_gid)
+        self.assertEqual(rmtree_call.call_count, 1)
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertIn("permission denied", str(ctx.exception.detail))
 
     def test_ensure_project_setup_snapshot_uses_repo_root_context_for_repo_dockerfile(self) -> None:
         self._connect_github_app()
@@ -5745,7 +6445,7 @@ Gemini CLI
         self.assertNotIn(unexpected_mount, recommendation["default_rw_mounts"])
         self.assertTrue((fake_home / ".ccache").exists())
 
-    def test_normalize_auto_config_recommendation_drops_project_workspace_mount(self) -> None:
+    def test_normalize_auto_config_recommendation_rejects_project_workspace_mount(self) -> None:
         workspace = self.tmp_path / "workspace-project-mount"
         workspace.mkdir(parents=True, exist_ok=True)
         keep_host = self.tmp_path / "safe-volume"
@@ -5754,28 +6454,25 @@ Gemini CLI
         fake_home = self.tmp_path / "fake-home-project-mount"
         fake_home.mkdir(parents=True, exist_ok=True)
         with patch("agent_hub.server.Path.home", return_value=fake_home):
-            recommendation = self.state._normalize_auto_config_recommendation(
-                {
-                    "base_image_mode": "tag",
-                    "base_image_value": "ubuntu:22.04",
-                    "setup_script": "",
-                    "default_ro_mounts": [],
-                    "default_rw_mounts": [
-                        f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/data",
-                        f"{keep_host}:{project_container_workspace}",
-                        f"{keep_host}:{project_container_workspace}/src",
-                    ],
-                    "default_env_vars": [],
-                    "notes": "",
-                },
-                workspace,
-                project_container_workspace=project_container_workspace,
-            )
-
-        self.assertEqual(
-            recommendation["default_rw_mounts"],
-            [f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/data"],
-        )
+            with self.assertRaises(hub_server.MountVisibilityError) as ctx:
+                self.state._normalize_auto_config_recommendation(
+                    {
+                        "base_image_mode": "tag",
+                        "base_image_value": "ubuntu:22.04",
+                        "setup_script": "",
+                        "default_ro_mounts": [],
+                        "default_rw_mounts": [
+                            f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/data",
+                            f"{keep_host}:{project_container_workspace}",
+                            f"{keep_host}:{project_container_workspace}/src",
+                        ],
+                        "default_env_vars": [],
+                        "notes": "",
+                    },
+                    workspace,
+                    project_container_workspace=project_container_workspace,
+                )
+        self.assertIn("reserved workspace path", str(ctx.exception))
 
     def test_normalize_auto_config_recommendation_drops_undetected_cache_mounts(self) -> None:
         workspace = self.tmp_path / "workspace-no-cache"
@@ -5809,7 +6506,7 @@ Gemini CLI
 
         self.assertEqual(recommendation["default_rw_mounts"], [])
 
-    def test_normalize_auto_config_recommendation_drops_docker_socket_mounts(self) -> None:
+    def test_normalize_auto_config_recommendation_rejects_docker_socket_mounts(self) -> None:
         workspace = self.tmp_path / "workspace-drop-docker-socket"
         workspace.mkdir(parents=True, exist_ok=True)
         keep_host = self.tmp_path / "safe-cache"
@@ -5818,27 +6515,23 @@ Gemini CLI
         fake_home.mkdir(parents=True, exist_ok=True)
 
         with patch("agent_hub.server.Path.home", return_value=fake_home):
-            recommendation = self.state._normalize_auto_config_recommendation(
-                {
-                    "base_image_mode": "tag",
-                    "base_image_value": "ubuntu:22.04",
-                    "setup_script": "",
-                    "default_ro_mounts": ["/tmp/nonexistent/docker.sock:/var/run/docker.sock"],
-                    "default_rw_mounts": [
-                        f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.cache/build",
-                        "/run/user/1000/docker.sock:/tmp/agent-docker.sock",
-                    ],
-                    "default_env_vars": [],
-                    "notes": "",
-                },
-                workspace,
-            )
-
-        self.assertEqual(recommendation["default_ro_mounts"], [])
-        self.assertEqual(
-            recommendation["default_rw_mounts"],
-            [f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.cache/build"],
-        )
+            with self.assertRaises(hub_server.MountVisibilityError) as ctx:
+                self.state._normalize_auto_config_recommendation(
+                    {
+                        "base_image_mode": "tag",
+                        "base_image_value": "ubuntu:22.04",
+                        "setup_script": "",
+                        "default_ro_mounts": ["/tmp/nonexistent/docker.sock:/var/run/docker.sock"],
+                        "default_rw_mounts": [
+                            f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.cache/build",
+                            "/run/user/1000/docker.sock:/tmp/agent-docker.sock",
+                        ],
+                        "default_env_vars": [],
+                        "notes": "",
+                    },
+                    workspace,
+                )
+        self.assertIn("docker socket mounts are not allowed", str(ctx.exception))
 
     def test_normalize_auto_config_recommendation_ignores_cache_signals_in_test_paths(self) -> None:
         workspace = self.tmp_path / "workspace-test-cache-signals"
@@ -6053,7 +6746,7 @@ Gemini CLI
         workspace = self.tmp_path / "workspace-chat-paths"
         workspace.mkdir(parents=True, exist_ok=True)
         runtime_config_file = self.tmp_path / "auto-config-runtime.toml"
-        runtime_config_file.write_text("model = 'test'\n", encoding="utf-8")
+        runtime_config_file.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
         fixed_uuid = SimpleNamespace(hex="autocfgpayload")
         repo_url = "https://github.com/example/agent_hub.git"
         output_file = workspace / ".agent-hub-auto-config-autocfgpayload.json"
@@ -6091,6 +6784,10 @@ Gemini CLI
             return_value=("session-test", "token-test"),
         ), patch.object(
             self.state,
+            "issue_agent_tools_session_ready_ack_guid",
+            return_value="ready-ack-test",
+        ), patch.object(
+            self.state,
             "_prepare_chat_runtime_config",
             return_value=runtime_config_file,
         ), patch.object(
@@ -6126,6 +6823,8 @@ Gemini CLI
         cmd = captured_cmd["cmd"]
         self.assertEqual(cmd[cmd.index("--cd") + 1], container_workspace)
         self.assertEqual(cmd[cmd.index("--output-last-message") + 1], container_output_file)
+        self.assertIn("--run-mode", cmd)
+        self.assertEqual(cmd[cmd.index("--run-mode") + 1], "docker")
         self.assertIn("--model", cmd)
         self.assertIn("gpt-5-codex", cmd)
         self.assertIn("-c", cmd)
@@ -6435,7 +7134,7 @@ Gemini CLI
         long_error_line = (
             "Command failed with exit code 1: docker run --rm -i -t --tmpfs /tmp:mode=1777,exec "
             "--init --user 1002:1007 --gpus all --workdir /workspace/agent_hub --volume "
-            "/home/joew/.local/share/agent-hub/agent-hub-auto-config-eceu5-aaaaaaaa-bbbbbbbb-cccccccccccccccccccc"
+            "/home/joew/.local/share/agent_hub/agent-hub-auto-config-eceu5-aaaaaaaa-bbbbbbbb-cccccccccccccccccccc"
         )
         detail = hub_server._codex_exec_error_message_full(
             f"analysis output\n{long_error_line}"
@@ -6933,9 +7632,9 @@ class AgentToolsCredentialResolveToolTests(unittest.TestCase):
         structured = response["structuredContent"]
         runtime_setup = structured.get("runtime_git_setup") or {}
         self.assertTrue(runtime_setup.get("configured"))
-        self.assertEqual(runtime_setup.get("credential_file"), "/tmp/agent_hub_git_credentials")
+        self.assertEqual(runtime_setup.get("credential_file"), "/workspace/tmp/agent_hub_git_credentials")
         self.assertIn(
-            ["git", "config", "--global", "credential.helper", "store --file=/tmp/agent_hub_git_credentials"],
+            ["git", "config", "--global", "credential.helper", "store --file=/workspace/tmp/agent_hub_git_credentials"],
             git_calls,
         )
         self.assertIn(["git", "config", "--global", "user.name", "Agent User"], git_calls)
@@ -6976,6 +7675,18 @@ class CliEnvVarTests(unittest.TestCase):
         self.assertEqual(image_cli.AGENT_CLI_BASE_IMAGE, "agent-cli-base")
         self.assertEqual(image_cli.DEFAULT_BASE_IMAGE, "agent-cli-base")
         self.assertIn("ARG BASE_IMAGE=agent-cli-base", content)
+
+    def test_resolved_agent_hub_data_dir_uses_canonical_default_when_legacy_state_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home_dir = Path(tmp) / "home"
+            default_dir = home_dir / ".local" / "share" / "agent_hub"
+            legacy_dir = home_dir / ".local" / "share" / "agent-hub"
+            default_dir.mkdir(parents=True, exist_ok=True)
+            legacy_dir.mkdir(parents=True, exist_ok=True)
+            (legacy_dir / "state.json").write_text("{}", encoding="utf-8")
+            with patch("agent_cli.cli.Path.home", return_value=home_dir):
+                resolved = image_cli._resolved_agent_hub_data_dir()
+            self.assertEqual(resolved, default_dir)
 
     def test_agent_cli_base_dockerfile_uses_ubuntu_24_04(self) -> None:
         content = AGENT_CLI_BASE_DOCKERFILE.read_text(encoding="utf-8")
@@ -7166,6 +7877,425 @@ class CliEnvVarTests(unittest.TestCase):
         with self.assertRaises(Exception):
             image_cli._parse_env_var("NO_EQUALS", "--env-var")
 
+    def test_get_provider_unknown_raises_value_error(self) -> None:
+        with self.assertRaises(ValueError):
+            image_cli.agent_providers.get_provider("unsupported")
+
+    def test_agent_cli_unknown_agent_command_fails_without_provider_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n",
+                encoding="utf-8",
+            )
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-command",
+                        "unsupported-agent",
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("Unsupported --agent-command", result.output)
+
+    def test_agent_cli_explicit_missing_config_file_fails_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            missing_config = tmp_path / "missing.config.toml"
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ):
+                result_flag = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(missing_config),
+                    ],
+                )
+                result_equals = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        f"--config-file={missing_config}",
+                    ],
+                )
+
+            self.assertNotEqual(result_flag.exit_code, 0)
+            self.assertNotEqual(result_equals.exit_code, 0)
+            self.assertIn("Agent config file does not exist", result_flag.output)
+            self.assertIn("Agent config file does not exist", result_equals.output)
+
+    def test_agent_cli_explicit_missing_system_prompt_file_fails_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n",
+                encoding="utf-8",
+            )
+            missing_prompt = tmp_path / "missing.SYSTEM_PROMPT.md"
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ):
+                result_flag = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--system-prompt-file",
+                        str(missing_prompt),
+                    ],
+                )
+                result_equals = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        f"--system-prompt-file={missing_prompt}",
+                    ],
+                )
+
+            self.assertNotEqual(result_flag.exit_code, 0)
+            self.assertNotEqual(result_equals.exit_code, 0)
+            self.assertIn("System prompt file does not exist", result_flag.output)
+            self.assertIn("System prompt file does not exist", result_equals.output)
+
+    def test_agent_cli_rejects_base_with_base_docker_context_or_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("[runtime]\n", encoding="utf-8")
+
+            runner = CliRunner()
+            result = runner.invoke(
+                image_cli.main,
+                [
+                    "--project",
+                    str(project),
+                    "--config-file",
+                    str(config),
+                    "--base",
+                    str(project),
+                    "--base-docker-context",
+                    str(project),
+                ],
+            )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("--base cannot be combined with --base-docker-context", result.output)
+
+    def test_agent_cli_rejects_base_image_with_base_docker_source_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("[runtime]\n", encoding="utf-8")
+
+            runner = CliRunner()
+            result = runner.invoke(
+                image_cli.main,
+                [
+                    "--project",
+                    str(project),
+                    "--config-file",
+                    str(config),
+                    "--base-image",
+                    "ubuntu:24.04",
+                    "--base-docker-context",
+                    str(project),
+                ],
+            )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("--base-image cannot be combined", result.output)
+
+    def test_agent_cli_rejects_base_image_tag_without_docker_source_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("[runtime]\n", encoding="utf-8")
+
+            runner = CliRunner()
+            result = runner.invoke(
+                image_cli.main,
+                [
+                    "--project",
+                    str(project),
+                    "--config-file",
+                    str(config),
+                    "--base-image-tag",
+                    "agent-custom-base:test",
+                ],
+            )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("--base-image-tag requires --base", result.output)
+
+    def test_agent_cli_native_run_mode_from_config_fails_without_docker_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nrun_mode = 'native'\n",
+                encoding="utf-8",
+            )
+
+            runner = CliRunner()
+
+            def fake_which(name: str) -> str | None:
+                if name in {"docker", "codex"}:
+                    return f"/usr/bin/{name}"
+                return None
+
+            with patch("agent_cli.cli.shutil.which", side_effect=fake_which), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("run_mode=native is configured", result.output)
+
+    def test_agent_cli_run_mode_override_takes_precedence_over_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nrun_mode = 'native'\n",
+                encoding="utf-8",
+            )
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._validate_rw_mount", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--run-mode",
+                        "docker",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+
+    def test_agent_cli_uses_config_identity_defaults_when_flags_not_provided(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\nuid = 1234\ngid = 2345\nusername = 'config-user'\nsupplementary_gids = '3000,3001'\n\n"
+                "[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nrun_mode = 'docker'\n",
+                encoding="utf-8",
+            )
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._validate_rw_mount", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            self.assertIn("--user", run_cmd)
+            self.assertIn("1234:2345", run_cmd)
+            env_values = [
+                run_cmd[index + 1]
+                for index, part in enumerate(run_cmd[:-1])
+                if part == "--env"
+            ]
+            self.assertIn("LOCAL_USER=config-user", env_values)
+            self.assertIn("--group-add", run_cmd)
+            self.assertIn("3000", run_cmd)
+            self.assertIn("3001", run_cmd)
+
+    def test_agent_cli_rejects_partial_config_uid_gid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\nuid = 1234\n\n"
+                "[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nrun_mode = 'docker'\n",
+                encoding="utf-8",
+            )
+
+            runner = CliRunner()
+            with patch("agent_cli.cli._validate_daemon_visible_mount_source", return_value=None), patch(
+                "agent_cli.cli._read_system_prompt", return_value=""
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("identity.uid and identity.gid must be set together", result.output)
+
+    def test_agent_cli_runtime_identity_from_config_uses_canonical_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = tmp_path / "identity.config.toml"
+            config.write_text(
+                (
+                    "[identity]\n"
+                    "uid = 1010\n"
+                    "gid = 2020\n"
+                    "username = 'config-user'\n"
+                    "supplementary_gids = '3000,3001'\n\n"
+                    "[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                    "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n"
+                ),
+                encoding="utf-8",
+            )
+
+            runtime_config = image_cli.load_agent_runtime_config(config)
+            self.assertEqual(
+                image_cli._runtime_identity_from_config(runtime_config),
+                (1010, 2020, "config-user", "3000,3001"),
+            )
+
+    def test_agent_cli_translates_identity_error_at_click_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n"
+                "[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nrun_mode = 'docker'\n",
+                encoding="utf-8",
+            )
+            system_prompt = tmp_path / "SYSTEM_PROMPT.md"
+            system_prompt.write_text("system prompt", encoding="utf-8")
+
+            runner = CliRunner()
+            with patch("agent_cli.cli._validate_daemon_visible_mount_source", return_value=None), patch(
+                "agent_cli.cli.core_identity.resolve_runtime_identity",
+                side_effect=IdentityError("identity exploded"),
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--system-prompt-file",
+                        str(system_prompt),
+                        "--run-mode",
+                        "docker",
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("identity exploded", result.output)
+
     def test_snapshot_setup_script_prepares_workspace_tmp(self) -> None:
         script = image_cli._build_snapshot_setup_shell_script(
             "echo hello",
@@ -7192,6 +8322,46 @@ class CliEnvVarTests(unittest.TestCase):
         self.assertTrue(second_runtime.startswith("agent-runtime-setup-"))
         self.assertNotEqual(first_runtime, second_runtime)
 
+    def test_snapshot_service_fails_fast_when_user_flag_missing_for_setup_rewrite(self) -> None:
+        service = SnapshotService(
+            none_provider=image_cli.AGENT_PROVIDER_NONE,
+            codex_provider=image_cli.AGENT_PROVIDER_CODEX,
+            claude_provider=image_cli.AGENT_PROVIDER_CLAUDE,
+            gemini_provider=image_cli.AGENT_PROVIDER_GEMINI,
+            default_container_home=image_cli.DEFAULT_CONTAINER_HOME,
+            snapshot_source_project_path=image_cli.SNAPSHOT_SOURCE_PROJECT_PATH,
+            snapshot_setup_runtime_image_for_snapshot=lambda _tag: "setup-runtime:test",
+            snapshot_runtime_image_for_provider=lambda _tag, _provider: "provider-runtime:test",
+            ensure_runtime_image_built_if_missing=lambda **_kwargs: None,
+            build_runtime_image=lambda **_kwargs: None,
+            build_snapshot_setup_shell_script=lambda *_args, **_kwargs: "echo setup",
+            sanitize_tag_component=lambda value: value,
+            short_hash=lambda _value: "abc123",
+            docker_rm_force=lambda _name: None,
+            run_command=lambda _cmd, _cwd: None,
+            click_echo=lambda *_args, **_kwargs: None,
+        )
+
+        with self.assertRaises(ClickException) as exc:
+            service.resolve_runtime_image(
+                default_runtime_image="runtime:test",
+                selected_agent_provider=image_cli.AGENT_PROVIDER_CODEX,
+                snapshot_tag="snapshot:test",
+                prepare_snapshot_only=True,
+                cached_snapshot_exists=False,
+                use_project_bind_mount=False,
+                setup_script="echo hello",
+                run_args=["--init", "--workdir", "/workspace/project"],
+                daemon_project_path=Path("/workspace/project"),
+                container_project_path="/workspace/project",
+                project_path=Path("/workspace/project"),
+                uid=1000,
+                gid=1000,
+                ensure_selected_base_image=lambda: "base:test",
+            )
+
+        self.assertIn("include --user", str(exc.exception))
+
     def test_prepare_daemon_visible_file_mount_source_fails_when_daemon_resolves_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "config.toml"
@@ -7202,7 +8372,7 @@ class CliEnvVarTests(unittest.TestCase):
                 "agent_cli.cli._daemon_mount_source_kind",
                 return_value="dir",
             ):
-                with self.assertRaises(ClickException) as exc:
+                with self.assertRaises(hub_server.MountVisibilityError) as exc:
                     image_cli._prepare_daemon_visible_file_mount_source(
                         source,
                         label="--config-file",
@@ -7227,13 +8397,90 @@ class CliEnvVarTests(unittest.TestCase):
                 )
             self.assertEqual(resolved, source.resolve())
 
+    def test_prepare_daemon_visible_file_mount_source_validates_translated_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "config.toml"
+            source.write_text("model='test'\n", encoding="utf-8")
+            translated = Path("/tmp/translated-config.toml")
+            with patch("agent_cli.cli._is_running_inside_container", return_value=True), patch(
+                "agent_cli.cli._daemon_visible_mount_source",
+                return_value=translated,
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind",
+                return_value="file",
+            ), patch("agent_cli.cli._validate_daemon_visible_mount_source") as validate_mount:
+                image_cli._prepare_daemon_visible_file_mount_source(
+                    source,
+                    label="--config-file",
+                )
+
+            self.assertEqual(validate_mount.call_count, 2)
+            self.assertEqual(validate_mount.call_args_list[0].kwargs["label"], "--config-file")
+            self.assertEqual(validate_mount.call_args_list[1].kwargs["label"], "--config-file (mapped)")
+            self.assertEqual(validate_mount.call_args_list[1].args[0], translated)
+
+    def test_agent_cli_fails_when_mapped_ro_mount_source_validation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n",
+                encoding="utf-8",
+            )
+            ro_mount = tmp_path / "ro-mount"
+            ro_mount.mkdir(parents=True, exist_ok=True)
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            def fake_validate(path: Path, *, label: str) -> None:
+                if label == "--ro-mount (mapped)" and Path(path) == Path("/tmp/mapped-ro-mount"):
+                    raise ClickException("mapped mount source is not daemon-visible")
+
+            def fake_mapped_source(path: Path) -> Path:
+                if path.resolve() == ro_mount.resolve():
+                    return Path("/tmp/mapped-ro-mount")
+                return path.resolve()
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", side_effect=fake_validate
+            ), patch(
+                "agent_cli.cli._daemon_visible_mount_source", side_effect=fake_mapped_source
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--ro-mount",
+                        f"{ro_mount}:/workspace/external",
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("mapped mount source is not daemon-visible", result.output)
+            self.assertEqual(commands, [])
+
     def test_snapshot_commit_resets_entrypoint_and_cmd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -7326,7 +8573,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -7368,7 +8615,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
             rw_mount = tmp_path / "rw-mount"
             locked_dir = rw_mount / "x86_64-linux" / "packages"
             locked_dir.mkdir(parents=True, exist_ok=True)
@@ -7421,7 +8668,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
             rw_mount = tmp_path / "rw-mount"
             rw_mount.mkdir(parents=True, exist_ok=True)
 
@@ -7450,6 +8697,8 @@ class CliEnvVarTests(unittest.TestCase):
                         str(config),
                         "--local-uid",
                         "999999",
+                        "--local-user",
+                        "host-user",
                         "--rw-mount",
                         f"{rw_mount}:/workspace/.ark_toolchain_cache",
                         "--snapshot-image-tag",
@@ -7465,13 +8714,71 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("owner uid does not match runtime uid", result.output)
             self.assertEqual(commands, [])
 
+    def test_non_snapshot_launch_validates_rw_mount_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n",
+                encoding="utf-8",
+            )
+            rw_mount = tmp_path / "rw-mount"
+            rw_mount.mkdir(parents=True, exist_ok=True)
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._validate_rw_mount", return_value=None
+            ) as validate_rw_mount, patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--rw-mount",
+                        f"{rw_mount}:/workspace/.cache",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            self.assertIn("Running RW mount preflight checks", result.output)
+            validate_rw_mount.assert_any_call(
+                rw_mount,
+                "/workspace/.cache",
+                runtime_uid=os.getuid(),
+                runtime_gid=os.getgid(),
+            )
+            validate_rw_mount.assert_any_call(
+                project,
+                "/workspace/project",
+                runtime_uid=os.getuid(),
+                runtime_gid=os.getgid(),
+            )
+            docker_run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(docker_run_cmd)
+
     def test_build_agent_tools_runtime_config_includes_agent_tools_env_table(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             config = tmp_path / "agent.config.toml"
             host_codex_dir = tmp_path / ".codex"
             host_codex_dir.mkdir(parents=True, exist_ok=True)
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             runtime_config = image_cli._build_agent_tools_runtime_config(
                 config_path=config,
@@ -7584,7 +8891,10 @@ class CliEnvVarTests(unittest.TestCase):
             config = tmp_path / "agent.config.toml"
             host_codex_dir = tmp_path / ".codex"
             host_codex_dir.mkdir(parents=True, exist_ok=True)
-            config.write_text("model = 'test'\\n\\n[tui]\\nanimations = false\\n", encoding="utf-8")
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n\n[tui]\nanimations = false\n",
+                encoding="utf-8",
+            )
 
             runtime_config = image_cli._build_agent_tools_runtime_config(
                 config_path=config,
@@ -7607,7 +8917,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
             agent_home = tmp_path / "agent-home"
 
             captured_paths: list[Path] = []
@@ -7654,8 +8964,8 @@ class CliEnvVarTests(unittest.TestCase):
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
             runtime_config = tmp_path / "runtime-agent-tools.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
-            runtime_config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
+            runtime_config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             class FakeBridge:
                 def __init__(self, runtime_path: Path):
@@ -7726,8 +9036,8 @@ class CliEnvVarTests(unittest.TestCase):
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
             runtime_config = tmp_path / "runtime-agent-tools.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
-            runtime_config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
+            runtime_config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             class FakeBridge:
                 def __init__(self, runtime_path: Path):
@@ -7792,7 +9102,7 @@ class CliEnvVarTests(unittest.TestCase):
             config = tmp_path / "agent.config.toml"
             runtime_config = tmp_path / "runtime-agent-tools.json"
             agent_home = tmp_path / "agent-home"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
             runtime_config.write_text("{}", encoding="utf-8")
 
             class FakeBridge:
@@ -7865,7 +9175,10 @@ class CliEnvVarTests(unittest.TestCase):
             config = tmp_path / "agent.config.toml"
             runtime_config = tmp_path / "runtime-agent-tools.json"
             agent_home = tmp_path / "agent-home"
-            config.write_text("model = 'test'\\n", encoding="utf-8")
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n",
+                encoding="utf-8",
+            )
             runtime_config.write_text("{}", encoding="utf-8")
 
             class FakeBridge:
@@ -7936,7 +9249,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -7991,7 +9304,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -8043,7 +9356,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -8093,7 +9406,7 @@ class CliEnvVarTests(unittest.TestCase):
             config = tmp_path / "agent.config.toml"
             system_prompt = tmp_path / "SYSTEM_PROMPT.md"
             config.write_text(
-                "model = 'test'\n"
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n"
                 "project_doc_auto_load = true\n"
                 "project_doc_fallback_filenames = ['AGENTS.md', 'README.md']\n"
                 "project_doc_auto_load_extra_filenames = ['docs/agent-setup.md']\n"
@@ -8159,7 +9472,7 @@ class CliEnvVarTests(unittest.TestCase):
             config = tmp_path / "agent.config.toml"
             system_prompt = tmp_path / "SYSTEM_PROMPT.md"
             config.write_text(
-                "model = 'test'\n"
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n"
                 "project_doc_auto_load = true\n"
                 "project_doc_fallback_filenames = ['AGENTS.md']\n",
                 encoding="utf-8",
@@ -8215,7 +9528,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -8262,7 +9575,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -8306,25 +9619,18 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("--no-sandbox", gemini_args)
             self.assertNotIn("yolo", gemini_args)
 
-    def test_shared_prompt_context_from_config_parses_json_config_file(self) -> None:
+    def test_shared_prompt_context_from_runtime_config_uses_toml_runtime_config_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            config = tmp_path / "runtime-config.json"
+            config = tmp_path / "runtime-config.toml"
             config.write_text(
-                json.dumps(
-                    {
-                        "project_doc_auto_load": True,
-                        "project_doc_fallback_filenames": ["AGENTS.md", "README.md"],
-                        "project_doc_auto_load_extra_filenames": ["docs/agent-setup.md"],
-                        "project_doc_max_bytes": 4096,
-                    },
-                    indent=2,
-                ),
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nproject_doc_auto_load = true\nproject_doc_fallback_filenames = ['AGENTS.md', 'README.md']\nproject_doc_auto_load_extra_filenames = ['docs/agent-setup.md']\nproject_doc_max_bytes = 4096\n",
                 encoding="utf-8",
             )
+            runtime_config = image_cli.load_agent_runtime_config(config)
 
-            shared_prompt = image_cli._shared_prompt_context_from_config(
-                config,
+            shared_prompt = image_cli._shared_prompt_context_from_runtime_config(
+                runtime_config,
                 core_system_prompt="Shared instruction for this run.",
             )
 
@@ -8349,7 +9655,7 @@ class CliEnvVarTests(unittest.TestCase):
             )
             config = tmp_path / "agent.config.toml"
             config.write_text(
-                "model = 'test'\n"
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n"
                 "project_doc_auto_load = true\n"
                 "project_doc_fallback_filenames = ['AGENTS.md', 'README.md']\n"
                 "project_doc_auto_load_extra_filenames = ['docs/agent-setup.md']\n"
@@ -8393,8 +9699,8 @@ class CliEnvVarTests(unittest.TestCase):
 
             self.assertEqual(result.exit_code, 0, msg=result.output)
             updated_context = gemini_context_file.read_text(encoding="utf-8")
-            expected_context = image_cli._shared_prompt_context_from_config(
-                config,
+            expected_context = image_cli._shared_prompt_context_from_runtime_config(
+                image_cli.load_agent_runtime_config(config),
                 core_system_prompt=system_prompt.read_text(encoding="utf-8").strip(),
             )
             self.assertEqual(updated_context, f"{expected_context}\n")
@@ -8412,7 +9718,7 @@ class CliEnvVarTests(unittest.TestCase):
             gemini_context_file.parent.mkdir(parents=True, exist_ok=True)
             gemini_context_file.write_text("Pre-existing Gemini-only context.\n", encoding="utf-8")
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
             system_prompt.write_text("\n", encoding="utf-8")
 
             commands: list[list[str]] = []
@@ -8454,7 +9760,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -8504,7 +9810,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -8552,7 +9858,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -8600,7 +9906,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -8658,7 +9964,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -8716,7 +10022,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -8763,7 +10069,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -8832,7 +10138,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -8959,7 +10265,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -9005,7 +10311,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -9040,7 +10346,8 @@ class CliEnvVarTests(unittest.TestCase):
             image_index = run_cmd.index(image_cli.DEFAULT_RUNTIME_IMAGE)
             resume_script = run_cmd[image_index + 3]
             self.assertIn("codex --ask-for-approval never --sandbox danger-full-access --config", resume_script)
-            self.assertIn("--no-alt-screen resume --last", resume_script)
+            self.assertIn("--no-alt-screen", resume_script)
+            self.assertIn("resume --last", resume_script)
             self.assertIn("developer_instructions=", resume_script)
             self.assertIn("exec codex --ask-for-approval never --sandbox danger-full-access --config", resume_script)
 
@@ -9050,7 +10357,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
@@ -9081,7 +10388,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
             agent_home = tmp_path / "agent-home"
 
             commands: list[list[str]] = []
@@ -9129,24 +10436,18 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn(claude_config_mount, run_cmd)
             self.assertIn(gemini_mount, run_cmd)
 
-    def test_cli_ignores_custom_git_credential_flags(self) -> None:
+    def test_cli_rejects_custom_git_credential_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
             credential_file = tmp_path / "github_credentials"
             credential_file.write_text(
                 "https://x-access-token:ghs_test_installation_token@github.com\n",
                 encoding="utf-8",
             )
-
-            commands: list[list[str]] = []
-
-            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
-                del cwd
-                commands.append(list(cmd))
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
@@ -9155,8 +10456,6 @@ class CliEnvVarTests(unittest.TestCase):
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
-            ), patch(
-                "agent_cli.cli._run", side_effect=fake_run
             ):
                 result = runner.invoke(
                     image_cli.main,
@@ -9172,41 +10471,21 @@ class CliEnvVarTests(unittest.TestCase):
                     ],
                 )
 
-            self.assertEqual(result.exit_code, 0, msg=result.output)
-            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
-            self.assertIsNotNone(run_cmd)
-            assert run_cmd is not None
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("The --git-credential-* flags are no longer supported.", result.output)
 
-            env_values = [
-                run_cmd[index + 1]
-                for index, part in enumerate(run_cmd[:-1])
-                if part == "--env"
-            ]
-            self.assertNotIn("GIT_TERMINAL_PROMPT=0", env_values)
-            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIALS_") for value in env_values))
-            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIAL_HOST=") for value in env_values))
-            self.assertFalse(any(value.startswith("GIT_CONFIG_KEY_") for value in env_values))
-            self.assertFalse(any(value.startswith("GIT_CONFIG_VALUE_") for value in env_values))
-            self.assertIn("Ignoring --git-credential-* flags.", result.output)
-
-    def test_cli_ignores_custom_git_credential_flags_with_host_port_and_scheme(self) -> None:
+    def test_cli_rejects_custom_git_credential_flags_with_host_port_and_scheme(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
             credential_file = tmp_path / "gitlab_credentials"
             credential_file.write_text(
                 "http://gitlab-user:glpat_local_test_token@gitlab.local:8929\n",
                 encoding="utf-8",
             )
-
-            commands: list[list[str]] = []
-
-            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
-                del cwd
-                commands.append(list(cmd))
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
@@ -9215,8 +10494,6 @@ class CliEnvVarTests(unittest.TestCase):
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
-            ), patch(
-                "agent_cli.cli._run", side_effect=fake_run
             ):
                 result = runner.invoke(
                     image_cli.main,
@@ -9234,21 +10511,8 @@ class CliEnvVarTests(unittest.TestCase):
                     ],
                 )
 
-            self.assertEqual(result.exit_code, 0, msg=result.output)
-            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
-            self.assertIsNotNone(run_cmd)
-            assert run_cmd is not None
-
-            env_values = [
-                run_cmd[index + 1]
-                for index, part in enumerate(run_cmd[:-1])
-                if part == "--env"
-            ]
-            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIAL_HOST=") for value in env_values))
-            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIAL_SCHEME=") for value in env_values))
-            self.assertFalse(any(value.startswith("GIT_CONFIG_KEY_") for value in env_values))
-            self.assertFalse(any(value.startswith("GIT_CONFIG_VALUE_") for value in env_values))
-            self.assertIn("Ignoring --git-credential-* flags.", result.output)
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("The --git-credential-* flags are no longer supported.", result.output)
 
     def test_cli_does_not_auto_discover_agent_hub_git_credentials_when_flags_not_provided(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9256,13 +10520,13 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             stored_credentials = (
                 tmp_path
                 / ".local"
                 / "share"
-                / "agent-hub"
+                / "agent_hub"
                 / image_cli.AGENT_HUB_SECRETS_DIR_NAME
                 / image_cli.AGENT_HUB_GIT_CREDENTIALS_DIR_NAME
                 / "discovered-github.git-credentials"
@@ -9321,13 +10585,13 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             stored_credentials = (
                 tmp_path
                 / ".local"
                 / "share"
-                / "agent-hub"
+                / "agent_hub"
                 / image_cli.AGENT_HUB_SECRETS_DIR_NAME
                 / image_cli.AGENT_HUB_GIT_CREDENTIALS_DIR_NAME
                 / "discovered-ghe.git-credentials"
@@ -9385,13 +10649,13 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             stored_credentials = (
                 tmp_path
                 / ".local"
                 / "share"
-                / "agent-hub"
+                / "agent_hub"
                 / image_cli.AGENT_HUB_SECRETS_DIR_NAME
                 / image_cli.AGENT_HUB_GIT_CREDENTIALS_DIR_NAME
                 / "discovered-host-port.git-credentials"
@@ -9450,7 +10714,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -9492,7 +10756,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "demo-project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -9544,7 +10808,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -9590,7 +10854,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -9640,7 +10904,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
             rw_mount = tmp_path / "rw-cache"
             rw_mount.mkdir(parents=True, exist_ok=True)
 
@@ -9680,7 +10944,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -9691,6 +10955,8 @@ class CliEnvVarTests(unittest.TestCase):
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._validate_rw_mount", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
             ), patch(
@@ -9709,6 +10975,8 @@ class CliEnvVarTests(unittest.TestCase):
                         "1234",
                         "--local-gid",
                         "2345",
+                        "--local-user",
+                        "host-user",
                         "--local-supplementary-gids",
                         "3000,3001",
                     ],
@@ -9727,14 +10995,14 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("4444", run_cmd)
 
     def test_cli_bootstrap_as_root_passes_local_identity_env(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/workspace/tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             agent_home = tmp_path / "agent-home"
             agent_home.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -9745,6 +11013,8 @@ class CliEnvVarTests(unittest.TestCase):
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._validate_rw_mount", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
             ), patch(
@@ -9763,6 +11033,8 @@ class CliEnvVarTests(unittest.TestCase):
                         "1234",
                         "--local-gid",
                         "2345",
+                        "--local-user",
+                        "host-user",
                         "--local-supplementary-gids",
                         "3000,3001",
                         "--bootstrap-as-root",
@@ -9785,7 +11057,7 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             commands: list[list[str]] = []
 
@@ -9830,7 +11102,10 @@ class CliEnvVarTests(unittest.TestCase):
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\\n", encoding="utf-8")
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n",
+                encoding="utf-8",
+            )
 
             commands: list[list[str]] = []
 
@@ -9870,7 +11145,7 @@ class CliEnvVarTests(unittest.TestCase):
             tmp_path = Path(tmp)
             data_dir = tmp_path / "hub"
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             with patch("agent_hub.server.uvicorn.run", return_value=None), patch.object(
                 hub_server.HubState,
@@ -9898,13 +11173,80 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertEqual(clean_patch.call_count, 1)
             self.assertIn("Clean start completed", result.output)
 
+    def test_agent_hub_main_fails_fast_for_non_docker_effective_run_mode(self) -> None:
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = tmp_path / "hub"
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nrun_mode = 'native'\n",
+                encoding="utf-8",
+            )
+
+            with patch("agent_hub.server._ensure_frontend_built") as build_frontend, patch(
+                "agent_hub.server.HubState"
+            ) as state_cls, patch(
+                "agent_hub.server.uvicorn.run",
+                return_value=None,
+            ):
+                result = runner.invoke(
+                    hub_server.main,
+                    [
+                        "--data-dir",
+                        str(data_dir),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("effective docker runtime mode", result.output)
+            build_frontend.assert_not_called()
+            state_cls.assert_not_called()
+
+    def test_agent_hub_main_fails_fast_when_runtime_strict_mode_disabled(self) -> None:
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = tmp_path / "hub"
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                (
+                    "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                    "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nstrict_mode = false\n"
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("agent_hub.server._ensure_frontend_built") as build_frontend, patch(
+                "agent_hub.server.HubState"
+            ) as state_cls, patch(
+                "agent_hub.server.uvicorn.run",
+                return_value=None,
+            ):
+                result = runner.invoke(
+                    hub_server.main,
+                    [
+                        "--data-dir",
+                        str(data_dir),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("runtime.strict_mode=true", result.output)
+            build_frontend.assert_not_called()
+            state_cls.assert_not_called()
+
     def test_agent_hub_main_respects_log_level_flag(self) -> None:
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             data_dir = tmp_path / "hub"
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             with patch("agent_hub.server.uvicorn.run", return_value=None) as uvicorn_run:
                 result = runner.invoke(
@@ -9925,13 +11267,98 @@ class CliEnvVarTests(unittest.TestCase):
             kwargs = uvicorn_run.call_args.kwargs
             self.assertEqual(kwargs.get("log_level"), "warning")
 
+    def test_agent_hub_main_ignores_log_level_env_fallback(self) -> None:
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = tmp_path / "hub"
+            config = tmp_path / "agent.config.toml"
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"AGENT_HUB_LOG_LEVEL": "error"}, clear=False), patch(
+                "agent_hub.server.uvicorn.run",
+                return_value=None,
+            ) as uvicorn_run:
+                result = runner.invoke(
+                    hub_server.main,
+                    [
+                        "--data-dir",
+                        str(data_dir),
+                        "--config-file",
+                        str(config),
+                        "--no-frontend-build",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            kwargs = uvicorn_run.call_args.kwargs
+            self.assertEqual(kwargs.get("log_level"), "info")
+
+    def test_agent_hub_main_uses_config_log_level_without_log_level_flag(self) -> None:
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = tmp_path / "hub"
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\nlevel = 'warning'\n\n[runtime]\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"AGENT_HUB_LOG_LEVEL": "error"}, clear=False), patch(
+                "agent_hub.server.uvicorn.run",
+                return_value=None,
+            ) as uvicorn_run:
+                result = runner.invoke(
+                    hub_server.main,
+                    [
+                        "--data-dir",
+                        str(data_dir),
+                        "--config-file",
+                        str(config),
+                        "--no-frontend-build",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            kwargs = uvicorn_run.call_args.kwargs
+            self.assertEqual(kwargs.get("log_level"), "warning")
+
+    def test_agent_hub_main_rejects_invalid_config_log_level(self) -> None:
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = tmp_path / "hub"
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\nlevel = 'invalid-level'\n\n[runtime]\n",
+                encoding="utf-8",
+            )
+
+            with patch("agent_hub.server.uvicorn.run", return_value=None) as uvicorn_run:
+                result = runner.invoke(
+                    hub_server.main,
+                    [
+                        "--data-dir",
+                        str(data_dir),
+                        "--config-file",
+                        str(config),
+                        "--no-frontend-build",
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIsNotNone(result.exception)
+            self.assertIn("Invalid logging.level", str(result.exception))
+            uvicorn_run.assert_not_called()
+
     def test_agent_hub_main_caps_uvicorn_log_level_at_info_for_debug(self) -> None:
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             data_dir = tmp_path / "hub"
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             with patch("agent_hub.server.uvicorn.run", return_value=None) as uvicorn_run:
                 result = runner.invoke(
@@ -9957,7 +11384,7 @@ class CliEnvVarTests(unittest.TestCase):
             tmp_path = Path(tmp)
             data_dir = tmp_path / "hub"
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             with patch("agent_hub.server.HubState") as state_cls, patch(
                 "agent_hub.server.uvicorn.run",
@@ -9986,7 +11413,7 @@ class CliEnvVarTests(unittest.TestCase):
             tmp_path = Path(tmp)
             data_dir = tmp_path / "hub"
             config = tmp_path / "agent.config.toml"
-            config.write_text("model = 'test'\n", encoding="utf-8")
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
 
             with patch("agent_hub.server.HubState") as state_cls, patch(
                 "agent_hub.server.uvicorn.run",
@@ -10015,7 +11442,7 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         self.tmp_path = Path(self.tmp.name)
         self.data_dir = self.tmp_path / "hub"
         self.config = self.tmp_path / "agent.config.toml"
-        self.config.write_text("model = 'test'\n", encoding="utf-8")
+        self.config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
         self.runner = CliRunner()
         self.host_user_patcher = patch.dict(
             os.environ,
@@ -10064,7 +11491,7 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             "agent_hub.server.asyncio.to_thread",
             new=AsyncMock(side_effect=self._fake_to_thread),
         ) as to_thread, patch.object(
-            hub_server.HubState,
+            hub_server.AutoConfigService,
             "auto_configure_project",
             return_value=recommendation,
         ) as auto_config:
@@ -10104,12 +11531,42 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 400, msg=response.text)
         self.assertEqual(response.json()["detail"], "agent_args must be an array.")
+        self.assertEqual(response.json()["error_code"], "BAD_REQUEST")
+
+    def test_auto_configure_route_rejects_invalid_agent_type(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.AutoConfigService, "auto_configure_project") as auto_configure:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/auto-configure",
+                    json={
+                        "repo_url": "https://example.com/org/repo.git",
+                        "agent_type": "invalid-agent",
+                        "agent_args": [],
+                    },
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertIn("agent_type must be one of", response.json()["detail"])
+        auto_configure.assert_not_called()
+
+    def test_auto_configure_route_rejects_malformed_json(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.AutoConfigService, "auto_configure_project") as auto_configure:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/auto-configure",
+                    data='{"repo_url":',
+                    headers={"content-type": "application/json"},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        auto_configure.assert_not_called()
 
     def test_auto_configure_cancel_route_calls_state_and_returns_result(self) -> None:
         app = self._build_app()
         cancellation_result = {"request_id": "pending-auto-123", "cancelled": True, "active": True}
         with patch.object(
-            hub_server.HubState,
+            hub_server.AutoConfigService,
             "cancel_auto_configure_project",
             return_value=cancellation_result,
         ) as cancel_auto_config:
@@ -10129,12 +11586,26 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             response = client.post("/api/projects/auto-configure/cancel", json=["not-an-object"])
         self.assertEqual(response.status_code, 400, msg=response.text)
         self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        self.assertEqual(response.json()["error_code"], "BAD_REQUEST")
+
+    def test_auto_configure_cancel_route_rejects_malformed_json(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.AutoConfigService, "cancel_auto_configure_project") as cancel_auto_config:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/auto-configure/cancel",
+                    data='{"request_id":',
+                    headers={"content-type": "application/json"},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        cancel_auto_config.assert_not_called()
 
     def test_project_build_cancel_route_calls_state_and_returns_result(self) -> None:
         app = self._build_app()
         cancellation_result = {"project_id": "project-1", "cancelled": True, "active": True}
         with patch.object(
-            hub_server.HubState,
+            hub_server.ProjectService,
             "cancel_project_build",
             return_value=cancellation_result,
         ) as cancel_project_build:
@@ -10162,8 +11633,8 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             "agent_hub.server.asyncio.to_thread",
             new=AsyncMock(side_effect=self._fake_to_thread),
         ) as to_thread, patch.object(
-            hub_server.HubState,
-            "add_project",
+            hub_server.ProjectService,
+            "create_project",
             return_value=project,
         ) as add_project:
             with TestClient(app) as client:
@@ -10198,6 +11669,80 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             credential_binding={"mode": "auto", "credential_ids": [], "source": "", "updated_at": ""},
         )
 
+    def test_create_project_route_rejects_non_object_payload(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ProjectService, "create_project") as create_project:
+            with TestClient(app) as client:
+                response = client.post("/api/projects", json=["not-an-object"])
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        create_project.assert_not_called()
+
+    def test_create_project_route_rejects_malformed_json(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ProjectService, "create_project") as create_project:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects",
+                    data='{"repo_url":',
+                    headers={"content-type": "application/json"},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        create_project.assert_not_called()
+
+    def test_update_project_route_rejects_non_object_payload(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ProjectService, "update_project") as update_project:
+            with TestClient(app) as client:
+                response = client.patch("/api/projects/project-1", json=["not-an-object"])
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        update_project.assert_not_called()
+
+    def test_update_project_route_rejects_malformed_json(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ProjectService, "update_project") as update_project:
+            with TestClient(app) as client:
+                response = client.patch(
+                    "/api/projects/project-1",
+                    data='{"name":',
+                    headers={"content-type": "application/json"},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        update_project.assert_not_called()
+
+    def test_project_credential_binding_route_rejects_malformed_json(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ProjectService, "attach_project_credentials") as attach_project_credentials:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/project-1/credential-binding",
+                    data='{"mode":',
+                    headers={"content-type": "application/json"},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        attach_project_credentials.assert_not_called()
+
+    def test_create_project_route_rejects_invalid_credential_binding_mode(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ProjectService, "create_project") as create_project:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects",
+                    json={
+                        "repo_url": "https://example.com/org/repo.git",
+                        "name": "demo",
+                        "credential_binding": {"mode": "invalid-mode"},
+                    },
+                )
+        self.assertEqual(response.status_code, 401, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "CREDENTIAL_RESOLUTION_ERROR")
+        self.assertIn("credential_binding.mode must be one of", response.json()["detail"])
+        create_project.assert_not_called()
+
     def test_project_chat_start_route_runs_state_call_in_worker_thread(self) -> None:
         app = self._build_app()
         chat = {"id": "chat-1", "status": "running"}
@@ -10206,7 +11751,7 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             "agent_hub.server.asyncio.to_thread",
             new=AsyncMock(side_effect=self._fake_to_thread),
         ) as to_thread, patch.object(
-            hub_server.HubState,
+            hub_server.ProjectService,
             "create_and_start_chat",
             return_value=chat,
         ) as start_chat:
@@ -10233,7 +11778,7 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             "agent_hub.server.asyncio.to_thread",
             new=AsyncMock(side_effect=self._fake_to_thread),
         ) as to_thread, patch.object(
-            hub_server.HubState,
+            hub_server.ProjectService,
             "create_and_start_chat",
             return_value=chat,
         ) as start_chat:
@@ -10269,7 +11814,7 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             "default_chat_agent_type",
             return_value="claude",
         ) as default_agent_type, patch.object(
-            hub_server.HubState,
+            hub_server.ProjectService,
             "create_and_start_chat",
             return_value=chat,
         ) as start_chat:
@@ -10289,12 +11834,171 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             agent_type="claude",
         )
 
+    def test_project_chat_start_route_rejects_legacy_codex_args(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/projects/project-1/chats/start",
+                json={"agent_type": "codex", "codex_args": ["--model", "gpt-5.3-codex"]},
+            )
+
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "codex_args is no longer supported; use agent_args.")
+
+    def test_project_chat_start_route_requires_agent_args(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/projects/project-1/chats/start",
+                json={"agent_type": "codex"},
+            )
+
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "agent_args is required and must be an array.")
+
+    def test_project_chat_start_route_rejects_invalid_json_body(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/projects/project-1/chats/start",
+                data="{not-json",
+                headers={"content-type": "application/json"},
+            )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+
+    def test_project_chat_start_route_rejects_non_object_body(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/projects/project-1/chats/start",
+                json=["not-an-object"],
+            )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Request body must be an object.")
+
+    def test_project_chat_start_route_rejects_invalid_agent_type(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ProjectService, "create_and_start_chat") as start_chat:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/project-1/chats/start",
+                    json={"agent_type": "invalid-agent", "agent_args": []},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertIn("agent_type must be one of", response.json()["detail"])
+        start_chat.assert_not_called()
+
+    def test_project_chat_start_route_surfaces_config_error_code(self) -> None:
+        app = self._build_app()
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ), patch.object(
+            hub_server.ProjectService,
+            "create_and_start_chat",
+            side_effect=hub_server.ConfigError("chat runtime config invalid"),
+        ):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/project-1/chats/start",
+                    json={"agent_type": "codex", "agent_args": []},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "CONFIG_ERROR")
+
+    def test_create_chat_route_rejects_non_object_payload(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.post("/api/chats", json=["not-an-object"])
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+
+    def test_patch_chat_route_rejects_non_object_payload(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.patch("/api/chats/chat-1", json=["not-an-object"])
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+
+    def test_create_chat_route_rejects_legacy_codex_args(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/chats",
+                json={
+                    "project_id": "project-1",
+                    "codex_args": ["--model", "gpt-5.3-codex"],
+                    "agent_args": [],
+                },
+            )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "codex_args is no longer supported; use agent_args.")
+
+    def test_patch_chat_route_rejects_legacy_codex_args(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.patch(
+                "/api/chats/chat-1",
+                json={"codex_args": ["--model", "gpt-5.3-codex"]},
+            )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "codex_args is no longer supported; use agent_args.")
+
+    def test_create_chat_route_requires_agent_args_array(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/chats",
+                json={"project_id": "project-1", "agent_args": "not-an-array"},
+            )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "agent_args must be an array.")
+
+    def test_create_chat_route_requires_project_id(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.post("/api/chats", json={"agent_args": []})
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "project_id is required.")
+
+    def test_create_chat_route_rejects_invalid_agent_type(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ChatService, "create_chat") as create_chat:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/chats",
+                    json={"project_id": "project-1", "agent_args": [], "agent_type": "invalid-agent"},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertIn("agent_type must be one of", response.json()["detail"])
+        create_chat.assert_not_called()
+
+    def test_patch_chat_route_rejects_invalid_agent_type(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ChatService, "update_chat") as update_chat:
+            with TestClient(app) as client:
+                response = client.patch(
+                    "/api/chats/chat-1",
+                    json={"agent_type": "invalid-agent"},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertIn("agent_type must be one of", response.json()["detail"])
+        update_chat.assert_not_called()
+
+    def test_patch_chat_route_rejects_empty_patch_payload(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.patch("/api/chats/chat-1", json={})
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "No patch values provided.")
+
     def test_chat_refresh_container_route_calls_state_refresh(self) -> None:
         app = self._build_app()
         chat = {"id": "chat-1", "status": "running"}
 
         with patch.object(
-            hub_server.HubState,
+            hub_server.ChatService,
             "refresh_chat_container",
             return_value=chat,
         ) as refresh_chat:
@@ -10313,7 +12017,7 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         }
 
         with patch.object(
-            hub_server.HubState,
+            hub_server.AppStateService,
             "update_settings",
             return_value=updated_settings,
         ) as update_settings:
@@ -10329,12 +12033,19 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             {"default_agent_type": "gemini", "chat_layout_engine": "flexlayout"}
         )
 
+    def test_settings_patch_route_rejects_non_object_payload(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.patch("/api/settings", json=["not-an-object"])
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+
     def test_runtime_flags_route_returns_state_payload(self) -> None:
         app = self._build_app()
         flags_payload = {"ui_lifecycle_debug": True}
 
         with patch.object(
-            hub_server.HubState,
+            hub_server.RuntimeService,
             "runtime_flags_payload",
             return_value=flags_payload,
         ) as runtime_flags_payload:
@@ -10372,11 +12083,11 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         }
 
         with patch.object(
-            hub_server.HubState,
+            hub_server.AppStateService,
             "agent_capabilities_payload",
             return_value=cached_payload,
         ) as read_capabilities, patch.object(
-            hub_server.HubState,
+            hub_server.AppStateService,
             "start_agent_capabilities_discovery",
             return_value=discovery_payload,
         ) as start_discovery:
@@ -10408,11 +12119,11 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         }
 
         with patch.object(
-            hub_server.HubState,
+            hub_server.LifecycleService,
             "forward_openai_account_callback",
             return_value=forwarded_payload,
         ) as forward_callback, patch.object(
-            hub_server.HubState,
+            hub_server.AuthService,
             "openai_account_session_payload",
             return_value=session_payload,
         ):
@@ -10446,11 +12157,11 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         }
 
         with patch.object(
-            hub_server.HubState,
+            hub_server.LifecycleService,
             "forward_openai_account_callback",
             return_value=forwarded_payload,
         ) as forward_callback, patch.object(
-            hub_server.HubState,
+            hub_server.AuthService,
             "openai_account_session_payload",
             return_value=session_payload,
         ):
@@ -10479,6 +12190,104 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         self.assertEqual(request_context.get("x_forwarded_port"), 443)
         self.assertEqual(request_context.get("host_header_host"), "public.example.com")
         self.assertEqual(request_context.get("host_header_port"), 443)
+
+    def test_openai_account_callback_route_surfaces_network_reachability_error_code(self) -> None:
+        app = self._build_app()
+        with patch.object(
+            hub_server.LifecycleService,
+            "forward_openai_account_callback",
+            side_effect=hub_server.NetworkReachabilityError("callback target unreachable"),
+        ):
+            with TestClient(app) as client:
+                response = client.get("/api/settings/auth/openai/account/callback?code=abc")
+        self.assertEqual(response.status_code, 502, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "NETWORK_REACHABILITY_ERROR")
+        self.assertEqual(response.json()["failure_class"], "network")
+        self.assertEqual(response.json()["user_message"], "Required network endpoint is not reachable.")
+        self.assertIn("unreachable", response.json()["detail"])
+
+    def test_agent_tools_credential_resolve_route_surfaces_credential_resolution_error_code(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.CredentialsService, "resolve_token", return_value="token"), patch.object(
+            hub_server.CredentialsService,
+            "resolve_chat_credentials",
+            side_effect=hub_server.CredentialResolutionError("mode must be one of: all, auto, set, single."),
+        ):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/chats/chat-1/agent-tools/credentials/resolve",
+                    json={"mode": "invalid"},
+                )
+        self.assertEqual(response.status_code, 401, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "CREDENTIAL_RESOLUTION_ERROR")
+
+    def test_chat_start_route_surfaces_config_error_code(self) -> None:
+        app = self._build_app()
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ), patch.object(
+            hub_server.ChatService,
+            "start_chat",
+            side_effect=hub_server.ConfigError("invalid runtime config"),
+        ):
+            with TestClient(app) as client:
+                response = client.post("/api/chats/chat-1/start")
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "CONFIG_ERROR")
+        self.assertEqual(response.json()["failure_class"], "configuration")
+        self.assertEqual(response.json()["user_message"], "Configuration is invalid.")
+
+    def test_create_chat_route_surfaces_mount_visibility_error_code(self) -> None:
+        app = self._build_app()
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ), patch.object(
+            hub_server.ChatService,
+            "create_chat",
+            side_effect=hub_server.MountVisibilityError("mount path not visible to daemon"),
+        ):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/chats",
+                    json={"project_id": "project-1", "agent_args": []},
+                )
+        self.assertEqual(response.status_code, 409, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "MOUNT_VISIBILITY_ERROR")
+
+    def test_chat_start_route_surfaces_identity_error_code(self) -> None:
+        app = self._build_app()
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ), patch.object(
+            hub_server.ChatService,
+            "start_chat",
+            side_effect=hub_server.IdentityError("uid/gid mismatch"),
+        ):
+            with TestClient(app) as client:
+                response = client.post("/api/chats/chat-1/start")
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "IDENTITY_ERROR")
+
+    def test_chat_start_route_surfaces_runtime_command_error_code(self) -> None:
+        app = self._build_app()
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ), patch.object(
+            hub_server.ChatService,
+            "start_chat",
+            side_effect=RuntimeCommandError(command=["uv", "run", "agent_hub"], exit_code=3),
+        ):
+            with TestClient(app) as client:
+                response = client.post("/api/chats/chat-1/start")
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "RUNTIME_COMMAND_ERROR")
+        self.assertEqual(response.json()["failure_class"], "runtime_command")
+        self.assertEqual(response.json()["user_message"], "Runtime command execution failed.")
+        self.assertIn("uv run agent_hub", response.json()["detail"])
 
     def test_terminal_websocket_disconnect_during_backlog_send_detaches_listener(self) -> None:
         app = self._build_app()
@@ -10588,7 +12397,11 @@ class DockerEntrypointTests(unittest.TestCase):
                 },
                 clear=False,
             ):
-                path_cls.side_effect = lambda p: tmp_path / "agent_hub_git_credentials" if p == "/tmp/agent_hub_git_credentials" else Path(p)
+                path_cls.side_effect = (
+                    lambda p: tmp_path / "agent_hub_git_credentials"
+                    if p == "/workspace/tmp/agent_hub_git_credentials"
+                    else Path(p)
+                )
                 module._configure_git_auth_from_env()
 
             credential_file = tmp_path / "agent_hub_git_credentials"
@@ -10757,7 +12570,7 @@ class DockerEntrypointTests(unittest.TestCase):
             os.environ,
             {
                 "HOME": "",
-                "LOCAL_HOME": "/tmp/entrypoint-local-home",
+                "LOCAL_HOME": "/workspace/tmp/home/entrypoint-local-home",
                 "LOCAL_UMASK": "0022",
                 "LOCAL_USER": "host-user",
             },
@@ -10779,7 +12592,7 @@ class DockerEntrypointTests(unittest.TestCase):
                 module._entrypoint_main()
             observed_home = str(os.environ.get("HOME") or "")
 
-        self.assertEqual(observed_home, "/tmp/entrypoint-local-home")
+        self.assertEqual(observed_home, "/workspace/tmp/home/entrypoint-local-home")
         execvp.assert_called_once_with("bash", ["bash", "-lc", "echo ok"])
         ensure_workspace_tmp.assert_called_once_with()
         configure_git_auth.assert_called_once_with()
