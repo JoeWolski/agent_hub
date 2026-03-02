@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 import pwd
@@ -37,6 +38,7 @@ from agent_core import (
     RUNTIME_RUN_MODE_NATIVE,
     load_agent_runtime_config,
 )
+from agent_core.errors import MountVisibilityError
 from agent_core import identity as core_identity
 from agent_core import launch as core_launch
 from agent_core import paths as core_paths
@@ -442,9 +444,17 @@ class _AgentToolsRuntimeBridge:
         if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=2.0)
 
+        remove_session = (
+            getattr(self.state, "_remove_agent_tools_session", None) if self.state is not None else None
+        )
         sessions_lock = getattr(self.state, "_agent_tools_sessions_lock", None) if self.state is not None else None
         sessions = getattr(self.state, "_agent_tools_sessions", None) if self.state is not None else None
-        if self.session_id and sessions_lock is not None and isinstance(sessions, dict):
+        if self.session_id and callable(remove_session):
+            try:
+                remove_session(self.session_id)
+            except Exception:
+                pass
+        elif self.session_id and sessions_lock is not None and isinstance(sessions, dict):
             try:
                 with sessions_lock:
                     sessions.pop(self.session_id, None)
@@ -635,10 +645,6 @@ def _start_agent_tools_runtime_bridge(
 
     from agent_hub import server as hub_server
 
-    class _CliHubState(hub_server.HubState):
-        def _reconcile_project_build_state(self) -> None:  # type: ignore[override]
-            return
-
     data_dir = _resolved_agent_hub_data_dir(runtime_config)
     bridge_runtime_config = runtime_config
     if effective_run_mode == RUNTIME_RUN_MODE_DOCKER and runtime_config.runtime.run_mode != RUNTIME_RUN_MODE_DOCKER:
@@ -651,18 +657,30 @@ def _start_agent_tools_runtime_bridge(
             logging=runtime_config.logging,
             runtime=RuntimeConfig(
                 run_mode=RUNTIME_RUN_MODE_DOCKER,
+                strict_mode=bool(runtime_config.runtime.strict_mode),
                 values=dict(runtime_config.runtime.values),
             ),
             extras=dict(runtime_config.extras),
         )
 
-    hub_state = _CliHubState(
-        data_dir=data_dir,
-        config_file=config_path,
-        runtime_config=bridge_runtime_config,
-        system_prompt_file=system_prompt_path,
-        artifact_publish_base_url="http://127.0.0.1",
-    )
+    hub_state_kwargs: dict[str, object] = {
+        "data_dir": data_dir,
+        "config_file": config_path,
+        "runtime_config": bridge_runtime_config,
+        "system_prompt_file": system_prompt_path,
+        "artifact_publish_base_url": "http://127.0.0.1",
+    }
+    try:
+        hub_state_init_signature = inspect.signature(hub_server.HubState.__init__)
+    except (TypeError, ValueError):
+        hub_state_init_signature = None
+    if (
+        hub_state_init_signature is not None
+        and "reconcile_project_build_on_init" in hub_state_init_signature.parameters
+    ):
+        hub_state_kwargs["reconcile_project_build_on_init"] = False
+
+    hub_state = hub_server.HubState(**hub_state_kwargs)
     repo_url = _git_origin_repo_url(project_path)
     project_id = ""
     session_id = ""
@@ -988,20 +1006,12 @@ def _is_running_inside_container() -> bool:
 
 
 def _validate_daemon_visible_mount_source(path: Path, *, label: str) -> None:
-    """
-    Fail fast for mount sources that are frequently invisible to a host Docker daemon
-    when agent_cli itself runs inside a container.
-    """
-    if not _is_running_inside_container():
-        return
-    normalized = path.resolve()
-    for disallowed_root in (Path("/tmp"), Path("/var/tmp")):
-        if normalized == disallowed_root or disallowed_root in normalized.parents:
-            raise click.ClickException(
-                f"{label} must not use container-local '{disallowed_root}' when launching via a host Docker daemon. "
-                f"resolved_path={normalized}. "
-                "Use a daemon-visible path (for example under /workspace or a bind-mounted project directory)."
-            )
+    core_paths.validate_daemon_visible_mount_source(
+        path,
+        label=label,
+        is_running_inside_container=_is_running_inside_container(),
+        error_factory=lambda message: MountVisibilityError(message),
+    )
 
 
 def _daemon_mount_source_kind(path: Path) -> str:
@@ -1031,17 +1041,12 @@ def _daemon_mount_source_kind(path: Path) -> str:
 
 
 def _daemon_visible_mount_source(path: Path) -> Path:
-    source = path.resolve()
-    if not _is_running_inside_container():
-        return source
-    mapped_root = str(os.environ.get(AGENT_HUB_TMP_HOST_PATH_ENV) or "").strip()
-    if not mapped_root:
-        return source
-    try:
-        relative = source.relative_to(DAEMON_TMP_MOUNT_ROOT.resolve())
-    except ValueError:
-        return source
-    return Path(mapped_root) / relative
+    return core_paths.daemon_visible_mount_source(
+        path,
+        is_running_inside_container=_is_running_inside_container(),
+        mapped_tmp_root=str(os.environ.get(AGENT_HUB_TMP_HOST_PATH_ENV) or "").strip(),
+        daemon_tmp_mount_root=DAEMON_TMP_MOUNT_ROOT,
+    )
 
 
 def _prepare_daemon_visible_file_mount_source(
@@ -1051,7 +1056,7 @@ def _prepare_daemon_visible_file_mount_source(
 ) -> Path:
     source_path = source.resolve()
     if not source_path.exists() or not source_path.is_file():
-        raise click.ClickException(f"{label} must reference an existing file: {source_path}")
+        raise MountVisibilityError(f"{label} must reference an existing file: {source_path}")
     _validate_daemon_visible_mount_source(source_path, label=label)
     if not _is_running_inside_container():
         return source_path
@@ -1065,7 +1070,7 @@ def _prepare_daemon_visible_file_mount_source(
         source_kind = _daemon_mount_source_kind(candidate)
         if source_kind == "file":
             return candidate
-    raise click.ClickException(
+    raise MountVisibilityError(
         f"{label} must be daemon-visible as a file but resolved as '{source_kind}': {source_path}. "
         "Fix host/container path mapping before retrying."
     )
@@ -1823,13 +1828,7 @@ def main(
 
     config_path = _to_absolute(config_file, cwd)
     if not config_path.is_file():
-        if explicit_config_file:
-            raise click.ClickException(f"Agent config file does not exist: {config_path}")
-        fallback = _default_config_file()
-        if fallback.is_file():
-            config_path = fallback
-        else:
-            raise click.ClickException(f"Agent config file does not exist: {config_path}")
+        raise click.ClickException(f"Agent config file does not exist: {config_path}")
     if not config_path.is_file():
         raise click.ClickException(f"Agent config file does not exist: {config_path}")
     try:
@@ -1868,22 +1867,22 @@ def main(
             f"run_mode={effective_run_mode} is not supported for dockerized agent_cli execution."
         )
 
-    _validate_daemon_visible_mount_source(project_path, label="--project")
-    daemon_project_path = _daemon_visible_mount_source(project_path)
-    _validate_daemon_visible_mount_source(config_path, label="--config-file")
+    try:
+        _validate_daemon_visible_mount_source(project_path, label="--project")
+        daemon_project_path = _daemon_visible_mount_source(project_path)
+        _validate_daemon_visible_mount_source(config_path, label="--config-file")
+    except MountVisibilityError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     system_prompt_path = _to_absolute(system_prompt_file, cwd)
     if not system_prompt_path.is_file():
-        if explicit_system_prompt_file:
-            raise click.ClickException(f"System prompt file does not exist: {system_prompt_path}")
-        fallback = _default_system_prompt_file()
-        if fallback.is_file():
-            system_prompt_path = fallback
-        else:
-            raise click.ClickException(f"System prompt file does not exist: {system_prompt_path}")
+        raise click.ClickException(f"System prompt file does not exist: {system_prompt_path}")
     if not system_prompt_path.is_file():
         raise click.ClickException(f"System prompt file does not exist: {system_prompt_path}")
-    _validate_daemon_visible_mount_source(system_prompt_path, label="--system-prompt-file")
+    try:
+        _validate_daemon_visible_mount_source(system_prompt_path, label="--system-prompt-file")
+    except MountVisibilityError as exc:
+        raise click.ClickException(str(exc)) from exc
     core_system_prompt = _read_system_prompt(system_prompt_path)
 
     if git_credential_file or git_credential_host or git_credential_scheme:

@@ -54,7 +54,7 @@ class AgentToolsAckRouteIntegrationTests(unittest.TestCase):
             with TestClient(app) as client:
                 response = client.post(
                     "/api/chats/chat-1/agent-tools/ack",
-                    headers={"authorization": "Bearer token-1"},
+                    headers={hub_server.AGENT_TOOLS_TOKEN_HEADER: "token-1"},
                     json={"guid": "guid-1", "stage": "container_bootstrapped", "meta": {}},
                 )
 

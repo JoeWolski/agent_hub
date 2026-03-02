@@ -19,24 +19,11 @@ class ArtifactsService:
         self._agent_tools_token_header = str(agent_tools_token_header)
         self._artifact_token_header = str(artifact_token_header)
 
-    @staticmethod
-    def _bearer_token(headers: Mapping[str, Any]) -> str:
-        auth_header = str(headers.get("authorization") or "")
-        if auth_header.lower().startswith("bearer "):
-            return auth_header[7:].strip()
-        return ""
-
     def resolve_artifact_publish_token(self, headers: Mapping[str, Any]) -> str:
-        token = self._bearer_token(headers)
-        if not token:
-            token = str(headers.get(self._artifact_token_header) or "").strip()
-        return token
+        return str(headers.get(self._artifact_token_header) or "").strip()
 
     def resolve_agent_tools_token(self, headers: Mapping[str, Any]) -> str:
-        token = self._bearer_token(headers)
-        if not token:
-            token = str(headers.get(self._agent_tools_token_header) or "").strip()
-        return token
+        return str(headers.get(self._agent_tools_token_header) or "").strip()
 
     def list_chat_artifacts(self, chat_id: str) -> list[dict[str, Any]]:
         return self._state.list_chat_artifacts(chat_id)

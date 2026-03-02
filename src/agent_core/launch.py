@@ -31,6 +31,8 @@ class LaunchSpec:
     setup_script: str = ""
     prepare_snapshot_only: bool = False
     project_in_image: bool = False
+    bootstrap_as_root: bool = True
+    no_alt_screen: bool = True
 
 
 @dataclass(frozen=True)
@@ -86,11 +88,14 @@ def compile_agent_cli_command(spec: LaunchSpec) -> list[str]:
         str(spec.local_uid),
         "--local-gid",
         str(spec.local_gid),
-        "--bootstrap-as-root",
         "--local-user",
         str(spec.local_user),
-        "--no-alt-screen",
     ]
+
+    if spec.bootstrap_as_root:
+        cmd.append("--bootstrap-as-root")
+    if spec.no_alt_screen:
+        cmd.append("--no-alt-screen")
 
     if spec.local_supplementary_gids:
         cmd.extend(["--local-supplementary-gids", str(spec.local_supplementary_gids)])
@@ -142,9 +147,9 @@ def compile_agent_process_command(plan: AgentProcessLaunchPlan) -> list[str]:
 def parse_compiled_agent_cli_command(command: Sequence[str]) -> ParsedLaunchCommand:
     normalized = [str(item) for item in command]
     return ParsedLaunchCommand(
-        ro_mounts=tuple(_cli_option_values(normalized, long_option="--ro-mount")),
-        rw_mounts=tuple(_cli_option_values(normalized, long_option="--rw-mount")),
-        env_vars=tuple(_cli_option_values(normalized, long_option="--env-var")),
+        ro_mounts=tuple(cli_option_values(normalized, long_option="--ro-mount")),
+        rw_mounts=tuple(cli_option_values(normalized, long_option="--rw-mount")),
+        env_vars=tuple(cli_option_values(normalized, long_option="--env-var")),
         container_args=tuple(_container_args(normalized)),
     )
 
@@ -171,7 +176,7 @@ def _container_args(command: Sequence[str]) -> list[str]:
     return []
 
 
-def _cli_option_values(args: Sequence[str], *, long_option: str, short_option: str | None = None) -> list[str]:
+def cli_option_values(args: Sequence[str], *, long_option: str, short_option: str | None = None) -> list[str]:
     values: list[str] = []
     index = 0
     normalized_args = [str(item) for item in args]
@@ -196,3 +201,7 @@ def _cli_option_values(args: Sequence[str], *, long_option: str, short_option: s
             continue
         index += 1
     return values
+
+
+def _cli_option_values(args: Sequence[str], *, long_option: str, short_option: str | None = None) -> list[str]:
+    return cli_option_values(args, long_option=long_option, short_option=short_option)

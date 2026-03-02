@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import fcntl
 import hashlib
 import html
@@ -700,15 +701,12 @@ def _resolve_optional_chat_agent_type(raw_value: Any, *, default_value: str) -> 
 def _normalize_state_chat_agent_type(raw_value: Any, *, chat_id: str) -> str:
     value = str(raw_value or "").strip()
     if not value:
-        return DEFAULT_CHAT_AGENT_TYPE
+        raise ConfigError(f"Invalid chat state for chat '{chat_id}': missing required agent_type.")
     try:
         return _normalize_chat_agent_type(value, strict=True)
     except HTTPException as exc:
         detail = str(exc.detail or "invalid agent_type")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid chat state for chat '{chat_id}': {detail}",
-        ) from exc
+        raise ConfigError(f"Invalid chat state for chat '{chat_id}': {detail}") from exc
 
 
 def _cli_arg_matches_option(arg: str, *, long_option: str, short_option: str | None = None) -> bool:
@@ -724,48 +722,14 @@ def _has_cli_option(args: list[str], *, long_option: str, short_option: str | No
 
 
 def _cli_option_value(args: list[str], *, long_option: str, short_option: str | None = None) -> str:
-    normalized_args = [str(arg) for arg in args]
-    selected = ""
-    for index, arg in enumerate(normalized_args):
-        if arg == long_option or (short_option and arg == short_option):
-            selected = str(normalized_args[index + 1]).strip() if index + 1 < len(normalized_args) else ""
-            continue
-        if arg.startswith(f"{long_option}="):
-            _, _, selected = arg.partition("=")
-            selected = str(selected).strip()
-            continue
-        if short_option and arg.startswith(f"{short_option}="):
-            _, _, selected = arg.partition("=")
-            selected = str(selected).strip()
-            continue
-    return selected
+    values = core_launch.cli_option_values(args, long_option=long_option, short_option=short_option)
+    if not values:
+        return ""
+    return str(values[-1]).strip()
 
 
 def _cli_option_values(args: list[str], *, long_option: str, short_option: str | None = None) -> list[str]:
-    normalized_args = [str(arg) for arg in args]
-    values: list[str] = []
-    index = 0
-    while index < len(normalized_args):
-        arg = normalized_args[index]
-        if arg == "--":
-            break
-        if arg == long_option or (short_option and arg == short_option):
-            if index + 1 < len(normalized_args):
-                values.append(str(normalized_args[index + 1]).strip())
-                index += 2
-                continue
-            index += 1
-            continue
-        if arg.startswith(f"{long_option}="):
-            values.append(str(arg.partition("=")[2]).strip())
-            index += 1
-            continue
-        if short_option and arg.startswith(f"{short_option}="):
-            values.append(str(arg.partition("=")[2]).strip())
-            index += 1
-            continue
-        index += 1
-    return values
+    return core_launch.cli_option_values(args, long_option=long_option, short_option=short_option)
 
 
 def _auto_config_analysis_model(agent_type: str, agent_args: list[str]) -> str:
@@ -988,7 +952,7 @@ def _resolve_artifact_publish_base_url(value: Any, hub_port: int) -> str:
 
     parsed = urllib.parse.urlsplit(raw_value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError(
+        raise ConfigError(
             "Invalid artifact publish base URL. "
             "Expected an absolute http(s) URL reachable from agent_cli containers."
         )
@@ -1299,15 +1263,14 @@ def _new_state() -> dict[str, Any]:
     }
 
 
-def _normalize_project_credential_binding(raw_binding: Any) -> dict[str, Any]:
+def _normalize_project_credential_binding(raw_binding: Any, *, strict: bool = False) -> dict[str, Any]:
     if not isinstance(raw_binding, dict):
         raw_binding = {}
     raw_mode = str(raw_binding.get("mode") or "").strip().lower()
-    mode = (
-        raw_mode
-        if raw_mode in PROJECT_CREDENTIAL_BINDING_MODES
-        else PROJECT_CREDENTIAL_BINDING_MODE_AUTO
-    )
+    mode = raw_mode if raw_mode in PROJECT_CREDENTIAL_BINDING_MODES else PROJECT_CREDENTIAL_BINDING_MODE_AUTO
+    if strict and raw_mode and raw_mode not in PROJECT_CREDENTIAL_BINDING_MODES:
+        supported = ", ".join(sorted(PROJECT_CREDENTIAL_BINDING_MODES))
+        raise CredentialResolutionError(f"credential_binding.mode must be one of: {supported}.")
     raw_ids = raw_binding.get("credential_ids")
     credential_ids: list[str] = []
     if isinstance(raw_ids, list):
@@ -3391,10 +3354,10 @@ def _parse_local_callback(url_text: str) -> tuple[str, int, str]:
     cleaned = _clean_url_token(url_text)
     parsed = urllib.parse.urlparse(cleaned)
     if not parsed.scheme.startswith("http"):
-        return "", OPENAI_ACCOUNT_LOGIN_DEFAULT_CALLBACK_PORT, "/auth/callback"
+        return "", 0, ""
     host = (parsed.hostname or "").lower()
     if host not in {"localhost", "127.0.0.1"}:
-        return "", OPENAI_ACCOUNT_LOGIN_DEFAULT_CALLBACK_PORT, "/auth/callback"
+        return "", 0, ""
     callback_path = parsed.path or "/auth/callback"
     callback_port = OPENAI_ACCOUNT_LOGIN_DEFAULT_CALLBACK_PORT
     try:
@@ -3410,7 +3373,7 @@ def _parse_local_callback(url_text: str) -> tuple[str, int, str]:
     if parsed_port is not None:
         callback_port = parsed_port
     if callback_port < 1 or callback_port > 65535:
-        callback_port = OPENAI_ACCOUNT_LOGIN_DEFAULT_CALLBACK_PORT
+        return "", 0, ""
 
     normalized_netloc = host
     if callback_port != OPENAI_ACCOUNT_LOGIN_DEFAULT_CALLBACK_PORT or ":" in (parsed.netloc or ""):
@@ -4033,6 +3996,8 @@ def _resolve_hub_effective_run_mode(runtime_config: AgentRuntimeConfig | None) -
 
 
 def _validate_hub_runtime_run_mode(runtime_config: AgentRuntimeConfig | None) -> None:
+    if runtime_config is not None and not bool(runtime_config.runtime.strict_mode):
+        raise ConfigError("Agent Hub requires runtime.strict_mode=true.")
     configured, effective = _resolve_hub_effective_run_mode(runtime_config)
     if effective == "docker":
         return
@@ -4197,7 +4162,10 @@ def _docker_fix_path_ownership(path: Path, uid: int, gid: int) -> None:
 def _detect_default_branch(repo_url: str, env: dict[str, str] | None = None) -> str:
     result = _run(["git", "ls-remote", "--symref", repo_url, "HEAD"], capture=True, check=False, env=env)
     if result.returncode != 0:
-        return "master"
+        raise ConfigError(
+            "Unable to determine repository default branch via remote HEAD. "
+            f"repo_url={repo_url!r} exit_code={result.returncode}"
+        )
 
     for line in result.stdout.splitlines():
         if not line.startswith("ref:"):
@@ -4209,7 +4177,7 @@ def _detect_default_branch(repo_url: str, env: dict[str, str] | None = None) -> 
         if ref.startswith("refs/heads/"):
             return ref.rsplit("/", 1)[-1]
 
-    return "master"
+    raise ConfigError(f"Unable to determine repository default branch from remote HEAD for {repo_url!r}.")
 
 
 def _git_default_remote_branch(repo_dir: Path) -> str | None:
@@ -4377,6 +4345,7 @@ class HubState:
         hub_port: int = DEFAULT_PORT,
         artifact_publish_base_url: str | None = None,
         ui_lifecycle_debug: bool = False,
+        reconcile_project_build_on_init: bool = True,
     ):
         self.runtime_config = runtime_config
         if runtime_identity_overrides is not None:
@@ -4506,7 +4475,6 @@ class HubState:
             lock=self._lock,
             new_state_factory=_new_state,
         )
-        self._migrate_legacy_state_once()
         self.agent_capabilities_cache_file = self.data_dir / AGENT_CAPABILITIES_CACHE_FILE_NAME
         self.project_dir = self.data_dir / "projects"
         self.chat_dir = self.data_dir / "chats"
@@ -4541,7 +4509,8 @@ class HubState:
         self.host_codex_dir.mkdir(parents=True, exist_ok=True)
         self._reload_github_app_settings()
         self._load_agent_capabilities_cache()
-        self._reconcile_project_build_state()
+        if reconcile_project_build_on_init:
+            self._reconcile_project_build_state()
 
     def _reconcile_project_build_state(self) -> None:
         state = self.load()
@@ -4585,60 +4554,48 @@ class HubState:
         for project_id in rebuild_project_ids:
             self._schedule_project_build(project_id)
 
-    def _migrate_legacy_state_once(self) -> None:
-        raw_state = self._state_store.load_raw()
-        chats = raw_state.get("chats")
-        if not isinstance(chats, dict):
-            return
-        changed = False
-        for chat in chats.values():
-            if not isinstance(chat, dict):
-                continue
-            legacy_args = chat.get("codex_args")
-            current_args = chat.get("agent_args")
-            if isinstance(current_args, list):
-                normalized_args = [str(arg) for arg in current_args]
-                if normalized_args != current_args:
-                    chat["agent_args"] = normalized_args
-                    changed = True
-            elif isinstance(legacy_args, list):
-                chat["agent_args"] = [str(arg) for arg in legacy_args]
-                changed = True
-            else:
-                chat["agent_args"] = []
-                changed = True
-            if "codex_args" in chat:
-                chat.pop("codex_args", None)
-                changed = True
-        if changed:
-            self._state_store.save_raw(raw_state)
-
     def load(self) -> dict[str, Any]:
-        loaded = self._state_store.load_raw()
-        projects = loaded.get("projects")
-        chats = loaded.get("chats")
+        state = self._state_store.load(normalizer=self._normalize_loaded_state)
+        return state
+
+    def _normalize_loaded_state(self, loaded: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        loaded_copy = copy.deepcopy(loaded)
+        projects = loaded_copy.get("projects")
+        chats = loaded_copy.get("chats")
         if not isinstance(projects, dict):
             projects = {}
         if not isinstance(chats, dict):
             chats = {}
+        top_level_extras = {
+            key: value
+            for key, value in loaded_copy.items()
+            if key not in {"version", "projects", "chats", "settings"}
+        }
         state = {
-            "version": loaded.get("version", 1),
+            **top_level_extras,
+            "version": loaded_copy.get("version", 1),
             "projects": projects,
             "chats": chats,
-            "settings": self.settings_service.settings_payload(loaded),
+            "settings": self.settings_service.settings_payload(loaded_copy),
         }
-        state_needs_save = False
         for chat_id, chat in state["chats"].items():
             if not isinstance(chat, dict):
                 continue
+            if "codex_args" in chat:
+                raise ConfigError(
+                    f"Invalid chat state for chat '{chat_id}': codex_args is no longer supported; use agent_args."
+                )
             current_args = chat.get("agent_args")
             if isinstance(current_args, list):
                 chat["agent_args"] = [str(arg) for arg in current_args]
             else:
-                chat["agent_args"] = []
-                state_needs_save = True
+                raise ConfigError(f"Invalid chat state for chat '{chat_id}': agent_args must be an array.")
             chat["agent_type"] = _normalize_state_chat_agent_type(chat.get("agent_type"), chat_id=str(chat_id))
-            chat["status"] = _normalize_chat_status(chat.get("status"))
+            try:
+                chat["status"] = _normalize_chat_status(chat.get("status"), strict=True)
+            except HTTPException as exc:
+                detail = str(exc.detail or "invalid status")
+                raise ConfigError(f"Invalid chat state for chat '{chat_id}': {detail}") from exc
             chat["status_reason"] = _compact_whitespace(str(chat.get("status_reason") or ""))
             chat["last_status_transition_at"] = str(
                 chat.get("last_status_transition_at") or chat.get("updated_at") or chat.get("created_at") or ""
@@ -4676,9 +4633,7 @@ class HubState:
             ready_ack_meta = chat.get("ready_ack_meta")
             chat["ready_ack_meta"] = ready_ack_meta if isinstance(ready_ack_meta, dict) else {}
             chat["create_request_id"] = _compact_whitespace(str(chat.get("create_request_id") or "")).strip()
-        if state_needs_save:
-            self.save(state, reason="state_migrate_legacy_codex_args")
-        return state
+        return state, state != loaded
 
     @staticmethod
     def _event_queue_put(listener: queue.Queue[dict[str, Any] | None], value: dict[str, Any] | None) -> None:
@@ -5004,59 +4959,6 @@ class HubState:
                 and _option_count_excluding_default(discovered_reasoning_modes) >= 1
             ):
                 break
-
-        if resolved_type == AGENT_TYPE_CODEX and _option_count_excluding_default(discovered_models) < 1:
-            try:
-                codex_doc_models = _fetch_codex_models_from_docs(AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS)
-            except RuntimeError as exc:
-                last_error = str(exc)
-                LOGGER.warning("Codex model discovery from docs failed: %s", exc)
-            else:
-                if codex_doc_models:
-                    discovered_models = _normalize_model_options_for_agent(
-                        resolved_type,
-                        codex_doc_models,
-                        ["default"],
-                    )
-                    last_error = ""
-                else:
-                    last_error = f"no codex models found at {AGENT_CAPABILITY_CODEX_MODELS_DOC_URL}"
-                    LOGGER.warning("%s", last_error)
-
-        if resolved_type == AGENT_TYPE_CODEX and _option_count_excluding_default(discovered_reasoning_modes) < 1:
-            reasoning_cmd = [str(token) for token in AGENT_CAPABILITY_CODEX_REASONING_FALLBACK_COMMAND]
-            return_code, output_text = _run_agent_capability_probe(
-                reasoning_cmd,
-                AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS,
-                docker_run_args=probe_run_args,
-            )
-            parsed_reasoning = _extract_reasoning_candidates_from_output(output_text, resolved_type)
-            if parsed_reasoning:
-                discovered_reasoning_modes = _normalize_reasoning_mode_options_for_agent(
-                    resolved_type,
-                    parsed_reasoning,
-                    ["default"],
-                )
-                if return_code not in {127, 124} and (
-                    _option_count_excluding_default(discovered_models) >= 1 or not last_error
-                ):
-                    last_error = ""
-            elif return_code == 127:
-                last_error = f"command not found: {reasoning_cmd[0]}"
-            elif return_code == 124:
-                last_error = f"timeout running command: {' '.join(reasoning_cmd)}"
-            elif return_code != 0 and not last_error:
-                last_error = (
-                    "failed to parse codex reasoning levels from command output: "
-                    f"{' '.join(reasoning_cmd)}"
-                )
-
-        if resolved_type == AGENT_TYPE_GEMINI and _option_count_excluding_default(discovered_models) < 1:
-            discovered_models = _normalize_model_options_for_agent(
-                resolved_type,
-                list(AGENT_CAPABILITY_GEMINI_FALLBACK_MODELS),
-                ["default"],
-            )
 
         if not discovered_models:
             discovered_models = ["default"]
@@ -5681,15 +5583,21 @@ class HubState:
         default_host: str,
         default_provider: str,
         record_index: int,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         token = str(raw_record.get("personal_access_token") or "").strip()
         account_login = str(raw_record.get("account_login") or "").strip()
         if not token or not account_login:
-            return None
+            raise CredentialResolutionError(
+                "Invalid persisted personal access token record: "
+                f"provider={default_provider} index={record_index} requires personal_access_token and account_login."
+            )
 
         provider = str(raw_record.get("provider") or default_provider).strip().lower()
         if provider not in {GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB}:
-            provider = default_provider
+            raise CredentialResolutionError(
+                "Invalid persisted personal access token record: "
+                f"provider={provider!r} index={record_index} is unsupported."
+            )
 
         host_value = raw_record.get("host") or default_host
         default_scheme = (
@@ -5702,8 +5610,11 @@ class HubState:
                 field_name="host",
                 default_scheme=default_scheme,
             )
-        except HTTPException:
-            return None
+        except HTTPException as exc:
+            raise CredentialResolutionError(
+                "Invalid persisted personal access token record endpoint: "
+                f"provider={provider} index={record_index}."
+            ) from exc
 
         account_name = str(raw_record.get("account_name") or account_login).strip() or account_login
         account_email = str(raw_record.get("account_email") or "").strip()
@@ -5773,8 +5684,6 @@ class HubState:
                     default_provider=provider_name,
                     record_index=index,
                 )
-                if normalized is None:
-                    continue
                 token_id = str(normalized.get("token_id") or "").strip()
                 if token_id in seen_ids:
                     token_id = hashlib.sha256(f"{token_id}|{provider_name}|{index}".encode("utf-8")).hexdigest()[:32]
@@ -7232,8 +7141,10 @@ class HubState:
                 continue
             try:
                 host_path.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                continue
+            except OSError as exc:
+                raise MountVisibilityError(
+                    f"Auto-config cache mount host path is not writable: {host_path}"
+                ) from exc
             entry = f"{host_path}:{container_path}"
             if entry in existing:
                 continue
@@ -7305,7 +7216,6 @@ class HubState:
         reserved_container_workspace: str | None = None,
     ) -> list[str]:
         normalized_entries: list[str] = []
-        home_root = Path.home().resolve()
         for raw_entry in entries:
             if ":" not in raw_entry:
                 raise HTTPException(status_code=400, detail=f"Invalid auto-config {direction} mount '{raw_entry}'.")
@@ -7313,7 +7223,9 @@ class HubState:
             if self._is_auto_config_docker_socket_path(host_raw) or self._is_auto_config_docker_socket_path(
                 container_raw
             ):
-                continue
+                raise MountVisibilityError(
+                    f"Auto-config {direction} mount '{raw_entry}' is invalid: docker socket mounts are not allowed."
+                )
             container = container_raw.strip()
             if not container.startswith("/"):
                 raise HTTPException(
@@ -7322,27 +7234,16 @@ class HubState:
                 )
             host_path = Path(host_raw).expanduser()
             if not host_path.exists():
-                try:
-                    host_path_resolved = host_path.resolve()
-                except OSError:
-                    host_path_resolved = host_path
-                should_create = False
-                try:
-                    host_path_resolved.relative_to(home_root)
-                    should_create = True
-                except ValueError:
-                    should_create = False
-                if should_create:
-                    try:
-                        host_path_resolved.mkdir(parents=True, exist_ok=True)
-                        host_path = host_path_resolved
-                    except OSError:
-                        pass
+                raise MountVisibilityError(
+                    f"Auto-config {direction} mount host path does not exist: {host_raw}"
+                )
             if self._is_auto_config_container_workspace_mount(
                 container,
                 reserved_container_workspace=reserved_container_workspace,
             ):
-                continue
+                raise MountVisibilityError(
+                    f"Auto-config {direction} mount '{raw_entry}' targets reserved workspace path."
+                )
             normalized_entries.append(f"{host_path}:{container}")
         return _parse_mounts(normalized_entries, direction)
 
@@ -7887,14 +7788,7 @@ class HubState:
         container_workspace = str(PurePosixPath(DEFAULT_CONTAINER_HOME) / container_project_name)
         container_output_file = str(PurePosixPath(container_workspace) / output_file.name)
         session_id, session_token = self._create_agent_tools_session(repo_url=repo_url, workspace=workspace)
-        try:
-            ready_ack_guid = self.issue_agent_tools_session_ready_ack_guid(session_id)
-        except HTTPException as exc:
-            if int(exc.status_code) != 404:
-                raise
-            # Some tests mock _create_agent_tools_session without populating in-memory
-            # session state; fall back to a one-off guid so command construction remains deterministic.
-            ready_ack_guid = _new_ready_ack_guid()
+        ready_ack_guid = self.issue_agent_tools_session_ready_ack_guid(session_id)
         agent_tools_url = f"{self.artifact_publish_base_url}/api/agent-tools/sessions/{session_id}"
         agent_tools_chat_id = f"auto-config:{session_id}"
         runtime_config_file = self._prepare_chat_runtime_config(
@@ -8086,10 +7980,6 @@ class HubState:
             normalized_repo_url,
             env=authenticated_git_env,
         )
-        if not requested_branch and git_env and resolved_branch == "master":
-            public_branch = _detect_default_branch(normalized_repo_url, env=sanitized_git_env)
-            if public_branch:
-                resolved_branch = public_branch
 
         emit_auto_config_log("", replace=True)
         emit_auto_config_log("Preparing repository checkout for temporary analysis chat...\n")
@@ -8917,19 +8807,15 @@ class HubState:
         try:
             base_text = self.config_file.read_text(encoding="utf-8", errors="ignore")
         except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"Failed to read config file: {self.config_file}") from exc
+            raise ConfigError(f"Failed to read config file: {self.config_file}") from exc
 
         normalized_agent_tools_url = str(agent_tools_url or "").strip()
         normalized_agent_tools_token = str(agent_tools_token or "").strip()
         if not normalized_agent_tools_url:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Missing required {AGENT_TOOLS_URL_ENV} while preparing runtime config for {chat_id}.",
-            )
+            raise ConfigError(f"Missing required {AGENT_TOOLS_URL_ENV} while preparing runtime config for {chat_id}.")
         if not normalized_agent_tools_token:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Missing required {AGENT_TOOLS_TOKEN_ENV} while preparing runtime config for {chat_id}.",
+            raise ConfigError(
+                f"Missing required {AGENT_TOOLS_TOKEN_ENV} while preparing runtime config for {chat_id}."
             )
 
         self._ensure_agent_tools_mcp_runtime_script()
@@ -8962,10 +8848,7 @@ class HubState:
         try:
             script_text = source_path.read_text(encoding="utf-8")
         except OSError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to read agent_tools MCP source script: {source_path}",
-            ) from exc
+            raise ConfigError(f"Failed to read agent_tools MCP source script: {source_path}") from exc
 
         if self.agent_tools_mcp_runtime_script.exists():
             try:
@@ -8978,9 +8861,8 @@ class HubState:
         try:
             _write_private_env_file(self.agent_tools_mcp_runtime_script, script_text)
         except OSError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to materialize agent_tools MCP runtime script: {self.agent_tools_mcp_runtime_script}",
+            raise ConfigError(
+                f"Failed to materialize agent_tools MCP runtime script: {self.agent_tools_mcp_runtime_script}"
             ) from exc
 
     def _chat_agent_tools_url(self, chat_id: str) -> str:
@@ -9184,10 +9066,10 @@ class HubState:
         if kind == "github_app_installation":
             installation_id = int(str(credential_id).split(":", 1)[1]) if ":" in credential_id else 0
             if installation_id <= 0:
-                raise HTTPException(status_code=400, detail=f"Invalid GitHub App credential id: {credential_id}")
+                raise CredentialResolutionError(f"Invalid GitHub App credential id: {credential_id}")
             installation_status = self.github_app_auth_status()
             if int(installation_status.get("installation_id") or 0) != installation_id:
-                raise HTTPException(status_code=404, detail="GitHub App installation credential is no longer connected.")
+                raise CredentialResolutionError("GitHub App installation credential is no longer connected.")
             token, _expires_at = self._github_installation_token(installation_id)
             username = "x-access-token"
             secret = token
@@ -9198,7 +9080,7 @@ class HubState:
                     matching = token
                     break
             if matching is None:
-                raise HTTPException(status_code=404, detail="Personal access token credential is no longer connected.")
+                raise CredentialResolutionError("Personal access token credential is no longer connected.")
             username = str(matching.get("account_login") or "").strip()
             secret = str(matching.get("personal_access_token") or "").strip()
             account_login = str(matching.get("account_login") or "").strip()
@@ -9207,10 +9089,10 @@ class HubState:
             host = str(matching.get("host") or "").strip()
             scheme = _normalize_github_credential_scheme(matching.get("scheme"), field_name="scheme")
         else:
-            raise HTTPException(status_code=400, detail=f"Unsupported credential kind: {kind}")
+            raise CredentialResolutionError(f"Unsupported credential kind: {kind}")
 
         if not username or not secret or not host:
-            raise HTTPException(status_code=500, detail="Resolved credential is missing required fields.")
+            raise CredentialResolutionError("Resolved credential is missing required fields.")
 
         credential_file = self._write_github_git_credentials(
             host=host,
@@ -9302,7 +9184,8 @@ class HubState:
         _chat, project = self._chat_and_project_for_agent_tools(chat_id)
         normalized_mode = str(mode or "").strip().lower()
         if normalized_mode not in PROJECT_CREDENTIAL_BINDING_MODES:
-            normalized_mode = PROJECT_CREDENTIAL_BINDING_MODE_AUTO
+            supported = ", ".join(sorted(PROJECT_CREDENTIAL_BINDING_MODES))
+            raise CredentialResolutionError(f"mode must be one of: {supported}.")
         submitted_ids = credential_ids if isinstance(credential_ids, list) else []
         selected_ids = self._resolve_agent_tools_credential_ids(project, normalized_mode, submitted_ids)
         resolved_credentials: list[dict[str, Any]] = []
@@ -9487,7 +9370,8 @@ class HubState:
         project = self._agent_tools_project_context_from_session(session)
         normalized_mode = str(mode or "").strip().lower()
         if normalized_mode not in PROJECT_CREDENTIAL_BINDING_MODES:
-            normalized_mode = PROJECT_CREDENTIAL_BINDING_MODE_AUTO
+            supported = ", ".join(sorted(PROJECT_CREDENTIAL_BINDING_MODES))
+            raise CredentialResolutionError(f"mode must be one of: {supported}.")
         submitted_ids = credential_ids if isinstance(credential_ids, list) else []
         selected_ids = self._resolve_agent_tools_credential_ids(project, normalized_mode, submitted_ids)
         resolved_credentials: list[dict[str, Any]] = []
@@ -10571,27 +10455,7 @@ class HubState:
             project_id,
             **create_chat_kwargs,
         )
-        try:
-            return self.start_chat(chat["id"])
-        except Exception as exc:
-            detail = self._chat_start_error_detail(exc)
-            LOGGER.warning(
-                "New chat failed to start chat_id=%s project_id=%s reason=%s detail=%s",
-                chat["id"],
-                project_id,
-                "chat_start_failed_during_create",
-                detail,
-            )
-            failed_chat = self.chat(chat["id"])
-            if failed_chat is None or _normalize_chat_status(failed_chat.get("status")) != CHAT_STATUS_FAILED:
-                failed_chat = self._mark_chat_start_failed(
-                    chat["id"],
-                    detail=detail,
-                    reason="chat_start_failed_during_create",
-                )
-            if failed_chat is not None:
-                return failed_chat
-            raise
+        return self.start_chat(chat["id"])
 
     @staticmethod
     def _chat_for_create_request(
@@ -10681,25 +10545,6 @@ class HubState:
         try:
             shutil.rmtree(path)
             return
-        except PermissionError:
-            try:
-                _docker_fix_path_ownership(path, self.local_uid, self.local_gid)
-            except Exception as repair_exc:  # pragma: no cover - exercised in tests via patched helper
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        f"Failed to delete path {path}: permission denied and ownership repair failed: "
-                        f"{repair_exc}"
-                    ),
-                ) from repair_exc
-            try:
-                shutil.rmtree(path)
-                return
-            except Exception as retry_exc:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to delete path {path} after ownership repair: {retry_exc}",
-                ) from retry_exc
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"Failed to delete path {path}: {exc}") from exc
 
@@ -11271,11 +11116,7 @@ class HubState:
         }
 
     def _startup_reconcile_worker(self) -> None:
-        try:
-            summary = self.startup_reconcile()
-        except Exception:
-            LOGGER.exception("Startup reconciliation failed.")
-            return
+        summary = self.startup_reconcile()
         LOGGER.info(
             "Startup reconciliation completed: "
             "stopped_chat_processes=%d reconciled_chats=%d "
@@ -11417,16 +11258,16 @@ class HubState:
             context_key=f"project_sync:{project.get('id')}",
         )
         _run_for_repo(["fetch", "--all", "--prune"], workspace, check=True, env=git_env)
-        branch = project.get("default_branch") or "master"
+        branch = str(project.get("default_branch") or "").strip()
         remote_default = _git_default_remote_branch(workspace)
         if remote_default:
             branch = remote_default
 
-        if not _git_has_remote_branch(workspace, branch):
-            branch = "main" if _git_has_remote_branch(workspace, "main") else "master"
+        if not branch:
+            raise ConfigError("Unable to determine remote branch for sync: missing project.default_branch and origin/HEAD.")
 
         if not _git_has_remote_branch(workspace, branch):
-            raise HTTPException(status_code=400, detail="Unable to determine remote branch for sync.")
+            raise ConfigError(f"Unable to determine remote branch for sync: origin/{branch} not found.")
 
         _run_for_repo(["checkout", branch], workspace, check=True)
         _run_for_repo(["reset", "--hard", f"origin/{branch}"], workspace, check=True)
@@ -12829,6 +12670,7 @@ def main(
                 "event": "agent_hub_config_loaded",
                 "config_path": str(config_file),
                 "run_mode": str(runtime_config.runtime.run_mode or ""),
+                "strict_mode": bool(runtime_config.runtime.strict_mode),
             },
             sort_keys=True,
         ),
@@ -12836,7 +12678,7 @@ def main(
     )
     try:
         _validate_hub_runtime_run_mode(runtime_config)
-    except (ValueError, ConfigError) as exc:
+    except ConfigError as exc:
         raise click.ClickException(str(exc)) from exc
     normalized_log_level = _resolve_hub_log_level(log_level, runtime_config)
     _configure_hub_logging(normalized_log_level)
@@ -12872,7 +12714,7 @@ def main(
             artifact_publish_base_url=artifact_publish_base_url,
             ui_lifecycle_debug=ui_lifecycle_debug,
         )
-    except (ValueError, ConfigError) as exc:
+    except ConfigError as exc:
         raise click.ClickException(str(exc)) from exc
     LOGGER.info(
         "Artifact publish base URL: %s",

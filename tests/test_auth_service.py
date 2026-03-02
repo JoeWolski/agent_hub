@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-
-from fastapi import HTTPException
 
 import sys
 
@@ -14,6 +13,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from agent_core.errors import NetworkReachabilityError
 from agent_hub.services.auth_service import AuthCallbackForwardResult, AuthService
 
 
@@ -101,16 +101,14 @@ class AuthServiceTests(unittest.TestCase):
         self.assertEqual(result.response_body, "ok")
         self.assertEqual(result.target_origin, "http://127.0.0.1:8877")
 
-    def test_forward_openai_account_callback_raises_502_when_all_hosts_fail(self) -> None:
+    def test_forward_openai_account_callback_raises_network_reachability_error_when_all_hosts_fail_with_oserror(
+        self,
+    ) -> None:
         logger = Mock()
         service = self._service()
         session = SimpleNamespace(id="s-1", container_name="c-1")
-
-        def fail_urlopen(*args, **kwargs):
-            raise OSError("connection refused")
-
-        with patch("agent_hub.services.auth_service.urllib.request.urlopen", side_effect=fail_urlopen):
-            with self.assertRaises(HTTPException) as raised:
+        with patch("agent_hub.services.auth_service.urllib.request.urlopen", side_effect=OSError("connection refused")):
+            with self.assertRaises(NetworkReachabilityError) as raised:
                 service.forward_openai_account_callback(
                     session=session,
                     callback_port=8877,
@@ -128,10 +126,73 @@ class AuthServiceTests(unittest.TestCase):
                     logger=logger,
                 )
 
-        self.assertEqual(raised.exception.status_code, 502)
-        self.assertIn("connection_refused", str(raised.exception.detail))
-        self.assertIn("http://host-a:8877", str(raised.exception.detail))
-        self.assertIn("http://host-b:8877", str(raised.exception.detail))
+        detail = str(raised.exception)
+        self.assertIn("Reason: connection_refused", detail)
+        self.assertIn("http://host-a:8877", detail)
+        self.assertIn("http://host-b:8877", detail)
+
+    def test_forward_openai_account_callback_raises_network_reachability_error_when_all_hosts_fail_with_urlerror(
+        self,
+    ) -> None:
+        logger = Mock()
+        service = self._service()
+        session = SimpleNamespace(id="s-1", container_name="c-1")
+        with patch(
+            "agent_hub.services.auth_service.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("lookup failure"),
+        ):
+            with self.assertRaises(NetworkReachabilityError) as raised:
+                service.forward_openai_account_callback(
+                    session=session,
+                    callback_port=8877,
+                    callback_path="/oauth/callback",
+                    query="code=abc",
+                    artifact_publish_base_url="http://host-a:8876",
+                    request_host="127.0.0.1",
+                    request_context={},
+                    discover_bridge_hosts=lambda: (["host-b"], {}),
+                    normalize_host=lambda value: str(value or "").strip(),
+                    callback_query_summary=lambda query: {"raw": query},
+                    redact_url_query_values=lambda url: url,
+                    host_port_netloc=lambda host, port: f"{host}:{port}",
+                    classify_callback_error=lambda exc: "dns_error",
+                    logger=logger,
+                )
+
+        detail = str(raised.exception)
+        self.assertIn("Reason: dns_error", detail)
+        self.assertIn("http://host-a:8877", detail)
+        self.assertIn("http://host-b:8877", detail)
+
+    def test_forward_openai_account_callback_raises_network_reachability_error_when_all_hosts_fail_with_timeout(
+        self,
+    ) -> None:
+        logger = Mock()
+        service = self._service()
+        session = SimpleNamespace(id="s-1", container_name="c-1")
+        with patch("agent_hub.services.auth_service.urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+            with self.assertRaises(NetworkReachabilityError) as raised:
+                service.forward_openai_account_callback(
+                    session=session,
+                    callback_port=8877,
+                    callback_path="/oauth/callback",
+                    query="code=abc",
+                    artifact_publish_base_url="http://host-a:8876",
+                    request_host="127.0.0.1",
+                    request_context={},
+                    discover_bridge_hosts=lambda: (["host-b"], {}),
+                    normalize_host=lambda value: str(value or "").strip(),
+                    callback_query_summary=lambda query: {"raw": query},
+                    redact_url_query_values=lambda url: url,
+                    host_port_netloc=lambda host, port: f"{host}:{port}",
+                    classify_callback_error=lambda exc: "timeout",
+                    logger=logger,
+                )
+
+        detail = str(raised.exception)
+        self.assertIn("Reason: timeout", detail)
+        self.assertIn("http://host-a:8877", detail)
+        self.assertIn("http://host-b:8877", detail)
 
 
 if __name__ == "__main__":

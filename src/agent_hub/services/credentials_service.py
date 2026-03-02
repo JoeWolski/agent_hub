@@ -10,13 +10,7 @@ class CredentialsService:
         self._agent_tools_token_header = str(agent_tools_token_header)
 
     def resolve_token(self, headers: Mapping[str, Any]) -> str:
-        auth_header = str(headers.get("authorization") or "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        if not token:
-            token = str(headers.get(self._agent_tools_token_header) or "").strip()
-        return token
+        return str(headers.get(self._agent_tools_token_header) or "").strip()
 
     def list_chat_credentials(self, *, chat_id: str, token: str) -> dict[str, Any]:
         return self._domain.list_chat_credentials(chat_id=chat_id, token=token)

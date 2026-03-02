@@ -354,7 +354,7 @@ def register_hub_routes(
         default_ro_mounts = parse_mounts(empty_list(payload.get("default_ro_mounts")), "default read-only mount")
         default_rw_mounts = parse_mounts(empty_list(payload.get("default_rw_mounts")), "default read-write mount")
         default_env_vars = parse_env_vars(empty_list(payload.get("default_env_vars")))
-        credential_binding = normalize_project_credential_binding(payload.get("credential_binding"))
+        credential_binding = normalize_project_credential_binding(payload.get("credential_binding"), strict=True)
         if setup_script is not None:
             setup_script = str(setup_script).strip()
         if isinstance(branch, str):
@@ -407,7 +407,7 @@ def register_hub_routes(
         if "default_env_vars" in payload:
             update["default_env_vars"] = parse_env_vars(empty_list(payload.get("default_env_vars")))
         if "credential_binding" in payload:
-            update["credential_binding"] = normalize_project_credential_binding(payload.get("credential_binding"))
+            update["credential_binding"] = normalize_project_credential_binding(payload.get("credential_binding"), strict=True)
         if not update:
             raise HTTPException(status_code=400, detail="No patch values provided.")
         project = await asyncio.to_thread(state.project_service.update_project, project_id, update)

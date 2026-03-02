@@ -40,6 +40,14 @@ def _ensure_optional_str(value: object, *, label: str) -> str | None:
     return value
 
 
+def _ensure_optional_bool(value: object, *, label: str) -> bool | None:
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ConfigError(f"{label} must be a boolean.")
+    return value
+
+
 def _copy_section_values(raw: object, *, section: str) -> dict[str, Any]:
     return _ensure_dict(raw, label=f"section '{section}'")
 
@@ -86,6 +94,7 @@ class LoggingConfig:
 @dataclass(frozen=True)
 class RuntimeConfig:
     run_mode: str = DEFAULT_RUNTIME_RUN_MODE
+    strict_mode: bool = True
     values: dict[str, Any] = field(default_factory=dict)
 
 
@@ -188,7 +197,8 @@ def parse_runtime_run_mode(value: object, *, label: str = "runtime.run_mode") ->
 def _parse_runtime(raw_root: dict[str, Any]) -> RuntimeConfig:
     runtime_raw = _ensure_dict(raw_root.get("runtime"), label="section 'runtime'")
     run_mode = parse_runtime_run_mode(runtime_raw.pop("run_mode", None))
-    return RuntimeConfig(run_mode=run_mode, values=runtime_raw)
+    strict_mode = _ensure_optional_bool(runtime_raw.pop("strict_mode", None), label="runtime.strict_mode")
+    return RuntimeConfig(run_mode=run_mode, strict_mode=True if strict_mode is None else strict_mode, values=runtime_raw)
 
 
 def load_agent_runtime_config(path: str | Path) -> AgentRuntimeConfig:

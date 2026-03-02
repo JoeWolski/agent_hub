@@ -84,10 +84,10 @@ class RuntimeServiceTests(unittest.TestCase):
 
 
 class CredentialsServiceTests(unittest.TestCase):
-    def test_resolve_token_prefers_bearer(self) -> None:
+    def test_resolve_token_uses_explicit_header(self) -> None:
         service = CredentialsService(domain=SimpleNamespace(), agent_tools_token_header="x-agent-tools-token")
         headers = {"authorization": "Bearer abc", "x-agent-tools-token": "fallback"}
-        self.assertEqual(service.resolve_token(headers), "abc")
+        self.assertEqual(service.resolve_token(headers), "fallback")
 
     def test_list_chat_credentials_requires_existing_chat(self) -> None:
         state = SimpleNamespace(chat=Mock(return_value=None))

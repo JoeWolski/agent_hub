@@ -19,29 +19,52 @@ class HubStateStore:
         self._lock = lock
         self._new_state_factory = new_state_factory
 
+    def load(
+        self,
+        *,
+        normalizer: Callable[[dict[str, Any]], tuple[dict[str, Any], bool]] | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            loaded = self._load_raw_locked()
+            if normalizer is None:
+                return loaded
+            normalized, changed = normalizer(loaded)
+            if not isinstance(normalized, dict):
+                raise RuntimeError("State normalizer must return a JSON object.")
+            if changed:
+                self._write_locked(normalized)
+        return normalized
+
     def load_raw(self) -> dict[str, Any]:
         with self._lock:
-            if not self.state_file.exists():
-                return self._new_state_factory()
-            try:
-                loaded = json.loads(self.state_file.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
-                preserved_state_path = self._preserve_corrupt_state_file_locked()
-                raise RuntimeError(
-                    f"State file is corrupt JSON and was moved to {preserved_state_path}."
-                ) from exc
-            if not isinstance(loaded, dict):
-                preserved_state_path = self._preserve_corrupt_state_file_locked()
-                raise RuntimeError(
-                    "State file must contain a JSON object and was moved to "
-                    f"{preserved_state_path}."
-                )
+            loaded = self._load_raw_locked()
         return loaded
 
     def save_raw(self, state: dict[str, Any]) -> None:
         with self._lock:
-            with self.state_file.open("w", encoding="utf-8") as fp:
-                json.dump(state, fp, indent=2)
+            self._write_locked(state)
+
+    def _load_raw_locked(self) -> dict[str, Any]:
+        if not self.state_file.exists():
+            return self._new_state_factory()
+        try:
+            loaded = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            preserved_state_path = self._preserve_corrupt_state_file_locked()
+            raise RuntimeError(
+                f"State file is corrupt JSON and was moved to {preserved_state_path}."
+            ) from exc
+        if not isinstance(loaded, dict):
+            preserved_state_path = self._preserve_corrupt_state_file_locked()
+            raise RuntimeError(
+                "State file must contain a JSON object and was moved to "
+                f"{preserved_state_path}."
+            )
+        return loaded
+
+    def _write_locked(self, state: dict[str, Any]) -> None:
+        with self.state_file.open("w", encoding="utf-8") as fp:
+            json.dump(state, fp, indent=2)
 
     def _preserve_corrupt_state_file_locked(self) -> Path:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

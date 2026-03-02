@@ -236,6 +236,20 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(state.local_gid, 5020)
         self.assertEqual(state.local_user, "config-user")
 
+    def test_hub_state_rejects_runtime_config_with_strict_mode_disabled(self) -> None:
+        config_file = self.tmp_path / "strict-mode-disabled.config.toml"
+        config_file.write_text(
+            (
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nstrict_mode = false\n"
+            ),
+            encoding="utf-8",
+        )
+        runtime_config = hub_server.load_agent_runtime_config(config_file)
+
+        with self.assertRaisesRegex(hub_server.ConfigError, "runtime.strict_mode=true"):
+            hub_server.HubState(self.tmp_path / "hub-strict-disabled", config_file, runtime_config=runtime_config)
+
     def test_runtime_identity_with_config_uid_gid_preserves_env_supplementary_gids(self) -> None:
         config_file = self.tmp_path / "identity.config.toml"
         config_file.write_text(
@@ -1018,13 +1032,6 @@ Gemini CLI
             calls,
             [
                 ["codex", "--help"],
-                [
-                    "codex",
-                    "exec",
-                    "-c",
-                    'model_reasoning_effort="__agent_hub_invalid_reasoning__"',
-                    "capability-probe",
-                ],
                 ["claude", "--help"],
                 ["gemini", "--help"],
             ],
@@ -1309,7 +1316,7 @@ Gemini CLI
             hub_server.AGENT_CAPABILITY_DEFAULT_REASONING_BY_TYPE[hub_server.AGENT_TYPE_CODEX],
         )
 
-    def test_agent_capabilities_discovery_preserves_codex_docs_error_when_reasoning_fallback_succeeds(self) -> None:
+    def test_agent_capabilities_discovery_does_not_use_codex_docs_or_reasoning_fallback(self) -> None:
         def fake_probe(
             cmd: list[str],
             _timeout: float,
@@ -1317,14 +1324,6 @@ Gemini CLI
         ) -> tuple[int, str]:
             if cmd == ["codex", "--help"]:
                 return 0, "Codex CLI"
-            if cmd == list(hub_server.AGENT_CAPABILITY_CODEX_REASONING_FALLBACK_COMMAND):
-                return (
-                    1,
-                    (
-                        "Error loading config.toml: expected one of `none`, `minimal`, `low`, `medium`, `high`, "
-                        "`xhigh` in `model_reasoning_effort`"
-                    ),
-                )
             if cmd == ["claude", "--help"]:
                 return 127, ""
             if cmd == ["gemini", "--help"]:
@@ -1351,9 +1350,9 @@ Gemini CLI
         )
         self.assertEqual(
             codex["reasoning_modes"],
-            ["default", "minimal", "low", "medium", "high", "xhigh"],
+            ["default"],
         )
-        self.assertIn("failed to fetch codex docs", codex["last_error"])
+        self.assertEqual(codex["last_error"], "")
 
     def test_openai_credentials_round_trip_status(self) -> None:
         initial = self.state.openai_auth_status()
@@ -2140,6 +2139,12 @@ Gemini CLI
         self.assertEqual(callback_path, "/auth/callback")
         self.assertTrue(local_url.startswith("http://localhost:1455"))
 
+    def test_parse_local_callback_rejects_invalid_port_instead_of_fallback(self) -> None:
+        local_url, callback_port, callback_path = hub_server._parse_local_callback("http://localhost:99999/auth/callback")
+        self.assertEqual(local_url, "")
+        self.assertEqual(callback_port, 0)
+        self.assertEqual(callback_path, "")
+
     def test_openai_auth_status_reports_account_credentials(self) -> None:
         self.state.openai_codex_auth_file.parent.mkdir(parents=True, exist_ok=True)
         self.state.openai_codex_auth_file.write_text(
@@ -2569,15 +2574,14 @@ Gemini CLI
             "agent_hub.server._forward_openai_callback_via_container_loopback",
             return_value=hub_server.OpenAICallbackContainerForwardResult(attempted=False),
         ), self.assertLogs("agent_hub", level="INFO") as captured_logs:
-            with self.assertRaises(HTTPException) as ctx:
+            with self.assertRaises(hub_server.NetworkReachabilityError) as ctx:
                 self.state.forward_openai_account_callback(
                     "code=abc&state=xyz&code_verifier=secret-value",
                     path="/auth/callback",
                     request_host="10.0.1.1",
                 )
 
-        self.assertEqual(ctx.exception.status_code, 502)
-        self.assertIn("Reason: connection_refused", str(ctx.exception.detail))
+        self.assertIn("Reason: connection_refused", str(ctx.exception))
         merged_logs = "\n".join(captured_logs.output)
         self.assertIn("OpenAI callback forward resolution", merged_logs)
         self.assertIn("failure_reason=connection_refused", merged_logs)
@@ -2622,15 +2626,14 @@ Gemini CLI
             "agent_hub.server._forward_openai_callback_via_container_loopback",
             side_effect=AssertionError("container loopback fallback must not be used"),
         ):
-            with self.assertRaises(HTTPException) as ctx:
+            with self.assertRaises(hub_server.NetworkReachabilityError) as ctx:
                 self.state.forward_openai_account_callback(
                     "code=abc&state=xyz",
                     path="/auth/callback",
                     request_host="10.0.1.1",
                 )
 
-        self.assertEqual(ctx.exception.status_code, 502)
-        self.assertIn("Reason: connection_refused", str(ctx.exception.detail))
+        self.assertIn("Reason: connection_refused", str(ctx.exception))
         urlopen_mock.assert_called_once()
 
     def test_forward_openai_account_callback_uses_network_without_container_loopback(self) -> None:
@@ -2713,7 +2716,7 @@ Gemini CLI
             "agent_hub.server._forward_openai_callback_via_container_loopback",
             return_value=hub_server.OpenAICallbackContainerForwardResult(attempted=False),
         ):
-            with self.assertRaises(HTTPException) as ctx:
+            with self.assertRaises(hub_server.NetworkReachabilityError) as ctx:
                 self.state.forward_openai_account_callback(
                     "code=abc&state=xyz",
                     path="/auth/callback",
@@ -2721,8 +2724,7 @@ Gemini CLI
                     request_context={"forwarded_host": "198.51.100.20"},
                 )
 
-        self.assertEqual(ctx.exception.status_code, 502)
-        self.assertIn("Reason: url_error", str(ctx.exception.detail))
+        self.assertIn("Reason: url_error", str(ctx.exception))
         self.assertEqual(
             attempted_urls,
             ["http://10.0.1.1:1455/auth/callback?code=abc&state=xyz"],
@@ -2852,6 +2854,18 @@ Gemini CLI
         expected_line = 'projects."/workspace/agent_hub".trust_level = "trusted"'
         self.assertIn(expected_line, runtime_text)
         self.assertEqual(runtime_text.count(expected_line), 1)
+
+    def test_prepare_chat_runtime_config_fails_fast_when_agent_tools_url_missing(self) -> None:
+        with self.assertRaises(hub_server.ConfigError) as ctx:
+            self.state._prepare_chat_runtime_config(
+                "chat-missing-agent-tools-url",
+                agent_type="codex",
+                agent_tools_url="",
+                agent_tools_token="mcp-token-test",
+                agent_tools_project_id="project-mcp-test",
+                agent_tools_chat_id="chat-missing-agent-tools-url",
+            )
+        self.assertIn(hub_server.AGENT_TOOLS_URL_ENV, str(ctx.exception))
 
     def test_start_chat_filters_reserved_openai_env_vars(self) -> None:
         project = self.state.add_project(
@@ -3458,11 +3472,10 @@ Gemini CLI
             hub_server.HubState,
             "_spawn_chat_process",
         ) as spawn_process:
-            with self.assertRaises(HTTPException) as ctx:
+            with self.assertRaises(hub_server.ConfigError) as ctx:
                 self.state.start_chat(chat["id"])
 
-        self.assertEqual(ctx.exception.status_code, 400)
-        self.assertIn("agent_type must be one of", str(ctx.exception.detail))
+        self.assertIn("agent_type must be one of", str(ctx.exception))
         spawn_process.assert_not_called()
 
     def test_create_chat_invalid_agent_type_fails_fast(self) -> None:
@@ -3947,7 +3960,7 @@ Gemini CLI
         self.assertEqual(captured["cmd"][system_prompt_index + 1], str(self.state.system_prompt_file))
 
     def test_hub_state_rejects_invalid_artifact_publish_base_url(self) -> None:
-        with self.assertRaises(ValueError):
+        with self.assertRaises(hub_server.ConfigError):
             hub_server.HubState(
                 data_dir=self.tmp_path / "hub-invalid-artifacts-base",
                 config_file=self.config_file,
@@ -4207,8 +4220,23 @@ Gemini CLI
 
         loaded = self.state.load()["chats"][chat["id"]]
         self.assertEqual(loaded["artifact_current_ids"], ["artifact-legacy"])
+        persisted = json.loads(self.state.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["chats"][chat["id"]]["artifact_current_ids"], ["artifact-legacy"])
 
-    def test_load_migrates_legacy_codex_args_once(self) -> None:
+    def test_load_normalizes_invalid_root_shapes_and_persists(self) -> None:
+        self.state.state_file.write_text(
+            json.dumps({"version": 1, "projects": [], "chats": "invalid", "settings": {}}),
+            encoding="utf-8",
+        )
+
+        loaded = self.state.load()
+        self.assertEqual(loaded["projects"], {})
+        self.assertEqual(loaded["chats"], {})
+        persisted = json.loads(self.state.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["projects"], {})
+        self.assertEqual(persisted["chats"], {})
+
+    def test_load_fails_fast_on_legacy_codex_args(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
             default_branch="main",
@@ -4228,40 +4256,11 @@ Gemini CLI
         legacy_chat["codex_args"] = ["--model", "gpt-5.3-codex"]
         self.state.save(state_data)
 
-        self.state._migrate_legacy_state_once()
-        loaded_chat = self.state.load()["chats"][chat["id"]]
-        self.assertEqual(loaded_chat["agent_args"], ["--model", "gpt-5.3-codex"])
-        self.assertNotIn("codex_args", loaded_chat)
+        with self.assertRaises(hub_server.ConfigError) as ctx:
+            self.state.load()
+        self.assertIn("codex_args is no longer supported", str(ctx.exception))
 
-        persisted = json.loads(self.state.state_file.read_text(encoding="utf-8"))
-        self.assertNotIn("codex_args", persisted["chats"][chat["id"]])
-
-    def test_load_migration_prefers_agent_args_over_codex_args(self) -> None:
-        project = self.state.add_project(
-            repo_url="https://example.com/org/repo.git",
-            default_branch="main",
-        )
-        chat = self.state.create_chat(
-            project["id"],
-            profile="",
-            ro_mounts=[],
-            rw_mounts=[],
-            env_vars=[],
-            agent_args=[],
-        )
-
-        state_data = self.state.load()
-        target_chat = state_data["chats"][chat["id"]]
-        target_chat["agent_args"] = ["--model", "primary"]
-        target_chat["codex_args"] = ["--model", "legacy"]
-        self.state.save(state_data)
-
-        self.state._migrate_legacy_state_once()
-        loaded_chat = self.state.load()["chats"][chat["id"]]
-        self.assertEqual(loaded_chat["agent_args"], ["--model", "primary"])
-        self.assertNotIn("codex_args", loaded_chat)
-
-    def test_load_migration_uses_codex_args_when_agent_args_not_list(self) -> None:
+    def test_load_fails_fast_when_agent_args_is_not_array(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
             default_branch="main",
@@ -4278,13 +4277,11 @@ Gemini CLI
         state_data = self.state.load()
         target_chat = state_data["chats"][chat["id"]]
         target_chat["agent_args"] = "not-a-list"
-        target_chat["codex_args"] = ["--model", "legacy-fallback"]
         self.state.save(state_data)
 
-        self.state._migrate_legacy_state_once()
-        loaded_chat = self.state.load()["chats"][chat["id"]]
-        self.assertEqual(loaded_chat["agent_args"], ["--model", "legacy-fallback"])
-        self.assertNotIn("codex_args", loaded_chat)
+        with self.assertRaises(hub_server.ConfigError) as ctx:
+            self.state.load()
+        self.assertIn("agent_args must be an array", str(ctx.exception))
 
     def test_load_fails_fast_on_invalid_persisted_agent_type(self) -> None:
         project = self.state.add_project(
@@ -4304,10 +4301,9 @@ Gemini CLI
         state_data["chats"][chat["id"]]["agent_type"] = "not-a-valid-agent-type"
         self.state.save(state_data)
 
-        with self.assertRaises(HTTPException) as ctx:
+        with self.assertRaises(hub_server.ConfigError) as ctx:
             self.state.load()
-        self.assertEqual(ctx.exception.status_code, 400)
-        self.assertIn("Invalid chat state", str(ctx.exception.detail))
+        self.assertIn("Invalid chat state", str(ctx.exception))
 
     def test_publish_chat_artifact_rejects_invalid_token(self) -> None:
         project = self.state.add_project(
@@ -4427,7 +4423,7 @@ Gemini CLI
         self.assertEqual(captured["started_chat_id"], "chat-created")
         self.assertEqual(result["id"], "chat-created")
 
-    def test_create_and_start_chat_preserves_failed_chat_when_start_raises(self) -> None:
+    def test_create_and_start_chat_fails_fast_when_start_raises(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
             default_branch="main",
@@ -4438,16 +4434,11 @@ Gemini CLI
             hub_server.HubState,
             "start_chat",
             side_effect=HTTPException(status_code=500, detail="synthetic start failure"),
-        ):
-            result = self.state.create_and_start_chat(project["id"])
+        ), self.assertRaises(HTTPException) as ctx:
+            self.state.create_and_start_chat(project["id"])
 
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["status_reason"], "chat_start_failed_during_create")
-        self.assertEqual(result["start_error"], "synthetic start failure")
-        reloaded = self.state.load()["chats"][result["id"]]
-        self.assertEqual(reloaded["status"], "failed")
-        self.assertEqual(reloaded["status_reason"], "chat_start_failed_during_create")
-        self.assertEqual(reloaded["start_error"], "synthetic start failure")
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertEqual(str(ctx.exception.detail), "synthetic start failure")
 
     def test_create_and_start_chat_reuses_existing_request_id_chat(self) -> None:
         project = self.state.add_project(
@@ -5179,25 +5170,17 @@ Gemini CLI
         self.assertEqual(str(context.exception.detail), "Command failed (uv) with exit code 7")
         self.assertTrue(fake_logger.warning.called)
 
-    def test_delete_path_retries_after_permission_repair(self) -> None:
+    def test_delete_path_fails_fast_on_permission_error(self) -> None:
         path = self.tmp_path / "workspace-delete"
         path.mkdir(parents=True, exist_ok=True)
 
-        attempts = {"count": 0}
+        with patch("agent_hub.server.shutil.rmtree", side_effect=PermissionError("permission denied")) as rmtree_call:
+            with self.assertRaises(HTTPException) as ctx:
+                self.state._delete_path(path)
 
-        def fake_rmtree(target_path: Path) -> None:
-            self.assertEqual(target_path, path)
-            attempts["count"] += 1
-            if attempts["count"] == 1:
-                raise PermissionError("permission denied")
-
-        with patch("agent_hub.server.shutil.rmtree", side_effect=fake_rmtree) as rmtree_call, patch(
-            "agent_hub.server._docker_fix_path_ownership"
-        ) as repair_call:
-            self.state._delete_path(path)
-
-        self.assertEqual(rmtree_call.call_count, 2)
-        repair_call.assert_called_once_with(path, self.state.local_uid, self.state.local_gid)
+        self.assertEqual(rmtree_call.call_count, 1)
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertIn("permission denied", str(ctx.exception.detail))
 
     def test_ensure_project_setup_snapshot_uses_repo_root_context_for_repo_dockerfile(self) -> None:
         self._connect_github_app()
@@ -6356,7 +6339,7 @@ Gemini CLI
         self.assertNotIn(unexpected_mount, recommendation["default_rw_mounts"])
         self.assertTrue((fake_home / ".ccache").exists())
 
-    def test_normalize_auto_config_recommendation_drops_project_workspace_mount(self) -> None:
+    def test_normalize_auto_config_recommendation_rejects_project_workspace_mount(self) -> None:
         workspace = self.tmp_path / "workspace-project-mount"
         workspace.mkdir(parents=True, exist_ok=True)
         keep_host = self.tmp_path / "safe-volume"
@@ -6365,28 +6348,25 @@ Gemini CLI
         fake_home = self.tmp_path / "fake-home-project-mount"
         fake_home.mkdir(parents=True, exist_ok=True)
         with patch("agent_hub.server.Path.home", return_value=fake_home):
-            recommendation = self.state._normalize_auto_config_recommendation(
-                {
-                    "base_image_mode": "tag",
-                    "base_image_value": "ubuntu:22.04",
-                    "setup_script": "",
-                    "default_ro_mounts": [],
-                    "default_rw_mounts": [
-                        f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/data",
-                        f"{keep_host}:{project_container_workspace}",
-                        f"{keep_host}:{project_container_workspace}/src",
-                    ],
-                    "default_env_vars": [],
-                    "notes": "",
-                },
-                workspace,
-                project_container_workspace=project_container_workspace,
-            )
-
-        self.assertEqual(
-            recommendation["default_rw_mounts"],
-            [f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/data"],
-        )
+            with self.assertRaises(hub_server.MountVisibilityError) as ctx:
+                self.state._normalize_auto_config_recommendation(
+                    {
+                        "base_image_mode": "tag",
+                        "base_image_value": "ubuntu:22.04",
+                        "setup_script": "",
+                        "default_ro_mounts": [],
+                        "default_rw_mounts": [
+                            f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/data",
+                            f"{keep_host}:{project_container_workspace}",
+                            f"{keep_host}:{project_container_workspace}/src",
+                        ],
+                        "default_env_vars": [],
+                        "notes": "",
+                    },
+                    workspace,
+                    project_container_workspace=project_container_workspace,
+                )
+        self.assertIn("reserved workspace path", str(ctx.exception))
 
     def test_normalize_auto_config_recommendation_drops_undetected_cache_mounts(self) -> None:
         workspace = self.tmp_path / "workspace-no-cache"
@@ -6420,7 +6400,7 @@ Gemini CLI
 
         self.assertEqual(recommendation["default_rw_mounts"], [])
 
-    def test_normalize_auto_config_recommendation_drops_docker_socket_mounts(self) -> None:
+    def test_normalize_auto_config_recommendation_rejects_docker_socket_mounts(self) -> None:
         workspace = self.tmp_path / "workspace-drop-docker-socket"
         workspace.mkdir(parents=True, exist_ok=True)
         keep_host = self.tmp_path / "safe-cache"
@@ -6429,27 +6409,23 @@ Gemini CLI
         fake_home.mkdir(parents=True, exist_ok=True)
 
         with patch("agent_hub.server.Path.home", return_value=fake_home):
-            recommendation = self.state._normalize_auto_config_recommendation(
-                {
-                    "base_image_mode": "tag",
-                    "base_image_value": "ubuntu:22.04",
-                    "setup_script": "",
-                    "default_ro_mounts": ["/tmp/nonexistent/docker.sock:/var/run/docker.sock"],
-                    "default_rw_mounts": [
-                        f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.cache/build",
-                        "/run/user/1000/docker.sock:/tmp/agent-docker.sock",
-                    ],
-                    "default_env_vars": [],
-                    "notes": "",
-                },
-                workspace,
-            )
-
-        self.assertEqual(recommendation["default_ro_mounts"], [])
-        self.assertEqual(
-            recommendation["default_rw_mounts"],
-            [f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.cache/build"],
-        )
+            with self.assertRaises(hub_server.MountVisibilityError) as ctx:
+                self.state._normalize_auto_config_recommendation(
+                    {
+                        "base_image_mode": "tag",
+                        "base_image_value": "ubuntu:22.04",
+                        "setup_script": "",
+                        "default_ro_mounts": ["/tmp/nonexistent/docker.sock:/var/run/docker.sock"],
+                        "default_rw_mounts": [
+                            f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.cache/build",
+                            "/run/user/1000/docker.sock:/tmp/agent-docker.sock",
+                        ],
+                        "default_env_vars": [],
+                        "notes": "",
+                    },
+                    workspace,
+                )
+        self.assertIn("docker socket mounts are not allowed", str(ctx.exception))
 
     def test_normalize_auto_config_recommendation_ignores_cache_signals_in_test_paths(self) -> None:
         workspace = self.tmp_path / "workspace-test-cache-signals"
@@ -6700,6 +6676,10 @@ Gemini CLI
             self.state,
             "_create_agent_tools_session",
             return_value=("session-test", "token-test"),
+        ), patch.object(
+            self.state,
+            "issue_agent_tools_session_ready_ack_guid",
+            return_value="ready-ack-test",
         ), patch.object(
             self.state,
             "_prepare_chat_runtime_config",
@@ -8129,7 +8109,7 @@ class CliEnvVarTests(unittest.TestCase):
                 "agent_cli.cli._daemon_mount_source_kind",
                 return_value="dir",
             ):
-                with self.assertRaises(ClickException) as exc:
+                with self.assertRaises(hub_server.MountVisibilityError) as exc:
                     image_cli._prepare_daemon_visible_file_mount_source(
                         source,
                         label="--config-file",
@@ -10909,6 +10889,41 @@ class CliEnvVarTests(unittest.TestCase):
             build_frontend.assert_not_called()
             state_cls.assert_not_called()
 
+    def test_agent_hub_main_fails_fast_when_runtime_strict_mode_disabled(self) -> None:
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = tmp_path / "hub"
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                (
+                    "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                    "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nstrict_mode = false\n"
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("agent_hub.server._ensure_frontend_built") as build_frontend, patch(
+                "agent_hub.server.HubState"
+            ) as state_cls, patch(
+                "agent_hub.server.uvicorn.run",
+                return_value=None,
+            ):
+                result = runner.invoke(
+                    hub_server.main,
+                    [
+                        "--data-dir",
+                        str(data_dir),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("runtime.strict_mode=true", result.output)
+            build_frontend.assert_not_called()
+            state_cls.assert_not_called()
+
     def test_agent_hub_main_respects_log_level_flag(self) -> None:
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmp:
@@ -11227,6 +11242,23 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             credential_binding={"mode": "auto", "credential_ids": [], "source": "", "updated_at": ""},
         )
 
+    def test_create_project_route_rejects_invalid_credential_binding_mode(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ProjectService, "create_project") as create_project:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects",
+                    json={
+                        "repo_url": "https://example.com/org/repo.git",
+                        "name": "demo",
+                        "credential_binding": {"mode": "invalid-mode"},
+                    },
+                )
+        self.assertEqual(response.status_code, 401, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "CREDENTIAL_RESOLUTION_ERROR")
+        self.assertIn("credential_binding.mode must be one of", response.json()["detail"])
+        create_project.assert_not_called()
+
     def test_project_chat_start_route_runs_state_call_in_worker_thread(self) -> None:
         app = self._build_app()
         chat = {"id": "chat-1", "status": "running"}
@@ -11372,6 +11404,24 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, msg=response.text)
         self.assertIn("agent_type must be one of", response.json()["detail"])
         start_chat.assert_not_called()
+
+    def test_project_chat_start_route_surfaces_config_error_code(self) -> None:
+        app = self._build_app()
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ), patch.object(
+            hub_server.ProjectService,
+            "create_and_start_chat",
+            side_effect=hub_server.ConfigError("chat runtime config invalid"),
+        ):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/project-1/chats/start",
+                    json={"agent_type": "codex", "agent_args": []},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "CONFIG_ERROR")
 
     def test_create_chat_route_rejects_non_object_payload(self) -> None:
         app = self._build_app()
@@ -11656,6 +11706,82 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         self.assertEqual(request_context.get("x_forwarded_port"), 443)
         self.assertEqual(request_context.get("host_header_host"), "public.example.com")
         self.assertEqual(request_context.get("host_header_port"), 443)
+
+    def test_openai_account_callback_route_surfaces_network_reachability_error_code(self) -> None:
+        app = self._build_app()
+        with patch.object(
+            hub_server.LifecycleService,
+            "forward_openai_account_callback",
+            side_effect=hub_server.NetworkReachabilityError("callback target unreachable"),
+        ):
+            with TestClient(app) as client:
+                response = client.get("/api/settings/auth/openai/account/callback?code=abc")
+        self.assertEqual(response.status_code, 502, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "NETWORK_REACHABILITY_ERROR")
+        self.assertIn("unreachable", response.json()["detail"])
+
+    def test_agent_tools_credential_resolve_route_surfaces_credential_resolution_error_code(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.CredentialsService, "resolve_token", return_value="token"), patch.object(
+            hub_server.CredentialsService,
+            "resolve_chat_credentials",
+            side_effect=hub_server.CredentialResolutionError("mode must be one of: all, auto, set, single."),
+        ):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/chats/chat-1/agent-tools/credentials/resolve",
+                    json={"mode": "invalid"},
+                )
+        self.assertEqual(response.status_code, 401, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "CREDENTIAL_RESOLUTION_ERROR")
+
+    def test_chat_start_route_surfaces_config_error_code(self) -> None:
+        app = self._build_app()
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ), patch.object(
+            hub_server.ChatService,
+            "start_chat",
+            side_effect=hub_server.ConfigError("invalid runtime config"),
+        ):
+            with TestClient(app) as client:
+                response = client.post("/api/chats/chat-1/start")
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "CONFIG_ERROR")
+
+    def test_create_chat_route_surfaces_mount_visibility_error_code(self) -> None:
+        app = self._build_app()
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ), patch.object(
+            hub_server.ChatService,
+            "create_chat",
+            side_effect=hub_server.MountVisibilityError("mount path not visible to daemon"),
+        ):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/chats",
+                    json={"project_id": "project-1", "agent_args": []},
+                )
+        self.assertEqual(response.status_code, 409, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "MOUNT_VISIBILITY_ERROR")
+
+    def test_chat_start_route_surfaces_identity_error_code(self) -> None:
+        app = self._build_app()
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ), patch.object(
+            hub_server.ChatService,
+            "start_chat",
+            side_effect=hub_server.IdentityError("uid/gid mismatch"),
+        ):
+            with TestClient(app) as client:
+                response = client.post("/api/chats/chat-1/start")
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "IDENTITY_ERROR")
 
     def test_terminal_websocket_disconnect_during_backlog_send_detaches_listener(self) -> None:
         app = self._build_app()

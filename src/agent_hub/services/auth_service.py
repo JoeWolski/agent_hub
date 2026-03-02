@@ -7,7 +7,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from fastapi import HTTPException
+from agent_core.errors import NetworkReachabilityError
 
 
 @dataclass
@@ -285,12 +285,9 @@ class AuthService:
                 json.dumps(callback_query, sort_keys=True),
                 extra={**log_extra_base, "result": "failed", "error_class": failure_reason},
             )
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Failed to forward OAuth callback to login container. "
-                    f"Reason: {failure_reason}. Attempted: {attempted}"
-                ),
+            raise NetworkReachabilityError(
+                "Failed to forward OAuth callback to login container. "
+                f"Reason: {failure_reason}. Attempted: {attempted}"
             ) from last_exc
 
         return AuthCallbackForwardResult(

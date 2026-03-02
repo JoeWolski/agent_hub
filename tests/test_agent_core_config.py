@@ -32,6 +32,7 @@ def test_agent_runtime_config_defaults() -> None:
     assert config.auth.values == {}
     assert config.logging.values == {}
     assert config.runtime.run_mode == "docker"
+    assert config.runtime.strict_mode is True
     assert config.runtime.values == {}
     assert config.extras == {}
 
@@ -134,5 +135,33 @@ def test_agent_runtime_config_invalid_run_mode_raises_config_error() -> None:
                 "auth": {},
                 "logging": {},
                 "runtime": {"run_mode": "invalid"},
+            }
+        )
+
+
+def test_agent_runtime_config_strict_mode_parsing_and_type_validation() -> None:
+    parsed = load_agent_runtime_config_dict(
+        {
+            "identity": {},
+            "paths": {},
+            "providers": {},
+            "mcp": {},
+            "auth": {},
+            "logging": {},
+            "runtime": {"strict_mode": False},
+        }
+    )
+    assert parsed.runtime.strict_mode is False
+
+    with pytest.raises(ConfigError, match="runtime.strict_mode must be a boolean"):
+        load_agent_runtime_config_dict(
+            {
+                "identity": {},
+                "paths": {},
+                "providers": {},
+                "mcp": {},
+                "auth": {},
+                "logging": {},
+                "runtime": {"strict_mode": "false"},
             }
         )
