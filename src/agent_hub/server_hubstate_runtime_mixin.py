@@ -2024,63 +2024,13 @@ class HubStateRuntimeMixin:
         return self.project_credential_binding_payload(project_id)
 
     def _start_project_build_thread_locked(self, project_id: str) -> None:
-        thread = self._project_build_threads.get(project_id)
-        if thread and thread.is_alive():
-            return
-        thread = Thread(target=self._project_build_worker, args=(project_id,), daemon=True)
-        self._project_build_threads[project_id] = thread
-        thread.start()
+        self.project_service._start_project_build_thread_locked(project_id)
 
     def _schedule_project_build(self, project_id: str) -> None:
-        self._register_project_build_request(project_id)
-        with self._project_build_lock:
-            self._start_project_build_thread_locked(project_id)
+        self.project_service._schedule_project_build(project_id)
 
     def _project_build_worker(self, project_id: str) -> None:
-        try:
-            while True:
-                if self._is_project_build_cancelled(project_id):
-                    self._mark_project_build_cancelled(project_id)
-                    return
-                state = self.load()
-                project = state["projects"].get(project_id)
-                if project is None:
-                    return
-                build_status = str(project.get("build_status") or "")
-                if build_status not in {"pending", "building"}:
-                    return
-                self._build_project_snapshot(project_id)
-                state = self.load()
-                project = state["projects"].get(project_id)
-                if project is None:
-                    return
-                expected = self._project_setup_snapshot_tag(project)
-                snapshot = str(project.get("setup_snapshot_image") or "").strip()
-                status = str(project.get("build_status") or "")
-                if status == "ready" and snapshot == expected and _docker_image_exists(snapshot):
-                    return
-                if status == "pending":
-                    if self._is_project_build_cancelled(project_id):
-                        self._mark_project_build_cancelled(project_id)
-                        return
-                    continue
-                if status == "ready" and snapshot != expected:
-                    project["build_status"] = "pending"
-                    project["updated_at"] = _iso_now()
-                    state["projects"][project_id] = project
-                    self.save(state)
-                    continue
-                return
-        finally:
-            with self._project_build_lock:
-                existing = self._project_build_threads.get(project_id)
-                if existing is not None and existing.ident == current_thread().ident:
-                    self._project_build_threads.pop(project_id, None)
-                    state = self.load()
-                    project = state["projects"].get(project_id)
-                    if project is not None and str(project.get("build_status") or "") in {"pending", "building"}:
-                        self._start_project_build_thread_locked(project_id)
-            self._clear_project_build_request(project_id)
+        self.project_service._project_build_worker(project_id)
 
     def _build_project_snapshot(self, project_id: str) -> dict[str, Any]:
         return self.project_service._build_project_snapshot(project_id)
@@ -2762,123 +2712,19 @@ class HubStateRuntimeMixin:
         return workspace
 
     def _ensure_project_clone(self, project: dict[str, Any]) -> Path:
-        workspace = self.project_workdir(project["id"])
-        if workspace.exists():
-            git_dir = workspace / ".git"
-            if git_dir.is_dir():
-                return workspace
-            self._delete_path(workspace)
-        workspace.parent.mkdir(parents=True, exist_ok=True)
-        git_env = self._github_git_env_for_repo(
-            str(project.get("repo_url") or ""),
-            project=project,
-            context_key=f"project_clone:{project.get('id')}",
-        )
-        _run(["git", "clone", project["repo_url"], str(workspace)], check=True, env=git_env)
-        return workspace
+        return self.project_service._ensure_project_clone(project)
 
     def _sync_checkout_to_remote(self, workspace: Path, project: dict[str, Any]) -> None:
-        git_env = self._github_git_env_for_repo(
-            str(project.get("repo_url") or ""),
-            project=project,
-            context_key=f"project_sync:{project.get('id')}",
-        )
-        _run_for_repo(["fetch", "--all", "--prune"], workspace, check=True, env=git_env)
-        branch = str(project.get("default_branch") or "").strip()
-        remote_default = _git_default_remote_branch(workspace)
-        if remote_default:
-            branch = remote_default
-
-        if not branch:
-            raise ConfigError("Unable to determine remote branch for sync: missing project.default_branch and origin/HEAD.")
-
-        if not _git_has_remote_branch(workspace, branch):
-            raise ConfigError(f"Unable to determine remote branch for sync: origin/{branch} not found.")
-
-        _run_for_repo(["checkout", branch], workspace, check=True)
-        _run_for_repo(["reset", "--hard", f"origin/{branch}"], workspace, check=True)
-        _run_for_repo(["clean", "-fd"], workspace, check=True)
+        self.project_service._sync_checkout_to_remote(workspace, project)
 
     def _resolve_project_base_value(self, workspace: Path, project: dict[str, Any]) -> tuple[str, str] | None:
-        base_mode = _normalize_base_image_mode(project.get("base_image_mode"))
-        base_value = _normalize_base_image_value(base_mode, project.get("base_image_value"))
-
-        if base_mode == "tag":
-            return "base-image", base_value
-        if not base_value:
-            raise HTTPException(
-                status_code=400,
-                detail="base_image_value is required when base_image_mode is 'repo_path'.",
-            )
-
-        workspace_root = workspace.resolve()
-        base_candidate = Path(base_value)
-        if base_candidate.is_absolute():
-            resolved_base = base_candidate.resolve()
-        else:
-            resolved_base = (workspace / base_candidate).resolve()
-        try:
-            resolved_base.relative_to(workspace_root)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Base path must be inside the checked-out project. "
-                    f"Got: {base_value}"
-                ),
-            ) from exc
-        if not resolved_base.exists():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Base path does not exist in project workspace: {base_value}",
-            )
-        if not (resolved_base.is_file() or resolved_base.is_dir()):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Base path must be a file or directory: {base_value}",
-            )
-        return "base", str(resolved_base)
+        return self.project_service._resolve_project_base_value(workspace, project)
 
     def _append_project_base_args(self, cmd: list[str], workspace: Path, project: dict[str, Any]) -> None:
-        resolved = self._resolve_project_base_value(workspace, project)
-        if not resolved:
-            return
-        flag, value = resolved
-        if flag == "base":
-            base_path = Path(value)
-            if base_path.is_file():
-                # Dockerfiles stored under subdirectories commonly still need the repository
-                # root as build context for COPY paths (for example COPY src ./src).
-                cmd.extend(["--base-docker-context", str(workspace.resolve())])
-                cmd.extend(["--base-dockerfile", str(base_path)])
-                return
-        cmd.extend([f"--{flag}", value])
+        self.project_service._append_project_base_args(cmd, workspace, project)
 
     def _project_setup_snapshot_tag(self, project: dict[str, Any]) -> str:
-        project_id = str(project.get("id") or "")[:12] or "project"
-        normalized_base_mode = _normalize_base_image_mode(project.get("base_image_mode"))
-        normalized_base_value = _normalize_base_image_value(
-            normalized_base_mode,
-            project.get("base_image_value"),
-        )
-        payload = json.dumps(
-            {
-                "snapshot_schema_version": _snapshot_schema_version(),
-                "project_id": project.get("id"),
-                "default_branch": project.get("default_branch") or "",
-                "repo_head_sha": project.get("repo_head_sha") or "",
-                "setup_script": str(project.get("setup_script") or ""),
-                "base_mode": normalized_base_mode,
-                "base_value": normalized_base_value,
-                "default_ro_mounts": list(project.get("default_ro_mounts") or []),
-                "default_rw_mounts": list(project.get("default_rw_mounts") or []),
-                "default_env_vars": list(project.get("default_env_vars") or []),
-                "agent_cli_runtime_inputs_fingerprint": _agent_cli_runtime_inputs_fingerprint(),
-            },
-            sort_keys=True,
-        )
-        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-        return f"agent-hub-setup-{project_id}-{digest}"
+        return self.project_service._project_setup_snapshot_tag(project)
 
     def _ensure_project_setup_snapshot(
         self,
