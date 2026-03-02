@@ -2083,108 +2083,7 @@ class HubStateRuntimeMixin:
             self._clear_project_build_request(project_id)
 
     def _build_project_snapshot(self, project_id: str) -> dict[str, Any]:
-        state = self.load()
-        project = state["projects"].get(project_id)
-        if project is None:
-            self._clear_project_build_request(project_id)
-            raise HTTPException(status_code=404, detail="Project not found.")
-        if self._is_project_build_cancelled(project_id):
-            self._mark_project_build_cancelled(project_id)
-            self._clear_project_build_request(project_id)
-            current_project = self.project(project_id)
-            if current_project is None:
-                raise HTTPException(status_code=404, detail="Project not found.")
-            return current_project
-
-        started_at = _iso_now()
-        project["build_status"] = "building"
-        project["build_error"] = ""
-        project["build_started_at"] = started_at
-        project["build_finished_at"] = ""
-        project["updated_at"] = started_at
-        state["projects"][project_id] = project
-        self.save(state, reason="project_build_started")
-
-        project_copy = dict(project)
-        log_path = self.project_build_log(project_id)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text("", encoding="utf-8")
-        self._emit_project_build_log(project_id, "", replace=True)
-
-        try:
-            snapshot_tag = self._prepare_project_snapshot_for_project(project_copy, log_path=log_path)
-            LOGGER.debug("Project build snapshot command succeeded for project=%s snapshot=%s", project_id, snapshot_tag)
-        except Exception as exc:
-            state = self.load()
-            current = state["projects"].get(project_id)
-            if current is None:
-                self._clear_project_build_request(project_id)
-                raise
-            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-            now = _iso_now()
-            is_cancelled = self._is_project_build_cancelled(project_id)
-            current["build_status"] = "cancelled" if is_cancelled else "failed"
-            current["build_error"] = PROJECT_BUILD_CANCELLED_ERROR if is_cancelled else str(detail)
-            current["build_finished_at"] = now
-            current["updated_at"] = now
-            state["projects"][project_id] = current
-            if is_cancelled:
-                self.save(state, reason="project_build_cancelled")
-                LOGGER.info("Project build cancelled for project=%s", project_id)
-            else:
-                self.save(state, reason="project_build_failed")
-                LOGGER.warning("Project build failed for project=%s: %s", project_id, detail)
-            self._clear_project_build_request(project_id)
-            return current
-
-        state = self.load()
-        current = state["projects"].get(project_id)
-        if current is None:
-            self._clear_project_build_request(project_id)
-            raise HTTPException(status_code=404, detail="Project not found.")
-        if self._is_project_build_cancelled(project_id):
-            now = _iso_now()
-            current["build_status"] = "cancelled"
-            current["build_error"] = PROJECT_BUILD_CANCELLED_ERROR
-            current["build_finished_at"] = now
-            current["updated_at"] = now
-            state["projects"][project_id] = current
-            self.save(state, reason="project_build_cancelled")
-            self._clear_project_build_request(project_id)
-            return current
-        current_candidate = dict(current)
-        current_candidate["repo_head_sha"] = project_copy.get("repo_head_sha") or ""
-        expected_snapshot = self._project_setup_snapshot_tag(current_candidate)
-        if snapshot_tag != expected_snapshot:
-            current["setup_snapshot_image"] = ""
-            current["repo_head_sha"] = ""
-            current.pop("snapshot_updated_at", None)
-            current["build_status"] = "pending"
-            current["build_error"] = ""
-            current["build_started_at"] = ""
-            current["build_finished_at"] = ""
-            current["updated_at"] = _iso_now()
-            state["projects"][project_id] = current
-            self.save(state, reason="project_build_superseded")
-            LOGGER.debug(
-                "Project build output superseded for project=%s built=%s expected=%s; keeping project pending",
-                project_id,
-                snapshot_tag,
-                expected_snapshot,
-            )
-            return current
-        current["setup_snapshot_image"] = snapshot_tag
-        current["repo_head_sha"] = project_copy.get("repo_head_sha") or ""
-        current["snapshot_updated_at"] = _iso_now()
-        current["build_status"] = "ready"
-        current["build_error"] = ""
-        current["build_finished_at"] = _iso_now()
-        current["updated_at"] = _iso_now()
-        state["projects"][project_id] = current
-        self.save(state, reason="project_build_ready")
-        LOGGER.debug("Project build completed for project=%s snapshot=%s", project_id, snapshot_tag)
-        self._clear_project_build_request(project_id)
-        return current
+        return self.project_service._build_project_snapshot(project_id)
 
     def delete_project(self, project_id: str) -> None:
         self.project_service.delete_project(project_id)
@@ -2989,97 +2888,20 @@ class HubStateRuntimeMixin:
         project_id: str | None = None,
         on_output: Callable[[str], None] | None = None,
     ) -> str:
-        setup_script = str(project.get("setup_script") or "").strip()
-        snapshot_tag = self._project_setup_snapshot_tag(project)
-        resolved_project_id = str(project_id or project.get("id") or "").strip()
-        if _docker_image_exists(snapshot_tag):
-            if log_path is not None:
-                line = f"Using cached setup snapshot image '{snapshot_tag}'\n"
-                with log_path.open("a", encoding="utf-8", errors="ignore") as log_file:
-                    log_file.write(line)
-                if resolved_project_id:
-                    self._emit_project_build_log(resolved_project_id, line)
-                if on_output is not None:
-                    on_output(line)
-            return snapshot_tag
-
-        repo_url = str(project.get("repo_url") or "")
-        project_tmp_workspace = self.project_tmp_workdir(resolved_project_id or str(project.get("id") or ""))
-        project_tmp_workspace.mkdir(parents=True, exist_ok=True)
-        cmd = self._prepare_agent_cli_command(
-            workspace=workspace,
-            container_project_name=_container_project_name(project.get("name") or project.get("id")),
-            runtime_config_file=self.config_file,
-            agent_type=DEFAULT_CHAT_AGENT_TYPE,
-            run_mode=self._runtime_run_mode(),
-            agent_tools_url=f"{self.artifact_publish_base_url}/api/projects/{resolved_project_id}/agent-tools",
-            agent_tools_token="snapshot-token",
-            agent_tools_project_id=resolved_project_id,
-            repo_url=repo_url,
-            project=project,
-            snapshot_tag=snapshot_tag,
-            ro_mounts=project.get("default_ro_mounts"),
-            rw_mounts=project.get("default_rw_mounts"),
-            env_vars=project.get("default_env_vars"),
-            setup_script=setup_script,
-            prepare_snapshot_only=True,
-            project_in_image=True,
-            runtime_tmp_mount=str(project_tmp_workspace),
-            context_key=f"snapshot:{project.get('id')}",
+        return self.project_service._ensure_project_setup_snapshot(
+            workspace,
+            project,
+            log_path=log_path,
+            project_id=project_id,
+            on_output=on_output,
         )
-        if log_path is None:
-            _run(cmd, check=True)
-        else:
-            emit_build_output: Callable[[str], None] | None = None
-            if resolved_project_id or on_output is not None:
-
-                def emit_build_output(chunk: str) -> None:
-                    if resolved_project_id:
-                        self._emit_project_build_log(resolved_project_id, chunk)
-                    if on_output is not None:
-                        on_output(chunk)
-
-            on_process_start: Callable[[subprocess.Popen[str]], None] | None = None
-            if resolved_project_id:
-
-                def on_process_start(process: subprocess.Popen[str]) -> None:
-                    self._set_project_build_request_process(resolved_project_id, process)
-
-            try:
-                _run_logged(
-                    cmd,
-                    log_path=log_path,
-                    check=True,
-                    on_output=emit_build_output,
-                    on_process_start=on_process_start,
-                )
-            finally:
-                if resolved_project_id:
-                    self._set_project_build_request_process(resolved_project_id, None)
-        return snapshot_tag
 
     def _prepare_project_snapshot_for_project(
         self,
         project: dict[str, Any],
         log_path: Path | None = None,
     ) -> str:
-        project_id = str(project.get("id") or "")
-        if project_id and self._is_project_build_cancelled(project_id):
-            raise HTTPException(status_code=409, detail=PROJECT_BUILD_CANCELLED_ERROR)
-        workspace = self._ensure_project_clone(project)
-        if project_id and self._is_project_build_cancelled(project_id):
-            raise HTTPException(status_code=409, detail=PROJECT_BUILD_CANCELLED_ERROR)
-        self._sync_checkout_to_remote(workspace, project)
-        if project_id and self._is_project_build_cancelled(project_id):
-            raise HTTPException(status_code=409, detail=PROJECT_BUILD_CANCELLED_ERROR)
-        head_result = _run_for_repo(["rev-parse", "HEAD"], workspace, capture=True)
-        project["repo_head_sha"] = head_result.stdout.strip()
-        return self._ensure_project_setup_snapshot(
-            workspace,
-            project,
-            log_path=log_path,
-            project_id=str(project.get("id") or ""),
-        )
+        return self.project_service._prepare_project_snapshot_for_project(project, log_path=log_path)
 
     def _chat_container_outdated_state(
         self,
