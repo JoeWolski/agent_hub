@@ -2148,13 +2148,10 @@ class HubStateOpsMixin:
         return next_recommendation
 
     def _runtime_identity_for_workspace(self, workspace: Path) -> tuple[int, int, str]:
-        del workspace
-        return int(self.local_uid), int(self.local_gid), self.local_supp_gids
+        return self.launch_profile_service._runtime_identity_for_workspace(workspace)
 
     def _runtime_run_mode(self) -> str:
-        if self.runtime_config is None:
-            return DEFAULT_RUNTIME_RUN_MODE
-        return str(self.runtime_config.runtime.run_mode or DEFAULT_RUNTIME_RUN_MODE)
+        return self.launch_profile_service._runtime_run_mode()
 
     def _prepare_agent_cli_command(
         self,
@@ -2186,76 +2183,34 @@ class HubStateOpsMixin:
         project_in_image: bool = False,
         runtime_tmp_mount: str = "",
     ) -> list[str]:
-        runtime_uid, runtime_gid, runtime_supp_gids = self._runtime_identity_for_workspace(workspace)
-        normalized_agent_type = _normalize_chat_agent_type(agent_type, strict=True)
-        agent_command = _agent_command_for_type(normalized_agent_type)
-        project_base_args: list[str] = []
-        if snapshot_tag:
-            self._append_project_base_args(project_base_args, workspace, project)
-
-        normalized_ro_mounts = [str(mount) for mount in (ro_mounts or []) if str(mount or "").strip()]
-        normalized_rw_mounts = [str(mount) for mount in (rw_mounts or []) if str(mount or "").strip()]
-        normalized_runtime_tmp_mount = str(runtime_tmp_mount or "").strip()
-        if normalized_runtime_tmp_mount:
-            has_workspace_tmp_mount = _contains_container_mount_target(
-                [*normalized_ro_mounts, *normalized_rw_mounts],
-                DEFAULT_CONTAINER_TMP_DIR,
-            )
-            if not has_workspace_tmp_mount:
-                normalized_rw_mounts.append(f"{normalized_runtime_tmp_mount}:{DEFAULT_CONTAINER_TMP_DIR}")
-
-        command_env_vars: list[str] = []
-        if artifacts_url:
-            command_env_vars.append(f"AGENT_ARTIFACTS_URL={artifacts_url}")
-        if artifacts_token:
-            command_env_vars.append(f"AGENT_ARTIFACT_TOKEN={artifacts_token}")
-
-        command_env_vars.append(f"{AGENT_TOOLS_URL_ENV}={agent_tools_url}")
-        command_env_vars.append(f"{AGENT_TOOLS_TOKEN_ENV}={agent_tools_token}")
-        command_env_vars.append(f"{AGENT_TOOLS_PROJECT_ID_ENV}={agent_tools_project_id}")
-        command_env_vars.append(f"{AGENT_TOOLS_CHAT_ID_ENV}={agent_tools_chat_id}")
-        if normalized_runtime_tmp_mount:
-            command_env_vars.append(f"{AGENT_HUB_TMP_HOST_PATH_ENV}={normalized_runtime_tmp_mount}")
-        normalized_ready_ack_guid = str(ready_ack_guid or "").strip()
-        if normalized_ready_ack_guid:
-            command_env_vars.append(f"{AGENT_TOOLS_READY_ACK_GUID_ENV}={normalized_ready_ack_guid}")
-        for env_entry in self._git_identity_env_vars_from_settings():
-            command_env_vars.append(env_entry)
-
-        for env_entry in env_vars or []:
-            if _is_reserved_env_entry(str(env_entry)):
-                continue
-            if str(env_entry).split("=", 1)[0].strip() == AGENT_HUB_TMP_HOST_PATH_ENV:
-                continue
-            command_env_vars.append(str(env_entry))
-
-        spec = core_launch.LaunchSpec(
-            repo_root=_repo_root(),
+        return self.launch_profile_service._prepare_agent_cli_command(
             workspace=workspace,
             container_project_name=container_project_name,
-            agent_home_path=self.host_agent_home,
             runtime_config_file=runtime_config_file,
-            system_prompt_file=self.system_prompt_file,
-            agent_command=agent_command,
-            run_mode=str(run_mode),
-            local_uid=int(runtime_uid),
-            local_gid=int(runtime_gid),
-            local_user=self.local_user,
-            local_supplementary_gids=runtime_supp_gids,
+            agent_type=agent_type,
+            run_mode=run_mode,
+            agent_tools_url=agent_tools_url,
+            agent_tools_token=agent_tools_token,
+            agent_tools_project_id=agent_tools_project_id,
+            agent_tools_chat_id=agent_tools_chat_id,
+            ready_ack_guid=ready_ack_guid,
+            repo_url=repo_url,
+            project=project,
+            snapshot_tag=snapshot_tag,
+            ro_mounts=ro_mounts,
+            rw_mounts=rw_mounts,
+            env_vars=env_vars,
+            artifacts_url=artifacts_url,
+            artifacts_token=artifacts_token,
+            resume=resume,
             allocate_tty=allocate_tty,
-            resume=bool(resume and normalized_agent_type == AGENT_TYPE_CODEX),
-            snapshot_tag=str(snapshot_tag or ""),
-            ro_mounts=tuple(normalized_ro_mounts),
-            rw_mounts=tuple(normalized_rw_mounts),
-            env_vars=tuple(command_env_vars),
-            extra_args=tuple(str(arg) for arg in (extra_args or [])),
-            openai_credentials_args=tuple(self._openai_credentials_arg()),
-            base_args=tuple(project_base_args),
-            setup_script=str(setup_script or ""),
+            context_key=context_key,
+            extra_args=extra_args,
+            setup_script=setup_script,
             prepare_snapshot_only=prepare_snapshot_only,
             project_in_image=project_in_image,
+            runtime_tmp_mount=runtime_tmp_mount,
         )
-        return core_launch.compile_agent_cli_command(spec)
 
     def _launch_profile_from_command(
         self,
@@ -2269,76 +2224,19 @@ class HubStateOpsMixin:
         snapshot_tag: str,
         prepare_snapshot_only: bool,
     ) -> dict[str, Any]:
-        runtime_image = ""
-        if snapshot_tag:
-            runtime_image = str(snapshot_tag)
-            if prepare_snapshot_only:
-                runtime_image = str(_snapshot_setup_runtime_image_for_snapshot(snapshot_tag))
-        parsed = core_launch.parse_compiled_agent_cli_command(command)
-
-        return {
-            "mode": str(mode or "").strip(),
-            "generated_at": _iso_now(),
-            "workspace": str(workspace),
-            "runtime_config_file": str(runtime_config_file),
-            "container_project_name": str(container_project_name),
-            "agent_type": _normalize_chat_agent_type(agent_type, strict=True),
-            "snapshot_tag": str(snapshot_tag or ""),
-            "runtime_image": runtime_image,
-            "prepare_snapshot_only": bool(prepare_snapshot_only),
-            "ro_mounts": list(parsed.ro_mounts),
-            "rw_mounts": list(parsed.rw_mounts),
-            "env_vars": list(parsed.env_vars),
-            "container_args": list(parsed.container_args),
-            "command": [str(item) for item in command],
-        }
+        return self.launch_profile_service._launch_profile_from_command(
+            mode=mode,
+            command=command,
+            workspace=workspace,
+            runtime_config_file=runtime_config_file,
+            container_project_name=container_project_name,
+            agent_type=agent_type,
+            snapshot_tag=snapshot_tag,
+            prepare_snapshot_only=prepare_snapshot_only,
+        )
 
     def project_snapshot_launch_profile(self, project_id: str) -> dict[str, Any]:
-        state = self.load()
-        project = state["projects"].get(project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="Project not found.")
-
-        workspace = self._ensure_project_clone(project)
-        self._sync_checkout_to_remote(workspace, project)
-        head_result = _run_for_repo(["rev-parse", "HEAD"], workspace, capture=True)
-        project_for_launch = dict(project)
-        project_for_launch["repo_head_sha"] = head_result.stdout.strip()
-        snapshot_tag = self._project_setup_snapshot_tag(project_for_launch)
-        resolved_project_id = str(project_for_launch.get("id") or project_id).strip()
-        project_tmp_workspace = self.project_tmp_workdir(resolved_project_id)
-        project_tmp_workspace.mkdir(parents=True, exist_ok=True)
-        cmd = self._prepare_agent_cli_command(
-            workspace=workspace,
-            container_project_name=_container_project_name(project_for_launch.get("name") or project_for_launch.get("id")),
-            runtime_config_file=self.config_file,
-            agent_type=DEFAULT_CHAT_AGENT_TYPE,
-            run_mode=self._runtime_run_mode(),
-            agent_tools_url=f"{self.artifact_publish_base_url}/api/projects/{resolved_project_id}/agent-tools",
-            agent_tools_token="snapshot-token",
-            agent_tools_project_id=resolved_project_id,
-            repo_url=str(project_for_launch.get("repo_url") or ""),
-            project=project_for_launch,
-            snapshot_tag=snapshot_tag,
-            ro_mounts=project_for_launch.get("default_ro_mounts"),
-            rw_mounts=project_for_launch.get("default_rw_mounts"),
-            env_vars=project_for_launch.get("default_env_vars"),
-            setup_script=str(project_for_launch.get("setup_script") or ""),
-            prepare_snapshot_only=True,
-            project_in_image=True,
-            runtime_tmp_mount=str(project_tmp_workspace),
-            context_key=f"snapshot:{project_for_launch.get('id')}",
-        )
-        return self._launch_profile_from_command(
-            mode="project_snapshot",
-            command=cmd,
-            workspace=workspace,
-            runtime_config_file=self.config_file,
-            container_project_name=_container_project_name(project_for_launch.get("name") or project_for_launch.get("id")),
-            agent_type=DEFAULT_CHAT_AGENT_TYPE,
-            snapshot_tag=snapshot_tag,
-            prepare_snapshot_only=True,
-        )
+        return self.launch_profile_service.project_snapshot_launch_profile(project_id)
 
     def chat_launch_profile(
         self,
@@ -2349,81 +2247,12 @@ class HubStateOpsMixin:
         artifact_publish_token: str = "artifact-token",
         ready_ack_guid: str = "ready-ack-guid",
     ) -> dict[str, Any]:
-        state = self.load()
-        chat = state["chats"].get(chat_id)
-        if chat is None:
-            raise HTTPException(status_code=404, detail="Chat not found.")
-        project = state["projects"].get(chat.get("project_id"))
-        if project is None:
-            raise HTTPException(status_code=404, detail="Parent project missing.")
-
-        snapshot_tag = str(project.get("setup_snapshot_image") or "").strip()
-        expected_snapshot_tag = self._project_setup_snapshot_tag(project)
-        snapshot_ready = (
-            str(project.get("build_status") or "") == "ready"
-            and snapshot_tag
-            and snapshot_tag == expected_snapshot_tag
-        )
-        if not snapshot_ready:
-            raise HTTPException(status_code=409, detail="Project image is not ready yet. Wait for setup build to finish.")
-
-        workspace = self._ensure_chat_clone(chat, project)
-        self._sync_checkout_to_remote(workspace, project)
-        container_project_name = _container_project_name(project.get("name") or project.get("id"))
-        agent_type = _normalize_chat_agent_type(chat.get("agent_type"), strict=True)
-        runtime_config_file = self._prepare_chat_runtime_config(
+        return self.launch_profile_service.chat_launch_profile(
             chat_id,
-            agent_type=agent_type,
-            agent_tools_url=self._chat_agent_tools_url(chat_id),
-            agent_tools_token=agent_tools_token,
-            agent_tools_project_id=str(project.get("id") or ""),
-            agent_tools_chat_id=chat_id,
-            trusted_project_path=str(PurePosixPath(DEFAULT_CONTAINER_HOME) / container_project_name),
-        )
-        agent_args = [str(arg) for arg in (chat.get("agent_args") or []) if str(arg).strip()]
-        if resume and agent_type == AGENT_TYPE_CODEX:
-            agent_args = []
-        elif resume:
-            agent_args = self._resume_agent_args(agent_type, agent_args)
-
-        project_id = str(project.get("id") or "")
-        chat_tmp_workspace = self.chat_tmp_workdir(project_id, chat_id)
-        chat_tmp_workspace.mkdir(parents=True, exist_ok=True)
-
-        cmd = self._prepare_agent_cli_command(
-            workspace=workspace,
-            container_project_name=container_project_name,
-            runtime_config_file=runtime_config_file,
-            agent_type=agent_type,
-            run_mode=self._runtime_run_mode(),
-            agent_tools_url=self._chat_agent_tools_url(chat_id),
-            agent_tools_token=agent_tools_token,
-            agent_tools_project_id=str(project.get("id") or ""),
-            agent_tools_chat_id=chat_id,
-            repo_url=str(project.get("repo_url") or ""),
-            project=project,
-            snapshot_tag=snapshot_tag,
-            ro_mounts=chat.get("ro_mounts"),
-            rw_mounts=chat.get("rw_mounts"),
-            env_vars=chat.get("env_vars"),
-            artifacts_url=self._chat_artifact_publish_url(chat_id),
-            artifacts_token=artifact_publish_token,
-            ready_ack_guid=ready_ack_guid,
             resume=resume,
-            project_in_image=True,
-            runtime_tmp_mount=str(chat_tmp_workspace),
-            context_key=f"chat_launch_profile:{chat_id}",
-            extra_args=agent_args,
-        )
-        return self._launch_profile_from_command(
-            mode="chat_start",
-            command=cmd,
-            workspace=workspace,
-            runtime_config_file=runtime_config_file,
-            container_project_name=container_project_name,
-            agent_type=agent_type,
-            snapshot_tag=snapshot_tag,
-            prepare_snapshot_only=False,
+            agent_tools_token=agent_tools_token,
+            artifact_publish_token=artifact_publish_token,
+            ready_ack_guid=ready_ack_guid,
         )
 
     def _run_temporary_auto_config_chat(
@@ -2436,175 +2265,15 @@ class HubStateOpsMixin:
         on_output: Callable[[str], None] | None = None,
         request_id: str = "",
     ) -> dict[str, Any]:
-        normalized_request_id = self._normalize_auto_config_request_id(request_id)
-        resolved_agent_type = _normalize_chat_agent_type(agent_type, strict=True)
-        normalized_agent_args = [str(arg) for arg in (agent_args or []) if str(arg).strip()]
-
-        def emit(chunk: str) -> None:
-            if on_output is None:
-                return
-            text = str(chunk or "")
-            if not text:
-                return
-            try:
-                on_output(text)
-            except Exception:
-                LOGGER.exception("Auto-config output callback failed.")
-
-        if resolved_agent_type == AGENT_TYPE_CODEX:
-            account_connected, _ = _read_codex_auth(self.openai_codex_auth_file)
-            if not account_connected:
-                raise HTTPException(status_code=409, detail=AUTO_CONFIG_NOT_CONNECTED_ERROR)
-
-        prompt = self._auto_config_prompt(repo_url, branch)
-        output_file = workspace / f".agent-hub-auto-config-{uuid.uuid4().hex}.json"
-        container_project_name = _container_project_name(_extract_repo_name(repo_url) or "auto-config")
-        container_workspace = str(PurePosixPath(DEFAULT_CONTAINER_HOME) / container_project_name)
-        container_output_file = str(PurePosixPath(container_workspace) / output_file.name)
-        session_id, session_token = self._create_agent_tools_session(repo_url=repo_url, workspace=workspace)
-        ready_ack_guid = self.issue_agent_tools_session_ready_ack_guid(session_id)
-        agent_tools_url = f"{self.artifact_publish_base_url}/api/agent-tools/sessions/{session_id}"
-        agent_tools_chat_id = f"auto-config:{session_id}"
-        runtime_config_file = self._prepare_chat_runtime_config(
-            f"auto-config-{session_id}",
-            agent_type=resolved_agent_type,
-            agent_tools_url=agent_tools_url,
-            agent_tools_token=session_token,
-            agent_tools_project_id="",
-            agent_tools_chat_id=agent_tools_chat_id,
-            trusted_project_path=container_workspace,
+        return self.auto_config_service._run_temporary_auto_config_chat(
+            workspace,
+            repo_url,
+            branch,
+            agent_type=agent_type,
+            agent_args=agent_args,
+            on_output=on_output,
+            request_id=request_id,
         )
-        artifact_publish_token = _new_artifact_publish_token()
-        with self._agent_tools_sessions_lock:
-            active_session = self._agent_tools_sessions.get(session_id)
-            if active_session is not None:
-                active_session["artifact_publish_token_hash"] = _hash_artifact_publish_token(artifact_publish_token)
-                self._agent_tools_sessions[session_id] = active_session
-
-        extra_args = [
-            *normalized_agent_args,
-            "exec",
-            "--skip-git-repo-check",
-            "--cd",
-            container_workspace,
-            "--sandbox",
-            "workspace-write",
-            "--output-last-message",
-            container_output_file,
-            prompt,
-        ]
-        cmd = self._prepare_agent_cli_command(
-            workspace=workspace,
-            container_project_name=container_project_name,
-            runtime_config_file=runtime_config_file,
-            agent_type=resolved_agent_type,
-            run_mode=self._runtime_run_mode(),
-            agent_tools_url=agent_tools_url,
-            agent_tools_token=session_token,
-            agent_tools_project_id="",
-            agent_tools_chat_id=agent_tools_chat_id,
-            repo_url=repo_url,
-            artifacts_url=f"{self.artifact_publish_base_url}/api/agent-tools/sessions/{session_id}/artifacts/publish",
-            artifacts_token=artifact_publish_token,
-            ready_ack_guid=ready_ack_guid,
-            allocate_tty=False,
-            context_key=f"auto_config_chat:{session_id}",
-            extra_args=extra_args,
-        )
-        emit("Launching temporary repository analysis chat...\n")
-        emit(f"Working directory: {workspace}\n")
-        emit(f"Repository URL: {repo_url}\n")
-        emit(f"Branch: {branch}\n\n")
-
-        if self._is_auto_config_request_cancelled(normalized_request_id):
-            raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR)
-
-        try:
-            process = subprocess.Popen(
-                cmd,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,
-                start_new_session=True,
-            )
-            self._set_auto_config_request_process(normalized_request_id, process)
-        except OSError as exc:
-            try:
-                runtime_config_file.unlink()
-            except OSError:
-                pass
-            self._remove_agent_tools_session(session_id)
-            raise HTTPException(status_code=502, detail=f"Temporary auto-config chat failed to start: {exc}") from exc
-
-        output_chunks: list[str] = []
-
-        def consume_output() -> None:
-            stdout = process.stdout
-            if stdout is None:
-                return
-            try:
-                for line in iter(stdout.readline, ""):
-                    if line == "":
-                        break
-                    output_chunks.append(line)
-                    emit(line)
-            finally:
-                stdout.close()
-
-        try:
-            try:
-                consumer = Thread(target=consume_output, daemon=True)
-                consumer.start()
-                return_code = process.wait(timeout=max(20.0, float(AUTO_CONFIG_CHAT_TIMEOUT_SECONDS)))
-                consumer.join(timeout=2.0)
-            except subprocess.TimeoutExpired as exc:
-                process.kill()
-                try:
-                    process.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    pass
-                emit("\nTemporary auto-config chat timed out.\n")
-                if self._is_auto_config_request_cancelled(normalized_request_id):
-                    raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR) from exc
-                raise HTTPException(status_code=504, detail="Temporary auto-config chat timed out.") from exc
-
-            output_text = "".join(output_chunks).strip()
-            if return_code != 0:
-                if self._is_auto_config_request_cancelled(normalized_request_id):
-                    emit("\nAuto-config chat was cancelled by user.\n")
-                    raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR)
-                detail = _codex_exec_error_message_full(output_text)
-                raise HTTPException(status_code=502, detail=f"Temporary auto-config chat failed: {detail}")
-
-            try:
-                raw_payload_text = output_file.read_text(encoding="utf-8", errors="ignore").strip()
-            except OSError as exc:
-                raise HTTPException(status_code=502, detail=AUTO_CONFIG_MISSING_OUTPUT_ERROR) from exc
-            if not raw_payload_text:
-                raise HTTPException(status_code=502, detail=AUTO_CONFIG_MISSING_OUTPUT_ERROR)
-
-            try:
-                parsed_payload = _parse_json_object_from_text(raw_payload_text)
-            except ValueError as exc:
-                raise HTTPException(status_code=502, detail=AUTO_CONFIG_INVALID_OUTPUT_ERROR) from exc
-            return {
-                "payload": parsed_payload,
-                "model": _auto_config_analysis_model(resolved_agent_type, normalized_agent_args),
-                "agent_type": resolved_agent_type,
-                "agent_args": normalized_agent_args,
-            }
-        finally:
-            self._set_auto_config_request_process(normalized_request_id, None)
-            try:
-                output_file.unlink()
-            except OSError:
-                pass
-            try:
-                runtime_config_file.unlink()
-            except OSError:
-                pass
-            self._remove_agent_tools_session(session_id)
 
     def auto_configure_project(
         self,
@@ -2614,165 +2283,13 @@ class HubStateOpsMixin:
         agent_type: Any = None,
         agent_args: Any = None,
     ) -> dict[str, Any]:
-        normalized_repo_url = str(repo_url or "").strip()
-        validation_error = _project_repo_url_validation_error(normalized_repo_url)
-        if validation_error:
-            raise HTTPException(status_code=400, detail=validation_error)
-        resolved_agent_type = _resolve_optional_chat_agent_type(
-            agent_type,
-            default_value=self.default_chat_agent_type(),
+        return self.auto_config_service.auto_configure_project(
+            repo_url=repo_url,
+            default_branch=default_branch,
+            request_id=request_id,
+            agent_type=agent_type,
+            agent_args=agent_args,
         )
-        if agent_args is None:
-            normalized_agent_args: list[str] = []
-        elif isinstance(agent_args, list):
-            normalized_agent_args = [str(arg) for arg in agent_args if str(arg).strip()]
-        else:
-            raise HTTPException(status_code=400, detail="agent_args must be an array.")
-        normalized_request_id = str(request_id or "").strip()[:AUTO_CONFIG_REQUEST_ID_MAX_CHARS]
-        if normalized_request_id:
-            self._register_auto_config_request(normalized_request_id)
-            if self._is_auto_config_request_cancelled(normalized_request_id):
-                self._clear_auto_config_request(normalized_request_id)
-                raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR)
-
-        def emit_auto_config_log(text: str, replace: bool = False) -> None:
-            if not normalized_request_id:
-                return
-            self._emit_auto_config_log(normalized_request_id, text, replace=replace)
-
-        requested_branch = str(default_branch or "").strip()
-        git_env = self._github_git_env_for_repo(normalized_repo_url)
-        sanitized_git_env = {
-            "GIT_CONFIG_COUNT": "0",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_TERMINAL_PROMPT": "0",
-        }
-        authenticated_git_env = dict(sanitized_git_env)
-        authenticated_git_env.update(git_env)
-        resolved_branch = requested_branch or _detect_default_branch(
-            normalized_repo_url,
-            env=authenticated_git_env,
-        )
-
-        emit_auto_config_log("", replace=True)
-        emit_auto_config_log("Preparing repository checkout for temporary analysis chat...\n")
-        emit_auto_config_log(f"Repository URL: {normalized_repo_url}\n")
-        emit_auto_config_log(f"Requested branch: {requested_branch or 'auto-detect'}\n")
-        emit_auto_config_log(f"Analysis agent: {resolved_agent_type}\n")
-        emit_auto_config_log(
-            f"Analysis model: {_auto_config_analysis_model(resolved_agent_type, normalized_agent_args)}\n"
-        )
-
-        if self._is_auto_config_request_cancelled(normalized_request_id):
-            raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR)
-
-        try:
-            with tempfile.TemporaryDirectory(prefix="agent-hub-auto-config-", dir=str(self.data_dir)) as temp_dir:
-                workspace = Path(temp_dir) / "repo"
-                env_candidates: list[dict[str, str]] = [authenticated_git_env]
-                if git_env:
-                    env_candidates.append(sanitized_git_env)
-
-                def run_clone(cmd: list[str]) -> subprocess.CompletedProcess:
-                    last_result = subprocess.CompletedProcess(cmd, 1, "", "")
-                    for env_candidate in env_candidates:
-                        if workspace.exists():
-                            self._delete_path(workspace)
-                        emit_auto_config_log(f"\n$ {' '.join(cmd)}\n")
-                        result = _run(cmd, capture=True, check=False, env=env_candidate)
-                        command_output = ((result.stdout or "") + (result.stderr or "")).strip()
-                        if command_output:
-                            emit_auto_config_log(f"{command_output}\n")
-                        elif result.returncode != 0:
-                            emit_auto_config_log(f"Command exited with code {result.returncode}.\n")
-                        if result.returncode == 0:
-                            return result
-                        last_result = result
-                    return last_result
-
-                clone_cmd_with_branch = [
-                    "git",
-                    "clone",
-                    "--depth",
-                    "1",
-                    "--branch",
-                    resolved_branch,
-                    normalized_repo_url,
-                    str(workspace),
-                ]
-                clone_result = run_clone(clone_cmd_with_branch)
-                if clone_result.returncode != 0:
-                    if requested_branch:
-                        detail = ((clone_result.stdout or "") + (clone_result.stderr or "")).strip()
-                        raise HTTPException(
-                            status_code=400,
-                            detail=(
-                                f"Unable to clone repository branch '{requested_branch}'. "
-                                f"{detail or 'git clone failed.'}"
-                            ),
-                        )
-
-                    clone_cmd_default = ["git", "clone", "--depth", "1", normalized_repo_url, str(workspace)]
-                    clone_result = run_clone(clone_cmd_default)
-                    if clone_result.returncode != 0:
-                        detail = ((clone_result.stdout or "") + (clone_result.stderr or "")).strip()
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Unable to clone repository for auto-configure. {detail or 'git clone failed.'}",
-                        )
-
-                    head_result = _run_for_repo(
-                        ["rev-parse", "--abbrev-ref", "HEAD"],
-                        workspace,
-                        capture=True,
-                        check=False,
-                        env=sanitized_git_env,
-                    )
-                    if head_result.returncode == 0 and head_result.stdout.strip():
-                        resolved_branch = head_result.stdout.strip()
-
-                emit_auto_config_log("\nRepository checkout complete. Starting temporary analysis chat...\n")
-                if self._is_auto_config_request_cancelled(normalized_request_id):
-                    raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR)
-
-                recommendation: dict[str, Any] = {}
-                chat_result: dict[str, Any] = {}
-                emit_auto_config_log("Running temporary analysis chat...\n")
-                chat_result = self._run_temporary_auto_config_chat(
-                    workspace,
-                    normalized_repo_url,
-                    resolved_branch,
-                    agent_type=resolved_agent_type,
-                    agent_args=normalized_agent_args,
-                    on_output=emit_auto_config_log if normalized_request_id else None,
-                    request_id=normalized_request_id,
-                )
-                container_workspace = _container_workspace_path_for_project(
-                    _extract_repo_name(normalized_repo_url) or "auto-config"
-                )
-                recommendation = self._normalize_auto_config_recommendation(
-                    chat_result.get("payload") or {},
-                    workspace,
-                    project_container_workspace=container_workspace,
-                )
-                recommendation = self._apply_auto_config_repository_hints(recommendation, workspace)
-                recommendation = self._normalize_auto_config_recommendation(
-                    recommendation,
-                    workspace,
-                    project_container_workspace=container_workspace,
-                )
-                emit_auto_config_log("Auto-config recommendation discovery completed.\n")
-        except HTTPException as exc:
-            detail = str(exc.detail or f"HTTP {exc.status_code}")
-            emit_auto_config_log(f"\nAuto-config failed: {detail}\n")
-            raise
-        finally:
-            self._clear_auto_config_request(normalized_request_id)
-
-        recommendation["default_branch"] = resolved_branch
-        emit_auto_config_log("\nAuto-config completed successfully.\n")
-        return recommendation
 
     def connect_openai(self, api_key: Any, verify: bool = True) -> dict[str, Any]:
         return self.openai_account_service.connect_openai(api_key, verify=verify)

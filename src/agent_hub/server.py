@@ -58,6 +58,9 @@ from agent_core import logging as core_logging
 from agent_core import paths as core_paths
 from agent_core import shared as core_shared
 from agent_hub.api import register_hub_routes
+from agent_hub.bootstrap.domain_wiring import build_hub_domain_service_bundle
+from agent_hub.bootstrap.path_layout import HubPathLayoutConfig, build_hub_path_layout, ensure_hub_path_layout_dirs
+from agent_hub.bootstrap.runtime_identity import resolve_runtime_identity_bootstrap
 from agent_hub.domains import (
     AuthDomain,
     CredentialsDomain,
@@ -75,6 +78,7 @@ from agent_hub.services.openai_account_service import OpenAIAccountService
 from agent_hub.services.project_service import ProjectService
 from agent_hub.services.runtime_service import RuntimeService
 from agent_hub.services.settings_service import SettingsService
+from agent_hub.services.launch_profile_service import LaunchProfileService
 from agent_hub.integrations import run_command
 from agent_hub.store import HubStateStore
 
@@ -4461,78 +4465,61 @@ class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
         ui_lifecycle_debug: bool = False,
         reconcile_project_build_on_init: bool = True,
     ):
-        runtime_config_supplied = runtime_config is not None
-        if runtime_config is None:
-            runtime_config = load_agent_runtime_config(config_file)
-        self.runtime_config = runtime_config
-        if runtime_identity_overrides is not None:
-            self.runtime_identity_overrides = runtime_identity_overrides
-        elif not runtime_config_supplied:
-            self.runtime_identity_overrides = _runtime_identity_env_overrides()
-        else:
-            self.runtime_identity_overrides = RuntimeIdentityEnvOverrides()
-        _validate_hub_runtime_run_mode(self.runtime_config)
-        resolved_identity = core_identity.resolve_runtime_identity(
-            core_identity.RuntimeIdentityResolutionContract(
-                runtime_config=self.runtime_config,
-                override_uid_raw=self.runtime_identity_overrides.uid_raw,
-                override_gid_raw=self.runtime_identity_overrides.gid_raw,
-                override_username=self.runtime_identity_overrides.username,
-                override_supplementary_gids=self.runtime_identity_overrides.supplementary_gids,
-                override_uid_source_name=AGENT_HUB_HOST_UID_ENV,
-                override_gid_source_name=AGENT_HUB_HOST_GID_ENV,
-                override_uid_gid_pair_message=(
-                    f"{AGENT_HUB_HOST_UID_ENV} and {AGENT_HUB_HOST_GID_ENV} must be set together."
-                ),
-                shared_root_candidates=(self.runtime_identity_overrides.shared_root,),
-                default_uid=os.getuid(),
-                default_gid=os.getgid(),
-                default_supplementary_gids=(
-                    _default_supplementary_gids()
-                    if not self.runtime_identity_overrides.supplementary_gids
-                    else self.runtime_identity_overrides.supplementary_gids
-                ),
+        runtime_identity_bootstrap = resolve_runtime_identity_bootstrap(
+            config_file=config_file,
+            runtime_config=runtime_config,
+            runtime_identity_overrides=runtime_identity_overrides,
+            load_runtime_config=load_agent_runtime_config,
+            runtime_identity_env_overrides_factory=_runtime_identity_env_overrides,
+            empty_runtime_identity_overrides_factory=RuntimeIdentityEnvOverrides,
+            validate_runtime_run_mode=_validate_hub_runtime_run_mode,
+            default_supplementary_gids_factory=_default_supplementary_gids,
+            host_uid_env=AGENT_HUB_HOST_UID_ENV,
+            host_gid_env=AGENT_HUB_HOST_GID_ENV,
+            host_user_env=AGENT_HUB_HOST_USER_ENV,
+            shared_root_env=AGENT_HUB_SHARED_ROOT_ENV,
+            identity_error_factory=IdentityError,
+        )
+        self.runtime_config = runtime_identity_bootstrap.runtime_config
+        self.runtime_identity_overrides = runtime_identity_bootstrap.runtime_identity_overrides
+        self.local_uid = runtime_identity_bootstrap.local_uid
+        self.local_gid = runtime_identity_bootstrap.local_gid
+        self.local_supp_gids = runtime_identity_bootstrap.local_supp_gids
+        self.local_user = runtime_identity_bootstrap.local_user
+        self.local_umask = runtime_identity_bootstrap.local_umask
+        self.runtime_identity = runtime_identity_bootstrap.runtime_identity
+
+        path_layout = build_hub_path_layout(
+            data_dir=data_dir,
+            local_user=self.local_user,
+            config=HubPathLayoutConfig(
+                secrets_dir_name=SECRETS_DIR_NAME,
+                openai_credentials_file_name=OPENAI_CREDENTIALS_FILE_NAME,
+                openai_codex_auth_file_name=OPENAI_CODEX_AUTH_FILE_NAME,
+                agent_tools_mcp_runtime_dir_name=AGENT_TOOLS_MCP_RUNTIME_DIR_NAME,
+                agent_tools_mcp_runtime_file_name=AGENT_TOOLS_MCP_RUNTIME_FILE_NAME,
+                state_file_name=STATE_FILE_NAME,
+                agent_capabilities_cache_file_name=AGENT_CAPABILITIES_CACHE_FILE_NAME,
+                runtime_tmp_root_dir_name=RUNTIME_TMP_ROOT_DIR_NAME,
+                runtime_tmp_projects_dir_name=RUNTIME_TMP_PROJECTS_DIR_NAME,
+                artifact_storage_dir_name=ARTIFACT_STORAGE_DIR_NAME,
+                artifact_storage_chat_dir_name=ARTIFACT_STORAGE_CHAT_DIR_NAME,
+                artifact_storage_session_dir_name=ARTIFACT_STORAGE_SESSION_DIR_NAME,
+                chat_runtime_configs_dir_name=CHAT_RUNTIME_CONFIGS_DIR_NAME,
+                github_app_settings_file_name=GITHUB_APP_SETTINGS_FILE_NAME,
+                github_app_installation_file_name=GITHUB_APP_INSTALLATION_FILE_NAME,
+                github_tokens_file_name=GITHUB_TOKENS_FILE_NAME,
+                gitlab_tokens_file_name=GITLAB_TOKENS_FILE_NAME,
+                git_credentials_dir_name=GIT_CREDENTIALS_DIR_NAME,
             ),
-            missing_username_message_factory=(
-                lambda lookup_uid: (
-                    "Host username resolution failed for runtime identity "
-                    f"(uid={lookup_uid}). Set {AGENT_HUB_HOST_USER_ENV}."
-                )
-            ),
-            stat_error_message_factory=(
-                lambda shared_root, exc: f"Failed to stat {AGENT_HUB_SHARED_ROOT_ENV}={shared_root!r}: {exc}"
-            ),
-            error_factory=lambda message: IdentityError(message),
         )
-        self.local_uid, self.local_gid, self.local_supp_gids = (
-            int(resolved_identity.uid),
-            int(resolved_identity.gid),
-            resolved_identity.supplementary_gids,
-        )
-        self.local_user = resolved_identity.username
-        self.local_umask = "0022"
-        self.runtime_identity = core_identity.RuntimeIdentity(
-            username=self.local_user,
-            uid=int(self.local_uid),
-            gid=int(self.local_gid),
-            supplementary_gids=self.local_supp_gids,
-            umask=self.local_umask,
-        )
-        self.settings_service = SettingsService(
-            default_agent_type=DEFAULT_CHAT_AGENT_TYPE,
-            default_chat_layout_engine=DEFAULT_CHAT_LAYOUT_ENGINE,
-            normalize_chat_agent_type=_normalize_chat_agent_type,
-            normalize_chat_layout_engine=_normalize_chat_layout_engine,
-        )
-        self.data_dir = Path(data_dir).resolve()
-        self.secrets_dir = self.data_dir / SECRETS_DIR_NAME
-        self.openai_credentials_file = self.secrets_dir / OPENAI_CREDENTIALS_FILE_NAME
-        self.host_agent_home = (self.data_dir / "agent-home" / self.local_user).resolve()
-        self.host_codex_dir = self.host_agent_home / ".codex"
-        self.agent_tools_mcp_runtime_script = (
-            self.host_codex_dir / AGENT_TOOLS_MCP_RUNTIME_DIR_NAME / AGENT_TOOLS_MCP_RUNTIME_FILE_NAME
-        )
-        self.openai_codex_auth_file = self.host_codex_dir / OPENAI_CODEX_AUTH_FILE_NAME
+        self.data_dir = path_layout.data_dir
+        self.secrets_dir = path_layout.secrets_dir
+        self.openai_credentials_file = path_layout.openai_credentials_file
+        self.host_agent_home = path_layout.host_agent_home
+        self.host_codex_dir = path_layout.host_codex_dir
+        self.agent_tools_mcp_runtime_script = path_layout.agent_tools_mcp_runtime_script
+        self.openai_codex_auth_file = path_layout.openai_codex_auth_file
 
         self.config_file = config_file
         self.system_prompt_file = Path(system_prompt_file or _default_system_prompt_file())
@@ -4542,47 +4529,6 @@ class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
             artifact_publish_base_url,
             self.hub_port,
         )
-        self.auth_domain = AuthDomain(state=self)
-        self.credentials_domain = CredentialsDomain(state=self)
-        self.runtime_domain = RuntimeDomain(
-            runtime_factory=ChatRuntime,
-            is_process_running=lambda pid: _is_process_running(pid),
-            signal_process_group_winch=lambda pid: _signal_process_group_winch(pid),
-            chat_log_path=self.chat_log,
-            on_runtime_exit=lambda chat_id, exit_code: self._record_chat_runtime_exit(
-                chat_id,
-                exit_code,
-                reason="chat_runtime_reader_completed",
-            ),
-            collect_submitted_prompts=self._collect_submitted_prompts_from_input,
-            record_submitted_prompt=self._record_submitted_prompt,
-            terminal_queue_max=TERMINAL_QUEUE_MAX,
-            default_cols=DEFAULT_PTY_COLS,
-            default_rows=DEFAULT_PTY_ROWS,
-        )
-        # Back-compat aliases for existing tests and transitional callers.
-        self._runtime_lock = self.runtime_domain._runtime_lock
-        self._chat_runtimes = self.runtime_domain._chat_runtimes
-        self.auth_service = AuthService(
-            domain=self.auth_domain,
-            default_artifact_publish_host=DEFAULT_ARTIFACT_PUBLISH_HOST,
-            callback_forward_timeout_seconds=OPENAI_ACCOUNT_CALLBACK_FORWARD_TIMEOUT_SECONDS,
-        )
-        self.project_service = ProjectService(state=self)
-        self.chat_service = ChatService(state=self)
-        self.runtime_service = RuntimeService(state=self)
-        self.credentials_service = CredentialsService(
-            domain=self.credentials_domain,
-            agent_tools_token_header=AGENT_TOOLS_TOKEN_HEADER,
-        )
-        self.artifacts_service = ArtifactsService(
-            state=self,
-            agent_tools_token_header=AGENT_TOOLS_TOKEN_HEADER,
-            artifact_token_header="x-agent-hub-artifact-token",
-        )
-        self.auto_config_service = AutoConfigService(state=self)
-        self.app_state_service = AppStateService(state=self)
-        self.event_service = EventService(state=self)
         self._lock = Lock()
         self._events_lock = Lock()
         self._project_build_lock = Lock()
@@ -4591,25 +4537,38 @@ class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
         self._openai_login_lock = Lock()
         self._openai_login_session: OpenAIAccountLoginSession | None = None
         self._openai_login_session_type = OpenAIAccountLoginSession
-        self.openai_account_service = OpenAIAccountService(
-            openai_codex_auth_file=self.openai_codex_auth_file,
-            openai_credentials_file=self.openai_credentials_file,
-            host_agent_home=self.host_agent_home,
-            host_codex_dir=self.host_codex_dir,
-            config_file=self.config_file,
-            local_uid_getter=lambda: self.local_uid,
-            local_gid_getter=lambda: self.local_gid,
-            local_supp_gids_getter=lambda: self.local_supp_gids,
-            local_user_getter=lambda: self.local_user,
-            local_umask_getter=lambda: self.local_umask,
-            artifact_publish_base_url_getter=lambda: self.artifact_publish_base_url,
-            openai_login_lock=self._openai_login_lock,
-            get_openai_login_session=lambda: self._openai_login_session,
-            set_openai_login_session=lambda session: setattr(self, "_openai_login_session", session),
-            openai_login_session_type=self._openai_login_session_type,
-            emit_auth_changed=lambda **kwargs: self._emit_auth_changed(**kwargs),
-            emit_openai_account_session_changed=lambda **kwargs: self._emit_openai_account_session_changed(**kwargs),
-            auth_forward_openai_account_callback_fn=self.auth_service.forward_openai_account_callback,
+        build_hub_domain_service_bundle(
+            state=self,
+            settings_service_factory=SettingsService,
+            launch_profile_service_factory=LaunchProfileService,
+            auth_domain_factory=AuthDomain,
+            credentials_domain_factory=CredentialsDomain,
+            runtime_domain_factory=RuntimeDomain,
+            auth_service_factory=AuthService,
+            project_service_factory=ProjectService,
+            chat_service_factory=ChatService,
+            runtime_service_factory=RuntimeService,
+            credentials_service_factory=CredentialsService,
+            artifacts_service_factory=ArtifactsService,
+            auto_config_service_factory=AutoConfigService,
+            app_state_service_factory=AppStateService,
+            event_service_factory=EventService,
+            openai_account_service_factory=OpenAIAccountService,
+            lifecycle_service_factory=LifecycleService,
+            default_agent_type=DEFAULT_CHAT_AGENT_TYPE,
+            default_chat_layout_engine=DEFAULT_CHAT_LAYOUT_ENGINE,
+            normalize_chat_agent_type=_normalize_chat_agent_type,
+            normalize_chat_layout_engine=_normalize_chat_layout_engine,
+            runtime_factory=ChatRuntime,
+            is_process_running=lambda pid: _is_process_running(pid),
+            signal_process_group_winch=lambda pid: _signal_process_group_winch(pid),
+            terminal_queue_max=TERMINAL_QUEUE_MAX,
+            default_cols=DEFAULT_PTY_COLS,
+            default_rows=DEFAULT_PTY_ROWS,
+            default_artifact_publish_host=DEFAULT_ARTIFACT_PUBLISH_HOST,
+            callback_forward_timeout_seconds=OPENAI_ACCOUNT_CALLBACK_FORWARD_TIMEOUT_SECONDS,
+            agent_tools_token_header=AGENT_TOOLS_TOKEN_HEADER,
+            artifact_token_header="x-agent-hub-artifact-token",
             logger=LOGGER,
             default_agent_image=DEFAULT_AGENT_IMAGE,
             openai_account_login_default_callback_port=OPENAI_ACCOUNT_LOGIN_DEFAULT_CALLBACK_PORT,
@@ -4617,7 +4576,6 @@ class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
             ansi_escape_re=ANSI_ESCAPE_RE,
             tmp_dir_tmpfs_spec=TMP_DIR_TMPFS_SPEC,
             default_container_home=DEFAULT_CONTAINER_HOME,
-            is_process_running=lambda pid: _is_process_running(pid),
             stop_process=lambda pid: _stop_process(pid),
             parse_gid_csv=lambda value: _parse_gid_csv(value),
             iso_now=lambda: _iso_now(),
@@ -4650,11 +4608,7 @@ class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
             chat_title_auth_mode_none=CHAT_TITLE_AUTH_MODE_NONE,
             chat_title_no_credentials_error=CHAT_TITLE_NO_CREDENTIALS_ERROR,
             chat_title_max_chars=CHAT_TITLE_MAX_CHARS,
-        )
-        self.lifecycle_service = LifecycleService(
-            forward_openai_account_callback_fn=self.openai_account_service.forward_openai_account_callback,
-            shutdown_fn=self.shutdown,
-        )
+        ).apply_to_state(self)
         self._chat_input_lock = Lock()
         self._chat_input_buffers: dict[str, str] = {}
         self._chat_input_ansi_carry: dict[str, str] = {}
@@ -4678,42 +4632,30 @@ class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
         self._project_build_requests_lock = Lock()
         self._project_build_requests: dict[str, ProjectBuildRequestState] = {}
         self.ui_lifecycle_debug = bool(ui_lifecycle_debug)
-        self.state_file = self.data_dir / STATE_FILE_NAME
+        self.state_file = path_layout.state_file
         self._state_store = HubStateStore(
             state_file=self.state_file,
             lock=self._lock,
             new_state_factory=_new_state,
         )
-        self.agent_capabilities_cache_file = self.data_dir / AGENT_CAPABILITIES_CACHE_FILE_NAME
-        self.project_dir = self.data_dir / "projects"
-        self.chat_dir = self.data_dir / "chats"
-        self.log_dir = self.data_dir / "logs"
-        self.runtime_tmp_dir = self.data_dir / RUNTIME_TMP_ROOT_DIR_NAME
-        self.runtime_project_tmp_dir = self.runtime_tmp_dir / RUNTIME_TMP_PROJECTS_DIR_NAME
-        self.artifacts_dir = self.data_dir / ARTIFACT_STORAGE_DIR_NAME
-        self.chat_artifacts_dir = self.artifacts_dir / ARTIFACT_STORAGE_CHAT_DIR_NAME
-        self.session_artifacts_dir = self.artifacts_dir / ARTIFACT_STORAGE_SESSION_DIR_NAME
-        self.chat_runtime_configs_dir = self.data_dir / CHAT_RUNTIME_CONFIGS_DIR_NAME
-        self.github_app_settings_file = self.secrets_dir / GITHUB_APP_SETTINGS_FILE_NAME
-        self.github_app_installation_file = self.secrets_dir / GITHUB_APP_INSTALLATION_FILE_NAME
-        self.github_tokens_file = self.secrets_dir / GITHUB_TOKENS_FILE_NAME
-        self.gitlab_tokens_file = self.secrets_dir / GITLAB_TOKENS_FILE_NAME
-        self.git_credentials_dir = self.secrets_dir / GIT_CREDENTIALS_DIR_NAME
+        self.agent_capabilities_cache_file = path_layout.agent_capabilities_cache_file
+        self.project_dir = path_layout.project_dir
+        self.chat_dir = path_layout.chat_dir
+        self.log_dir = path_layout.log_dir
+        self.runtime_tmp_dir = path_layout.runtime_tmp_dir
+        self.runtime_project_tmp_dir = path_layout.runtime_project_tmp_dir
+        self.artifacts_dir = path_layout.artifacts_dir
+        self.chat_artifacts_dir = path_layout.chat_artifacts_dir
+        self.session_artifacts_dir = path_layout.session_artifacts_dir
+        self.chat_runtime_configs_dir = path_layout.chat_runtime_configs_dir
+        self.github_app_settings_file = path_layout.github_app_settings_file
+        self.github_app_installation_file = path_layout.github_app_installation_file
+        self.github_tokens_file = path_layout.github_tokens_file
+        self.gitlab_tokens_file = path_layout.gitlab_tokens_file
+        self.git_credentials_dir = path_layout.git_credentials_dir
         self.github_app_settings: GithubAppSettings | None = None
         self.github_app_settings_error = ""
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.project_dir.mkdir(parents=True, exist_ok=True)
-        self.chat_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.runtime_tmp_dir.mkdir(parents=True, exist_ok=True)
-        self.runtime_project_tmp_dir.mkdir(parents=True, exist_ok=True)
-        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
-        self.chat_artifacts_dir.mkdir(parents=True, exist_ok=True)
-        self.session_artifacts_dir.mkdir(parents=True, exist_ok=True)
-        self.secrets_dir.mkdir(parents=True, exist_ok=True)
-        self.chat_runtime_configs_dir.mkdir(parents=True, exist_ok=True)
-        self.git_credentials_dir.mkdir(parents=True, exist_ok=True)
-        self.host_codex_dir.mkdir(parents=True, exist_ok=True)
+        ensure_hub_path_layout_dirs(path_layout)
         self._reload_github_app_settings()
         self._load_agent_capabilities_cache()
         if reconcile_project_build_on_init:

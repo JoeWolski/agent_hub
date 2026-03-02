@@ -1927,156 +1927,21 @@ class HubStateRuntimeMixin:
         default_env_vars: list[str] | None = None,
         credential_binding: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        normalized_repo_url = str(repo_url or "").strip()
-        validation_error = _project_repo_url_validation_error(normalized_repo_url)
-        if validation_error:
-            raise HTTPException(status_code=400, detail=validation_error)
-
-        state = self.load()
-        project_id = uuid.uuid4().hex
-        project_name = name or _extract_repo_name(normalized_repo_url)
-        normalized_binding = self._auto_discover_project_credential_binding(
-            normalized_repo_url,
+        return self.project_service.add_project(
+            repo_url=repo_url,
+            name=name,
+            default_branch=default_branch,
+            setup_script=setup_script,
+            base_image_mode=base_image_mode,
+            base_image_value=base_image_value,
+            default_ro_mounts=default_ro_mounts,
+            default_rw_mounts=default_rw_mounts,
+            default_env_vars=default_env_vars,
             credential_binding=credential_binding,
         )
-        normalized_env_vars = self._dedupe_entries(default_env_vars or [])
-        auth_env_vars = self._recommended_auth_env_vars_for_repo(
-            normalized_repo_url,
-            credential_binding=normalized_binding,
-        )
-        existing_env_keys = {
-            str(entry).split("=", 1)[0].strip().upper()
-            for entry in normalized_env_vars
-            if "=" in str(entry)
-        }
-        github_token_value = ""
-        for entry in normalized_env_vars:
-            raw = str(entry)
-            if "=" not in raw:
-                continue
-            key, value = raw.split("=", 1)
-            normalized_key = key.strip().upper()
-            if normalized_key in {"GITHUB_TOKEN", "GH_TOKEN"} and value:
-                github_token_value = value
-                break
-        if not github_token_value:
-            for entry in auth_env_vars:
-                raw = str(entry)
-                if "=" not in raw:
-                    continue
-                key, value = raw.split("=", 1)
-                normalized_key = key.strip().upper()
-                if normalized_key in {"GITHUB_TOKEN", "GH_TOKEN"} and value:
-                    github_token_value = value
-                    break
-        if github_token_value:
-            if "GITHUB_TOKEN" not in existing_env_keys:
-                normalized_env_vars.append(f"GITHUB_TOKEN={github_token_value}")
-                existing_env_keys.add("GITHUB_TOKEN")
-            if "GH_TOKEN" not in existing_env_keys:
-                normalized_env_vars.append(f"GH_TOKEN={github_token_value}")
-                existing_env_keys.add("GH_TOKEN")
-        for auth_env in auth_env_vars:
-            auth_key = str(auth_env).split("=", 1)[0].strip().upper()
-            if auth_key in {"GITHUB_TOKEN", "GH_TOKEN"}:
-                continue
-            if auth_key and auth_key not in existing_env_keys:
-                normalized_env_vars.append(auth_env)
-                existing_env_keys.add(auth_key)
-        resolved_default_branch = str(default_branch or "").strip()
-        if not resolved_default_branch:
-            git_env = self._github_git_env_for_repo(
-                normalized_repo_url,
-                project={"repo_url": normalized_repo_url, "credential_binding": normalized_binding},
-            )
-            resolved_default_branch = _detect_default_branch(normalized_repo_url, env=git_env)
-        normalized_base_mode = _normalize_base_image_mode(base_image_mode)
-        normalized_base_value = _normalize_base_image_value(normalized_base_mode, base_image_value)
-        if normalized_base_mode == "repo_path" and not normalized_base_value:
-            raise HTTPException(
-                status_code=400,
-                detail="base_image_value is required when base_image_mode is 'repo_path'.",
-            )
-        project = {
-            "id": project_id,
-            "name": project_name,
-            "repo_url": normalized_repo_url,
-            "setup_script": setup_script or "",
-            "base_image_mode": normalized_base_mode,
-            "base_image_value": normalized_base_value,
-            "default_ro_mounts": default_ro_mounts or [],
-            "default_rw_mounts": default_rw_mounts or [],
-            "default_env_vars": normalized_env_vars,
-            "default_branch": resolved_default_branch,
-            "created_at": _iso_now(),
-            "updated_at": _iso_now(),
-            "setup_snapshot_image": "",
-            "build_status": "pending",
-            "build_error": "",
-            "build_started_at": "",
-            "build_finished_at": "",
-            "credential_binding": normalized_binding,
-        }
-        state["projects"][project_id] = project
-        self.save(state)
-        self._schedule_project_build(project_id)
-        return self.load()["projects"][project_id]
 
     def update_project(self, project_id: str, update: dict[str, Any]) -> dict[str, Any]:
-        state = self.load()
-        project = state["projects"].get(project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="Project not found.")
-
-        for field in [
-            "setup_script",
-            "default_branch",
-            "name",
-            "base_image_mode",
-            "base_image_value",
-            "default_ro_mounts",
-            "default_rw_mounts",
-            "default_env_vars",
-            "credential_binding",
-        ]:
-            if field in update:
-                project[field] = update[field]
-        normalized_base_mode = _normalize_base_image_mode(project.get("base_image_mode"))
-        normalized_base_value = _normalize_base_image_value(normalized_base_mode, project.get("base_image_value"))
-        if normalized_base_mode == "repo_path" and not normalized_base_value:
-            raise HTTPException(
-                status_code=400,
-                detail="base_image_value is required when base_image_mode is 'repo_path'.",
-            )
-        project["base_image_mode"] = normalized_base_mode
-        project["base_image_value"] = normalized_base_value
-
-        snapshot_fields = {
-            "setup_script",
-            "default_branch",
-            "base_image_mode",
-            "base_image_value",
-            "default_ro_mounts",
-            "default_rw_mounts",
-            "default_env_vars",
-        }
-        requires_rebuild = any(field in update for field in snapshot_fields)
-        if requires_rebuild:
-            project["setup_snapshot_image"] = ""
-            project["repo_head_sha"] = ""
-            project.pop("snapshot_updated_at", None)
-            project["build_status"] = "pending"
-            project["build_error"] = ""
-            project["build_started_at"] = ""
-            project["build_finished_at"] = ""
-
-        project["updated_at"] = _iso_now()
-        state["projects"][project_id] = project
-        self.save(state)
-        if requires_rebuild:
-            self._schedule_project_build(project_id)
-            return self.load()["projects"][project_id]
-        return self.load()["projects"][project_id]
+        return self.project_service.update_project(project_id, update)
 
     def _project_available_credentials(self, project: dict[str, Any]) -> list[dict[str, Any]]:
         repo_host = _git_repo_host(str(project.get("repo_url") or ""))
@@ -2322,31 +2187,7 @@ class HubStateRuntimeMixin:
         return current
 
     def delete_project(self, project_id: str) -> None:
-        state = self.load()
-        if project_id not in state["projects"]:
-            raise HTTPException(status_code=404, detail="Project not found.")
-
-        process_to_cancel: subprocess.Popen[str] | None = None
-        with self._project_build_requests_lock:
-            request_state = self._project_build_requests.pop(project_id, None)
-            if request_state is not None:
-                process_to_cancel = request_state.process
-        if process_to_cancel is not None and _is_process_running(process_to_cancel.pid):
-            _stop_process(process_to_cancel.pid)
-
-        project_chats = [chat for chat in self.list_chats() if chat["project_id"] == project_id]
-        for chat in project_chats:
-            self.delete_chat(chat["id"], state=state)
-
-        project_workspace = self.project_workdir(project_id)
-        if project_workspace.exists():
-            self._delete_path(project_workspace)
-        project_log = self.project_build_log(project_id)
-        if project_log.exists():
-            project_log.unlink()
-
-        del state["projects"][project_id]
-        self.save(state)
+        self.project_service.delete_project(project_id)
 
     def create_chat(
         self,
@@ -2359,70 +2200,16 @@ class HubStateRuntimeMixin:
         agent_type: str | None = None,
         create_request_id: str | None = None,
     ) -> dict[str, Any]:
-        state = self.load()
-        project = state["projects"].get(project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="Project not found.")
-
-        chat_id = uuid.uuid4().hex
-        now = _iso_now()
-        sanitized_project_name = _sanitize_workspace_component(project.get("name") or project_id)
-        workspace_path = self.chat_dir / f"{sanitized_project_name}_{chat_id}"
-        container_workspace = _container_workspace_path_for_project(project.get("name") or project_id)
-        chat = {
-            "id": chat_id,
-            "project_id": project_id,
-            "name": CHAT_DEFAULT_NAME,
-            "profile": profile or "",
-            "ro_mounts": ro_mounts,
-            "rw_mounts": rw_mounts,
-            "env_vars": env_vars,
-            "agent_args": agent_args or [],
-            "agent_type": _resolve_optional_chat_agent_type(
-                agent_type,
-                default_value=self.default_chat_agent_type(),
-            ),
-            "status": CHAT_STATUS_STOPPED,
-            "status_reason": CHAT_STATUS_REASON_CHAT_CREATED,
-            "last_status_transition_at": now,
-            "start_error": "",
-            "last_exit_code": None,
-            "last_exit_at": "",
-            "stop_requested_at": "",
-            "pid": None,
-            "workspace": str(workspace_path),
-            "container_workspace": container_workspace,
-            "title_user_prompts": [],
-            "title_cached": "",
-            "title_prompt_fingerprint": "",
-            "title_source": "openai",
-            "title_status": "idle",
-            "title_error": "",
-            "artifacts": [],
-            "artifact_current_ids": [],
-            "artifact_prompt_history": [],
-            "artifact_publish_token_hash": "",
-            "artifact_publish_token_issued_at": "",
-            "agent_tools_token_hash": "",
-            "agent_tools_token_issued_at": "",
-            "ready_ack_guid": "",
-            "ready_ack_stage": AGENT_READY_ACK_STAGE_CONTAINER_BOOTSTRAPPED,
-            "ready_ack_at": "",
-            "ready_ack_meta": {},
-            "create_request_id": _compact_whitespace(str(create_request_id or "")).strip(),
-            "created_at": now,
-            "updated_at": now,
-        }
-        state["chats"][chat_id] = chat
-        self.save(state, reason=CHAT_STATUS_REASON_CHAT_CREATED)
-        LOGGER.info(
-            "Chat state transition chat_id=%s from=%s to=%s reason=%s",
-            chat_id,
-            "missing",
-            CHAT_STATUS_STOPPED,
-            CHAT_STATUS_REASON_CHAT_CREATED,
+        return self.chat_service.create_chat(
+            project_id=project_id,
+            profile=profile,
+            ro_mounts=ro_mounts,
+            rw_mounts=rw_mounts,
+            env_vars=env_vars,
+            agent_args=agent_args or [],
+            agent_type=agent_type or self.default_chat_agent_type(),
+            create_request_id=create_request_id,
         )
-        return chat
 
     def create_and_start_chat(
         self,
@@ -2431,54 +2218,12 @@ class HubStateRuntimeMixin:
         agent_type: str | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
-        state = self.load()
-        project = state["projects"].get(project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="Project not found.")
-        build_status = str(project.get("build_status") or "")
-        if build_status != "ready":
-            raise HTTPException(status_code=409, detail="Project image is still being built. Save settings and wait.")
-        normalized_agent_args = [str(arg) for arg in (agent_args or []) if str(arg).strip()]
-        resolved_agent_type = (
-            self.default_chat_agent_type()
-            if agent_type is None
-            else _normalize_chat_agent_type(agent_type, strict=True)
-        )
-        normalized_agent_args = _apply_default_model_for_agent(
-            resolved_agent_type,
-            normalized_agent_args,
-            self.runtime_config,
-        )
-        normalized_request_id = _compact_whitespace(str(request_id or "")).strip()
-        if normalized_request_id:
-            existing_chat = self._chat_for_create_request(
-                state=state,
-                project_id=project_id,
-                request_id=normalized_request_id,
-            )
-            if existing_chat is not None:
-                LOGGER.info(
-                    "Reused existing chat for create request project_id=%s request_id=%s chat_id=%s",
-                    project_id,
-                    normalized_request_id,
-                    existing_chat.get("id"),
-                )
-                return existing_chat
-        create_chat_kwargs: dict[str, Any] = {
-            "profile": "",
-            "ro_mounts": list(project.get("default_ro_mounts") or []),
-            "rw_mounts": list(project.get("default_rw_mounts") or []),
-            "env_vars": list(project.get("default_env_vars") or []),
-            "agent_args": normalized_agent_args,
-            "agent_type": resolved_agent_type,
-        }
-        if normalized_request_id:
-            create_chat_kwargs["create_request_id"] = normalized_request_id
-        chat = self.create_chat(
+        return self.project_service.create_and_start_chat(
             project_id,
-            **create_chat_kwargs,
+            agent_args=agent_args or [],
+            agent_type=agent_type,
+            request_id=request_id or "",
         )
-        return self.start_chat(chat["id"])
 
     @staticmethod
     def _chat_for_create_request(
@@ -3044,103 +2789,10 @@ class HubStateRuntimeMixin:
         return removed
 
     def _reconcile_startup_chat_runtime_state(self, state: dict[str, Any]) -> tuple[int, int, bool]:
-        chats = state.get("chats")
-        if not isinstance(chats, dict):
-            return 0, 0, False
-
-        stopped_chat_processes = 0
-        reconciled_chats = 0
-        changed = False
-        for chat_id, chat in chats.items():
-            if not isinstance(chat, dict):
-                continue
-            pid = chat.get("pid")
-            has_pid = isinstance(pid, int)
-            process_running = bool(has_pid and _is_process_running(pid))
-            if process_running and isinstance(pid, int):
-                _stop_process(pid)
-                stopped_chat_processes += 1
-
-            normalized_status = _normalize_chat_status(chat.get("status"))
-            status_requires_failure = normalized_status in {CHAT_STATUS_RUNNING, CHAT_STATUS_STARTING}
-            if not has_pid and not status_requires_failure:
-                continue
-
-            if status_requires_failure:
-                self._transition_chat_status(
-                    chat_id,
-                    chat,
-                    CHAT_STATUS_FAILED,
-                    CHAT_STATUS_REASON_STARTUP_RECONCILE_ORPHAN_PROCESS
-                    if has_pid
-                    else CHAT_STATUS_REASON_STARTUP_RECONCILE_PROCESS_MISSING,
-                )
-                if not str(chat.get("start_error") or "").strip():
-                    chat["start_error"] = (
-                        "Recovered from stale chat runtime state during startup."
-                        if has_pid
-                        else "Chat runtime process was missing during startup reconciliation."
-                    )
-
-            if has_pid:
-                chat["pid"] = None
-                chat["last_exit_code"] = _normalize_optional_int(chat.get("last_exit_code"))
-                chat["last_exit_at"] = _iso_now()
-            else:
-                chat["last_exit_code"] = _normalize_optional_int(chat.get("last_exit_code"))
-                if not str(chat.get("last_exit_at") or "").strip():
-                    chat["last_exit_at"] = _iso_now()
-            chat["artifact_publish_token_hash"] = ""
-            chat["artifact_publish_token_issued_at"] = ""
-            chat["agent_tools_token_hash"] = ""
-            chat["agent_tools_token_issued_at"] = ""
-            chat["stop_requested_at"] = ""
-            chat["updated_at"] = _iso_now()
-            state["chats"][chat_id] = chat
-            changed = True
-            reconciled_chats += 1
-        return stopped_chat_processes, reconciled_chats, changed
+        return self.lifecycle_service._reconcile_startup_chat_runtime_state(self, state)
 
     def startup_reconcile(self) -> dict[str, int]:
-        state = self.load()
-        stopped_chat_processes, reconciled_chats, state_changed = self._reconcile_startup_chat_runtime_state(state)
-        if state_changed:
-            self.save(state, reason="startup_reconcile")
-
-        removed_orphan_chat_paths = self._remove_orphan_children(
-            self.chat_dir,
-            self._managed_chat_workspace_paths(state),
-        )
-        self._remove_orphan_children(
-            self.chat_artifacts_dir,
-            self._managed_chat_artifact_paths(state),
-        )
-        removed_orphan_project_paths = self._remove_orphan_children(
-            self.project_dir,
-            self._managed_project_workspace_paths(state),
-        )
-        self._remove_orphan_children(
-            self.runtime_project_tmp_dir,
-            self._managed_project_tmp_paths(state),
-        )
-        projects = state.get("projects")
-        if isinstance(projects, dict):
-            for project_id in projects.keys():
-                self._remove_orphan_children(
-                    self.runtime_project_tmp_dir / str(project_id),
-                    self._managed_project_tmp_children_paths(state, str(project_id)),
-                )
-        removed_orphan_log_entries = self._remove_orphan_log_entries(state)
-        removed_stale_docker_containers = _docker_remove_stale_containers(STARTUP_STALE_DOCKER_CONTAINER_PREFIXES)
-
-        return {
-            "stopped_chat_processes": stopped_chat_processes,
-            "reconciled_chats": reconciled_chats,
-            "removed_orphan_chat_paths": removed_orphan_chat_paths,
-            "removed_orphan_project_paths": removed_orphan_project_paths,
-            "removed_orphan_log_entries": removed_orphan_log_entries,
-            "removed_stale_docker_containers": removed_stale_docker_containers,
-        }
+        return self.lifecycle_service.startup_reconcile(self)
 
     def _startup_reconcile_worker(self) -> None:
         summary = self.startup_reconcile()
@@ -3167,59 +2819,7 @@ class HubStateRuntimeMixin:
             worker.start()
 
     def clean_start(self) -> dict[str, int]:
-        self.cancel_openai_account_login()
-        state = self.load()
-
-        runtime_ids = self.runtime_domain.runtime_ids()
-        for chat_id in runtime_ids:
-            self._close_runtime(chat_id)
-
-        stopped_chats = 0
-        image_tags: set[str] = set()
-        for chat in state["chats"].values():
-            pid = chat.get("pid")
-            if isinstance(pid, int) and _is_process_running(pid):
-                _stop_process(pid)
-                stopped_chats += 1
-            snapshot_tag = str(chat.get("setup_snapshot_image") or "").strip()
-            if snapshot_tag:
-                image_tags.add(snapshot_tag)
-
-        projects_reset = 0
-        for project in state["projects"].values():
-            snapshot_tag = str(project.get("setup_snapshot_image") or "").strip()
-            if snapshot_tag:
-                image_tags.add(snapshot_tag)
-            if project.get("setup_snapshot_image"):
-                projects_reset += 1
-            project["setup_snapshot_image"] = ""
-            project.pop("snapshot_updated_at", None)
-            project["build_status"] = "pending"
-            project["build_error"] = ""
-            project["build_started_at"] = ""
-            project["build_finished_at"] = ""
-            project["updated_at"] = _iso_now()
-
-        cleared_chats = len(state["chats"])
-        state["chats"] = {}
-
-        for path in [self.chat_dir, self.project_dir, self.log_dir, self.runtime_tmp_dir, self.artifacts_dir]:
-            if path.exists():
-                self._delete_path(path)
-            path.mkdir(parents=True, exist_ok=True)
-        self.runtime_project_tmp_dir.mkdir(parents=True, exist_ok=True)
-        self.chat_artifacts_dir.mkdir(parents=True, exist_ok=True)
-        self.session_artifacts_dir.mkdir(parents=True, exist_ok=True)
-
-        self.save(state)
-        _docker_remove_images(("agent-hub-setup-", "agent-base-"), image_tags)
-
-        return {
-            "stopped_chats": stopped_chats,
-            "cleared_chats": cleared_chats,
-            "projects_reset": projects_reset,
-            "docker_images_requested": len(image_tags),
-        }
+        return self.lifecycle_service.clean_start(self)
 
     def shutdown(self) -> dict[str, int]:
         self.cancel_openai_account_login()
@@ -3525,413 +3125,16 @@ class HubStateRuntimeMixin:
         return [*resume_args, *normalized_args]
 
     def state_payload(self) -> dict[str, Any]:
-        state = self.load()
-        project_map: dict[str, dict[str, Any]] = {}
-        should_save = False
-        for pid, project in state["projects"].items():
-            project_copy = dict(project)
-            normalized_base_mode = _normalize_base_image_mode(project_copy.get("base_image_mode"))
-            normalized_base_value = _normalize_base_image_value(
-                normalized_base_mode,
-                project_copy.get("base_image_value"),
-            )
-            project_copy["base_image_mode"] = normalized_base_mode
-            project_copy["base_image_value"] = normalized_base_value
-            project_copy["default_ro_mounts"] = list(project_copy.get("default_ro_mounts") or [])
-            project_copy["default_rw_mounts"] = list(project_copy.get("default_rw_mounts") or [])
-            project_copy["default_env_vars"] = list(project_copy.get("default_env_vars") or [])
-            project_copy["setup_snapshot_image"] = str(project_copy.get("setup_snapshot_image") or "")
-            project_copy["build_status"] = str(project_copy.get("build_status") or "pending")
-            project_copy["build_error"] = str(project_copy.get("build_error") or "")
-            project_copy["build_started_at"] = str(project_copy.get("build_started_at") or "")
-            project_copy["build_finished_at"] = str(project_copy.get("build_finished_at") or "")
-            normalized_binding = _normalize_project_credential_binding(project_copy.get("credential_binding"))
-            project_copy["credential_binding"] = normalized_binding
-            if state["projects"].get(pid, {}).get("base_image_mode") != normalized_base_mode:
-                state["projects"][pid]["base_image_mode"] = normalized_base_mode
-                should_save = True
-            if str(state["projects"].get(pid, {}).get("base_image_value") or "").strip() != normalized_base_value:
-                state["projects"][pid]["base_image_value"] = normalized_base_value
-                should_save = True
-            if state["projects"].get(pid, {}).get("credential_binding") != normalized_binding:
-                state["projects"][pid]["credential_binding"] = normalized_binding
-                should_save = True
-            log_path = self.project_build_log(pid)
-            try:
-                project_copy["has_build_log"] = log_path.exists() and log_path.stat().st_size > 0
-            except OSError:
-                project_copy["has_build_log"] = False
-            project_map[pid] = project_copy
-        chats = []
-        for chat_id, chat in list(state["chats"].items()):
-            chat_copy = dict(chat)
-            pid = chat_copy.get("pid")
-            chat_copy["ro_mounts"] = list(chat_copy.get("ro_mounts") or [])
-            chat_copy["rw_mounts"] = list(chat_copy.get("rw_mounts") or [])
-            chat_copy["env_vars"] = list(chat_copy.get("env_vars") or [])
-            chat_copy["agent_type"] = _normalize_state_chat_agent_type(
-                chat_copy.get("agent_type"),
-                chat_id=str(chat_id),
-            )
-            chat_copy["setup_snapshot_image"] = str(chat_copy.get("setup_snapshot_image") or "")
-            cleaned_artifacts = _normalize_chat_artifacts(chat_copy.get("artifacts"))
-            if chat_id in state["chats"] and cleaned_artifacts != _normalize_chat_artifacts(state["chats"][chat_id].get("artifacts")):
-                state["chats"][chat_id]["artifacts"] = cleaned_artifacts
-                should_save = True
-            current_ids_raw = chat_copy.get("artifact_current_ids")
-            if isinstance(current_ids_raw, list):
-                cleaned_current_artifact_ids = _normalize_chat_current_artifact_ids(current_ids_raw, cleaned_artifacts)
-            else:
-                cleaned_current_artifact_ids = [
-                    str(artifact.get("id") or "")
-                    for artifact in cleaned_artifacts
-                    if str(artifact.get("id") or "")
-                ]
-            if chat_id in state["chats"]:
-                state_current_ids_raw = state["chats"][chat_id].get("artifact_current_ids")
-                if isinstance(state_current_ids_raw, list):
-                    state_current_artifact_ids = _normalize_chat_current_artifact_ids(state_current_ids_raw, cleaned_artifacts)
-                else:
-                    state_current_artifact_ids = [
-                        str(artifact.get("id") or "")
-                        for artifact in cleaned_artifacts
-                        if str(artifact.get("id") or "")
-                    ]
-                if cleaned_current_artifact_ids != state_current_artifact_ids:
-                    state["chats"][chat_id]["artifact_current_ids"] = cleaned_current_artifact_ids
-                    should_save = True
-            cleaned_artifact_prompt_history = _normalize_chat_artifact_prompt_history(chat_copy.get("artifact_prompt_history"))
-            if chat_id in state["chats"] and cleaned_artifact_prompt_history != _normalize_chat_artifact_prompt_history(
-                state["chats"][chat_id].get("artifact_prompt_history")
-            ):
-                state["chats"][chat_id]["artifact_prompt_history"] = cleaned_artifact_prompt_history
-                should_save = True
-            project_for_chat = project_map.get(chat_copy["project_id"], {})
-            project_name = str(project_for_chat.get("name") or chat_copy["project_id"] or "project")
-            chat_copy["artifacts"] = [self._chat_artifact_public_payload(chat_id, artifact) for artifact in reversed(cleaned_artifacts)]
-            chat_copy["artifact_current_ids"] = cleaned_current_artifact_ids
-            chat_copy["artifact_prompt_history"] = [
-                self._chat_artifact_history_public_payload(chat_id, entry)
-                for entry in reversed(cleaned_artifact_prompt_history)
-            ]
-            chat_copy["ready_ack_guid"] = str(chat_copy.get("ready_ack_guid") or "").strip()
-            chat_copy["ready_ack_stage"] = _normalize_ready_ack_stage(chat_copy.get("ready_ack_stage"))
-            chat_copy["ready_ack_at"] = str(chat_copy.get("ready_ack_at") or "")
-            ready_ack_meta = chat_copy.get("ready_ack_meta")
-            chat_copy["ready_ack_meta"] = ready_ack_meta if isinstance(ready_ack_meta, dict) else {}
-            chat_copy.pop("artifact_publish_token_hash", None)
-            chat_copy.pop("artifact_publish_token_issued_at", None)
-            chat_copy.pop("agent_tools_token_hash", None)
-            chat_copy.pop("agent_tools_token_issued_at", None)
-            chat_copy["create_request_id"] = _compact_whitespace(str(chat_copy.get("create_request_id") or "")).strip()
-            running = _is_process_running(pid)
-            normalized_status = _normalize_chat_status(chat_copy.get("status"))
-            if running:
-                if normalized_status != CHAT_STATUS_RUNNING and chat_id in state["chats"]:
-                    self._transition_chat_status(
-                        chat_id,
-                        state["chats"][chat_id],
-                        CHAT_STATUS_RUNNING,
-                        "chat_process_running_during_state_refresh",
-                    )
-                    should_save = True
-                    persisted_chat = state["chats"][chat_id]
-                    chat_copy["status"] = persisted_chat.get("status")
-                    chat_copy["status_reason"] = persisted_chat.get("status_reason")
-                    chat_copy["last_status_transition_at"] = persisted_chat.get("last_status_transition_at")
-                    chat_copy["updated_at"] = persisted_chat.get("updated_at")
-                chat_copy["status"] = CHAT_STATUS_RUNNING
-            else:
-                self._close_runtime(chat_id)
-                was_running = normalized_status in {CHAT_STATUS_RUNNING, CHAT_STATUS_STARTING} or isinstance(pid, int)
-                if was_running and chat_id in state["chats"]:
-                    persisted_chat = state["chats"][chat_id]
-                    self._transition_chat_status(
-                        chat_id,
-                        persisted_chat,
-                        CHAT_STATUS_FAILED,
-                        "chat_process_not_running_during_state_refresh",
-                    )
-                    if not str(persisted_chat.get("start_error") or "").strip():
-                        persisted_chat["start_error"] = "Chat process exited unexpectedly."
-                    persisted_chat["pid"] = None
-                    persisted_chat["artifact_publish_token_hash"] = ""
-                    persisted_chat["artifact_publish_token_issued_at"] = ""
-                    persisted_chat["agent_tools_token_hash"] = ""
-                    persisted_chat["agent_tools_token_issued_at"] = ""
-                    persisted_chat["last_exit_code"] = _normalize_optional_int(persisted_chat.get("last_exit_code"))
-                    if not str(persisted_chat.get("last_exit_at") or "").strip():
-                        persisted_chat["last_exit_at"] = _iso_now()
-                    persisted_chat["stop_requested_at"] = ""
-                    state["chats"][chat_id] = persisted_chat
-                    chat_copy["status"] = persisted_chat.get("status")
-                    chat_copy["status_reason"] = persisted_chat.get("status_reason")
-                    chat_copy["last_status_transition_at"] = persisted_chat.get("last_status_transition_at")
-                    chat_copy["updated_at"] = persisted_chat.get("updated_at")
-                    chat_copy["start_error"] = persisted_chat.get("start_error")
-                    chat_copy["last_exit_code"] = persisted_chat.get("last_exit_code")
-                    chat_copy["last_exit_at"] = persisted_chat.get("last_exit_at")
-                    chat_copy["stop_requested_at"] = persisted_chat.get("stop_requested_at")
-                    chat_copy["pid"] = None
-                    should_save = True
-                else:
-                    chat_copy["status"] = normalized_status
-                    if chat_copy.get("pid") is not None:
-                        chat_copy["pid"] = None
-                        if chat_id in state["chats"]:
-                            state["chats"][chat_id]["pid"] = None
-                            state["chats"][chat_id]["updated_at"] = _iso_now()
-                            should_save = True
-            chat_copy["is_running"] = running
-            chat_copy["container_workspace"] = str(chat_copy.get("container_workspace") or "") or _container_workspace_path_for_project(
-                project_name
-            )
-            chat_copy["project_name"] = project_name
-            is_outdated, outdated_reason = self._chat_container_outdated_state(
-                chat=chat_copy,
-                project=project_for_chat,
-                is_running=running,
-            )
-            chat_copy["container_outdated"] = is_outdated
-            chat_copy["container_outdated_reason"] = outdated_reason
-            subtitle = _chat_subtitle_from_log(self.chat_log(chat_id))
-            cached_title = _truncate_title(str(chat_copy.get("title_cached") or ""), CHAT_TITLE_MAX_CHARS)
-            if cached_title and _looks_like_terminal_control_payload(cached_title):
-                cached_title = ""
-                if chat_id in state["chats"]:
-                    state["chats"][chat_id]["title_cached"] = ""
-                    state["chats"][chat_id]["title_source"] = ""
-                    state["chats"][chat_id]["title_prompt_fingerprint"] = ""
-                    should_save = True
-            history_raw = chat_copy.get("title_user_prompts")
-            if isinstance(history_raw, list):
-                cleaned_history = [
-                    str(item)
-                    for item in history_raw
-                    if str(item).strip() and not _looks_like_terminal_control_payload(str(item))
-                ]
-                if chat_id in state["chats"] and cleaned_history != list(history_raw):
-                    state["chats"][chat_id]["title_user_prompts"] = cleaned_history
-                    should_save = True
-            title_status = str(chat_copy.get("title_status") or "idle").lower()
-            if title_status == "pending":
-                pending_history = chat_copy.get("title_user_prompts")
-                if isinstance(pending_history, list):
-                    normalized_prompts = _normalize_chat_prompt_history([str(item) for item in pending_history if str(item).strip()])
-                    if normalized_prompts:
-                        self._schedule_chat_title_generation(chat_id)
-            chat_copy["display_name"] = cached_title or _chat_display_name(chat_copy.get("name"))
-            title_error = _compact_whitespace(str(chat_copy.get("title_error") or ""))
-            if not subtitle and title_error:
-                subtitle = _short_summary(f"Title generation error: {title_error}", max_words=20, max_chars=CHAT_SUBTITLE_MAX_CHARS)
-            chat_copy["display_subtitle"] = subtitle
-            chats.append(chat_copy)
-
-        if should_save:
-            self.save(state, reason="state_payload_reconcile")
-
-        state["chats"] = chats
-        state["projects"] = list(project_map.values())
-        state["settings"] = self.settings_service.settings_payload(state)
-        return state
+        return self.app_state_service.state_payload()
 
     def start_chat(self, chat_id: str, *, resume: bool = False) -> dict[str, Any]:
-        state = self.load()
-        chat = state["chats"].get(chat_id)
-        if chat is None:
-            raise HTTPException(status_code=404, detail="Chat not found.")
-        project = state["projects"].get(chat["project_id"])
-        if project is None:
-            raise HTTPException(status_code=404, detail="Parent project missing.")
-
-        if _normalize_chat_status(chat.get("status")) == CHAT_STATUS_RUNNING and _is_process_running(chat.get("pid")):
-            raise HTTPException(status_code=409, detail="Chat is already running.")
-
-        build_status = str(project.get("build_status") or "")
-        snapshot_tag = str(project.get("setup_snapshot_image") or "").strip()
-        expected_snapshot_tag = self._project_setup_snapshot_tag(project)
-        snapshot_ready = (
-            build_status == "ready"
-            and snapshot_tag
-            and snapshot_tag == expected_snapshot_tag
-            and _docker_image_exists(snapshot_tag)
-        )
-        if not snapshot_ready:
-            raise HTTPException(status_code=409, detail="Project image is not ready yet. Wait for setup build to finish.")
-
-        self._transition_chat_status(chat_id, chat, CHAT_STATUS_STARTING, "chat_start_requested")
-        chat["start_error"] = ""
-        chat["last_exit_code"] = None
-        chat["last_exit_at"] = ""
-        chat["stop_requested_at"] = ""
-        chat["pid"] = None
-        state["chats"][chat_id] = chat
-        self.save(state, reason="chat_start_requested")
-
-        try:
-            workspace = self._ensure_chat_clone(chat, project)
-            self._sync_checkout_to_remote(workspace, project)
-            with self._chat_input_lock:
-                self._chat_input_buffers[chat_id] = ""
-                self._chat_input_ansi_carry[chat_id] = ""
-            artifact_publish_token = _new_artifact_publish_token()
-            agent_tools_token = _new_agent_tools_token()
-            ready_ack_guid = _new_ready_ack_guid()
-            agent_tools_url = self._chat_agent_tools_url(chat_id)
-            agent_tools_project_id = str(project.get("id") or "")
-            agent_type = _normalize_chat_agent_type(chat.get("agent_type"), strict=True)
-            runtime_config_file = self._prepare_chat_runtime_config(
-                chat_id,
-                agent_type=agent_type,
-                agent_tools_url=agent_tools_url,
-                agent_tools_token=agent_tools_token,
-                agent_tools_project_id=agent_tools_project_id,
-                agent_tools_chat_id=chat_id,
-                trusted_project_path=_container_workspace_path_for_project(project.get("name") or project.get("id")),
-            )
-            chat["agent_type"] = agent_type
-            container_workspace = _container_workspace_path_for_project(project.get("name") or project.get("id"))
-            chat_tmp_workspace = self.chat_tmp_workdir(agent_tools_project_id, chat_id)
-            chat_tmp_workspace.mkdir(parents=True, exist_ok=True)
-
-            agent_args = [str(arg) for arg in (chat.get("agent_args") or []) if str(arg).strip()]
-            if resume and agent_type == AGENT_TYPE_CODEX:
-                # agent_cli resume mode and explicit args are mutually exclusive.
-                agent_args = []
-            elif resume:
-                agent_args = self._resume_agent_args(agent_type, agent_args)
-
-            cmd = self._prepare_agent_cli_command(
-                workspace=workspace,
-                container_project_name=_container_project_name(project.get("name") or project.get("id")),
-                runtime_config_file=runtime_config_file,
-                agent_type=agent_type,
-                run_mode=self._runtime_run_mode(),
-                agent_tools_url=agent_tools_url,
-                agent_tools_token=agent_tools_token,
-                agent_tools_project_id=agent_tools_project_id,
-                agent_tools_chat_id=chat_id,
-                repo_url=str(project.get("repo_url") or ""),
-                project=project,
-                snapshot_tag=snapshot_tag,
-                ro_mounts=chat.get("ro_mounts"),
-                rw_mounts=chat.get("rw_mounts"),
-                env_vars=chat.get("env_vars"),
-                artifacts_url=self._chat_artifact_publish_url(chat_id),
-                artifacts_token=artifact_publish_token,
-                ready_ack_guid=ready_ack_guid,
-                resume=resume,
-                project_in_image=True,
-                runtime_tmp_mount=str(chat_tmp_workspace),
-                context_key=f"chat_start:{chat_id}",
-                extra_args=agent_args,
-            )
-
-            state = self.load()
-            chat = state["chats"].get(chat_id)
-            if chat is None:
-                raise HTTPException(status_code=404, detail="Chat was removed before runtime launch.")
-            chat["artifact_publish_token_hash"] = _hash_artifact_publish_token(artifact_publish_token)
-            chat["artifact_publish_token_issued_at"] = _iso_now()
-            chat["agent_tools_token_hash"] = _hash_agent_tools_token(agent_tools_token)
-            chat["agent_tools_token_issued_at"] = _iso_now()
-            chat["ready_ack_guid"] = ready_ack_guid
-            chat["ready_ack_stage"] = AGENT_READY_ACK_STAGE_CONTAINER_BOOTSTRAPPED
-            chat["ready_ack_at"] = ""
-            chat["ready_ack_meta"] = {}
-            state["chats"][chat_id] = chat
-            self.save(state, reason="chat_start_runtime_tokens_issued")
-
-            proc = self._spawn_chat_process(chat_id, cmd)
-        except Exception as exc:
-            detail = self._chat_start_error_detail(exc)
-            LOGGER.warning(
-                "Chat failed to start chat_id=%s project_id=%s reason=%s detail=%s",
-                chat_id,
-                chat.get("project_id"),
-                "chat_start_failed",
-                detail,
-            )
-            self._mark_chat_start_failed(chat_id, detail=detail, reason="chat_start_failed")
-            raise
-
-        state = self.load()
-        chat = state["chats"].get(chat_id)
-        if chat is None:
-            raise HTTPException(status_code=404, detail="Chat was removed before start completion.")
-        self._transition_chat_status(chat_id, chat, CHAT_STATUS_RUNNING, "chat_start_succeeded")
-        chat["start_error"] = ""
-        chat["pid"] = proc.pid
-        chat["setup_snapshot_image"] = snapshot_tag or ""
-        chat["container_workspace"] = container_workspace
-        chat["artifact_publish_token_hash"] = _hash_artifact_publish_token(artifact_publish_token)
-        chat["artifact_publish_token_issued_at"] = _iso_now()
-        chat["agent_tools_token_hash"] = _hash_agent_tools_token(agent_tools_token)
-        chat["agent_tools_token_issued_at"] = _iso_now()
-        chat["ready_ack_guid"] = str(chat.get("ready_ack_guid") or ready_ack_guid)
-        chat["ready_ack_stage"] = _normalize_ready_ack_stage(chat.get("ready_ack_stage"))
-        chat["ready_ack_at"] = str(chat.get("ready_ack_at") or "")
-        ready_ack_meta = chat.get("ready_ack_meta")
-        chat["ready_ack_meta"] = ready_ack_meta if isinstance(ready_ack_meta, dict) else {}
-        chat["last_started_at"] = _iso_now()
-        chat["stop_requested_at"] = ""
-        state["chats"][chat_id] = chat
-        self.save(state, reason="chat_start_succeeded")
-        return dict(chat)
+        return self.runtime_service.start_chat(chat_id, resume=resume)
 
     def refresh_chat_container(self, chat_id: str) -> dict[str, Any]:
-        state = self.load()
-        chat = state["chats"].get(chat_id)
-        if chat is None:
-            raise HTTPException(status_code=404, detail="Chat not found.")
-        project = state["projects"].get(chat["project_id"])
-        if project is None:
-            raise HTTPException(status_code=404, detail="Parent project missing.")
-
-        running = bool(chat.get("status") == "running" and _is_process_running(chat.get("pid")))
-        if not running:
-            raise HTTPException(status_code=409, detail="Chat must be running to refresh its container.")
-
-        is_outdated, _reason = self._chat_container_outdated_state(chat=chat, project=project, is_running=running)
-        if not is_outdated:
-            raise HTTPException(status_code=409, detail="Chat container is already up to date.")
-
-        self.close_chat(chat_id)
-        return self.start_chat(chat_id, resume=True)
+        return self.runtime_service.refresh_chat_container(chat_id)
 
     def close_chat(self, chat_id: str) -> dict[str, Any]:
-        state = self.load()
-        chat = state["chats"].get(chat_id)
-        if chat is None:
-            raise HTTPException(status_code=404, detail="Chat not found.")
-
-        stop_requested_at = _iso_now()
-        chat["stop_requested_at"] = stop_requested_at
-        chat["status_reason"] = CHAT_STATUS_REASON_CHAT_CLOSE_REQUESTED
-        chat["updated_at"] = stop_requested_at
-        state["chats"][chat_id] = chat
-        self.save(state, reason=CHAT_STATUS_REASON_CHAT_CLOSE_REQUESTED)
-        pid = chat.get("pid")
-        if isinstance(pid, int):
-            _stop_process(pid)
-        self._close_runtime(chat_id)
-        with self._chat_input_lock:
-            self._chat_input_buffers.pop(chat_id, None)
-            self._chat_input_ansi_carry.pop(chat_id, None)
-
-        self._transition_chat_status(chat_id, chat, CHAT_STATUS_STOPPED, CHAT_STATUS_REASON_CHAT_CLOSE_REQUESTED)
-        chat["start_error"] = ""
-        chat["pid"] = None
-        chat["artifact_publish_token_hash"] = ""
-        chat["artifact_publish_token_issued_at"] = ""
-        chat["agent_tools_token_hash"] = ""
-        chat["agent_tools_token_issued_at"] = ""
-        chat["last_exit_code"] = None
-        chat["last_exit_at"] = _iso_now()
-        chat["stop_requested_at"] = ""
-        state["chats"][chat_id] = chat
-        self.save(state, reason=CHAT_STATUS_REASON_CHAT_CLOSE_REQUESTED)
-        return dict(chat)
+        return self.runtime_service.close_chat(chat_id)
 
 
 def _html_page() -> str:

@@ -8,6 +8,7 @@ __all__ = [
     "chat_service",
     "credentials_service",
     "event_service",
+    "launch_profile_service",
     "lifecycle_service",
     "project_service",
     "runtime_service",
