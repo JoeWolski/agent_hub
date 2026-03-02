@@ -8,7 +8,6 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Callable
 
-import click
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -308,7 +307,10 @@ def register_hub_routes(
 
     @app.post("/api/projects/auto-configure")
     async def api_auto_configure_project(request: Request) -> dict[str, Any]:
-        payload = await request.json()
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Invalid JSON payload.")
         agent_args = payload.get("agent_args")
@@ -333,7 +335,10 @@ def register_hub_routes(
 
     @app.post("/api/projects/auto-configure/cancel")
     async def api_cancel_auto_configure_project(request: Request) -> dict[str, Any]:
-        payload = await request.json()
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Invalid JSON payload.")
         return state.auto_config_service.cancel_auto_configure_project(
@@ -342,7 +347,12 @@ def register_hub_routes(
 
     @app.post("/api/projects")
     async def api_create_project(request: Request) -> dict[str, Any]:
-        payload = await request.json()
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
         repo_url = str(payload.get("repo_url", "")).strip()
         name = payload.get("name")
         if name is not None:
@@ -378,7 +388,12 @@ def register_hub_routes(
 
     @app.patch("/api/projects/{project_id}")
     async def api_update_project(project_id: str, request: Request) -> dict[str, Any]:
-        payload = await request.json()
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
         update: dict[str, Any] = {}
         if "setup_script" in payload:
             script = payload.get("setup_script")
@@ -419,7 +434,10 @@ def register_hub_routes(
 
     @app.post("/api/projects/{project_id}/credential-binding")
     async def api_project_credential_binding_update(project_id: str, request: Request) -> dict[str, Any]:
-        payload = await request.json()
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Invalid JSON payload.")
         return state.project_service.attach_project_credentials(
@@ -917,13 +935,13 @@ def register_hub_routes(
         try:
             summary = state.lifecycle_service.shutdown()
             if summary["closed_chats"] > 0:
-                click.echo(
+                logger.info(
                     "Shutdown cleanup completed: "
                     f"stopped_chats={summary['stopped_chats']} "
                     f"closed_chats={summary['closed_chats']}"
                 )
         except Exception as exc:  # pragma: no cover - defensive shutdown guard
-            click.echo(f"Shutdown cleanup failed: {exc}", err=True)
+            logger.error("Shutdown cleanup failed: %s", exc)
 
     @app.get("/{path:path}")
     def spa(path: str):

@@ -53,8 +53,6 @@ class AuthServiceTests(unittest.TestCase):
         service = self._service()
         hosts, diagnostics = service._candidate_hosts(
             artifact_publish_base_url="http://bridge.example:8876",
-            request_host="ignored",
-            request_context={"x": "y"},
             discover_bridge_hosts=lambda: (["bridge.example", "10.0.0.8", "10.0.0.8"], {"source": "bridge"}),
             normalize_host=lambda value: str(value or "").strip().lower(),
         )
@@ -65,8 +63,6 @@ class AuthServiceTests(unittest.TestCase):
         service = self._service()
         hosts, diagnostics = service._candidate_hosts(
             artifact_publish_base_url="",
-            request_host="ignored",
-            request_context={},
             discover_bridge_hosts=lambda: (["10.0.0.8", "10.0.0.9"], {"source": "bridge"}),
             normalize_host=lambda value: str(value or "").strip().lower(),
         )
@@ -100,6 +96,13 @@ class AuthServiceTests(unittest.TestCase):
         self.assertEqual(result.status_code, 200)
         self.assertEqual(result.response_body, "ok")
         self.assertEqual(result.target_origin, "http://127.0.0.1:8877")
+        info_calls = [call for call in logger.info.call_args_list if "extra" in call.kwargs]
+        self.assertGreaterEqual(len(info_calls), 2)
+        for call in info_calls:
+            extra = call.kwargs["extra"]
+            self.assertIsInstance(extra.get("duration_ms"), int)
+            self.assertGreaterEqual(int(extra.get("duration_ms", -1)), 0)
+            self.assertEqual(extra.get("error_class"), "none")
 
     def test_forward_openai_account_callback_raises_network_reachability_error_when_all_hosts_fail_with_oserror(
         self,

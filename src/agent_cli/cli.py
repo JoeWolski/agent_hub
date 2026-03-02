@@ -1829,8 +1829,6 @@ def main(
     config_path = _to_absolute(config_file, cwd)
     if not config_path.is_file():
         raise click.ClickException(f"Agent config file does not exist: {config_path}")
-    if not config_path.is_file():
-        raise click.ClickException(f"Agent config file does not exist: {config_path}")
     try:
         runtime_config = load_agent_runtime_config(config_path)
     except ConfigError as exc:
@@ -1875,8 +1873,6 @@ def main(
         raise click.ClickException(str(exc)) from exc
 
     system_prompt_path = _to_absolute(system_prompt_file, cwd)
-    if not system_prompt_path.is_file():
-        raise click.ClickException(f"System prompt file does not exist: {system_prompt_path}")
     if not system_prompt_path.is_file():
         raise click.ClickException(f"System prompt file does not exist: {system_prompt_path}")
     try:

@@ -2730,6 +2730,18 @@ Gemini CLI
             ["http://10.0.1.1:1455/auth/callback?code=abc&state=xyz"],
         )
 
+    def test_discover_openai_callback_bridge_hosts_uses_docker_bridge_only(self) -> None:
+        with patch(
+            "agent_hub.server._discover_linux_default_gateway_host",
+            return_value=("172.18.0.1", {"status": "resolved"}),
+        ), patch(
+            "agent_hub.server._discover_docker_bridge_gateway_host",
+            return_value=("172.17.0.1", {"status": "resolved"}),
+        ):
+            hosts, diagnostics = hub_server._discover_openai_callback_bridge_hosts()
+        self.assertEqual(hosts, ["172.17.0.1"])
+        self.assertEqual(diagnostics["bridge_hosts"], ["172.17.0.1"])
+
     def test_forward_openai_callback_via_container_loopback_reports_python_missing(self) -> None:
         fake_process = SimpleNamespace(returncode=127, stdout="", stderr="python runtime unavailable in login container")
         with patch("agent_hub.server.shutil.which", return_value="/usr/bin/docker"), patch(
@@ -3967,6 +3979,23 @@ Gemini CLI
                 artifact_publish_base_url="host.docker.internal:8765",
             )
 
+    def test_hub_state_ignores_artifact_publish_base_url_env_fallback(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"AGENT_ARTIFACT_BASE_URL": "not-a-valid-url"},
+            clear=False,
+        ):
+            state = hub_server.HubState(
+                data_dir=self.tmp_path / "hub-artifacts-base-no-env-fallback",
+                config_file=self.config_file,
+                hub_port=8899,
+            )
+
+        self.assertEqual(
+            state.artifact_publish_base_url,
+            hub_server._default_artifact_publish_base_url(8899),
+        )
+
     def test_start_chat_rejects_base_path_outside_workspace(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
@@ -4223,18 +4252,35 @@ Gemini CLI
         persisted = json.loads(self.state.state_file.read_text(encoding="utf-8"))
         self.assertEqual(persisted["chats"][chat["id"]]["artifact_current_ids"], ["artifact-legacy"])
 
-    def test_load_normalizes_invalid_root_shapes_and_persists(self) -> None:
+    def test_load_fails_fast_on_invalid_root_shapes(self) -> None:
         self.state.state_file.write_text(
             json.dumps({"version": 1, "projects": [], "chats": "invalid", "settings": {}}),
             encoding="utf-8",
         )
 
-        loaded = self.state.load()
-        self.assertEqual(loaded["projects"], {})
-        self.assertEqual(loaded["chats"], {})
-        persisted = json.loads(self.state.state_file.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["projects"], {})
-        self.assertEqual(persisted["chats"], {})
+        with self.assertRaises(hub_server.ConfigError) as ctx:
+            self.state.load()
+        self.assertIn("projects", str(ctx.exception))
+
+    def test_load_fails_fast_on_invalid_project_entry_shape(self) -> None:
+        self.state.state_file.write_text(
+            json.dumps({"version": 1, "projects": {"project-1": 123}, "chats": {}, "settings": {}}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(hub_server.ConfigError) as ctx:
+            self.state.load()
+        self.assertIn("project-1", str(ctx.exception))
+
+    def test_load_fails_fast_on_invalid_chat_entry_shape(self) -> None:
+        self.state.state_file.write_text(
+            json.dumps({"version": 1, "projects": {}, "chats": {"chat-1": "oops"}, "settings": {}}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(hub_server.ConfigError) as ctx:
+            self.state.load()
+        self.assertIn("chat-1", str(ctx.exception))
 
     def test_load_fails_fast_on_legacy_codex_args(self) -> None:
         project = self.state.add_project(
@@ -10951,6 +10997,63 @@ class CliEnvVarTests(unittest.TestCase):
             kwargs = uvicorn_run.call_args.kwargs
             self.assertEqual(kwargs.get("log_level"), "warning")
 
+    def test_agent_hub_main_ignores_log_level_env_fallback(self) -> None:
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = tmp_path / "hub"
+            config = tmp_path / "agent.config.toml"
+            config.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"AGENT_HUB_LOG_LEVEL": "error"}, clear=False), patch(
+                "agent_hub.server.uvicorn.run",
+                return_value=None,
+            ) as uvicorn_run:
+                result = runner.invoke(
+                    hub_server.main,
+                    [
+                        "--data-dir",
+                        str(data_dir),
+                        "--config-file",
+                        str(config),
+                        "--no-frontend-build",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            kwargs = uvicorn_run.call_args.kwargs
+            self.assertEqual(kwargs.get("log_level"), "info")
+
+    def test_agent_hub_main_uses_config_log_level_without_log_level_flag(self) -> None:
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = tmp_path / "hub"
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\nlevel = 'warning'\n\n[runtime]\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"AGENT_HUB_LOG_LEVEL": "error"}, clear=False), patch(
+                "agent_hub.server.uvicorn.run",
+                return_value=None,
+            ) as uvicorn_run:
+                result = runner.invoke(
+                    hub_server.main,
+                    [
+                        "--data-dir",
+                        str(data_dir),
+                        "--config-file",
+                        str(config),
+                        "--no-frontend-build",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            kwargs = uvicorn_run.call_args.kwargs
+            self.assertEqual(kwargs.get("log_level"), "warning")
+
     def test_agent_hub_main_caps_uvicorn_log_level_at_info_for_debug(self) -> None:
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmp:
@@ -11148,6 +11251,19 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         self.assertIn("agent_type must be one of", response.json()["detail"])
         auto_configure.assert_not_called()
 
+    def test_auto_configure_route_rejects_malformed_json(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.AutoConfigService, "auto_configure_project") as auto_configure:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/auto-configure",
+                    data='{"repo_url":',
+                    headers={"content-type": "application/json"},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        auto_configure.assert_not_called()
+
     def test_auto_configure_cancel_route_calls_state_and_returns_result(self) -> None:
         app = self._build_app()
         cancellation_result = {"request_id": "pending-auto-123", "cancelled": True, "active": True}
@@ -11173,6 +11289,19 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, msg=response.text)
         self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
         self.assertEqual(response.json()["error_code"], "BAD_REQUEST")
+
+    def test_auto_configure_cancel_route_rejects_malformed_json(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.AutoConfigService, "cancel_auto_configure_project") as cancel_auto_config:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/auto-configure/cancel",
+                    data='{"request_id":',
+                    headers={"content-type": "application/json"},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        cancel_auto_config.assert_not_called()
 
     def test_project_build_cancel_route_calls_state_and_returns_result(self) -> None:
         app = self._build_app()
@@ -11241,6 +11370,63 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             default_env_vars=["FOO=bar"],
             credential_binding={"mode": "auto", "credential_ids": [], "source": "", "updated_at": ""},
         )
+
+    def test_create_project_route_rejects_non_object_payload(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ProjectService, "create_project") as create_project:
+            with TestClient(app) as client:
+                response = client.post("/api/projects", json=["not-an-object"])
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        create_project.assert_not_called()
+
+    def test_create_project_route_rejects_malformed_json(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ProjectService, "create_project") as create_project:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects",
+                    data='{"repo_url":',
+                    headers={"content-type": "application/json"},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        create_project.assert_not_called()
+
+    def test_update_project_route_rejects_non_object_payload(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ProjectService, "update_project") as update_project:
+            with TestClient(app) as client:
+                response = client.patch("/api/projects/project-1", json=["not-an-object"])
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        update_project.assert_not_called()
+
+    def test_update_project_route_rejects_malformed_json(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ProjectService, "update_project") as update_project:
+            with TestClient(app) as client:
+                response = client.patch(
+                    "/api/projects/project-1",
+                    data='{"name":',
+                    headers={"content-type": "application/json"},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        update_project.assert_not_called()
+
+    def test_project_credential_binding_route_rejects_malformed_json(self) -> None:
+        app = self._build_app()
+        with patch.object(hub_server.ProjectService, "attach_project_credentials") as attach_project_credentials:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/project-1/credential-binding",
+                    data='{"mode":',
+                    headers={"content-type": "application/json"},
+                )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+        attach_project_credentials.assert_not_called()
 
     def test_create_project_route_rejects_invalid_credential_binding_mode(self) -> None:
         app = self._build_app()
@@ -11718,6 +11904,8 @@ class HubApiAsyncRouteTests(unittest.TestCase):
                 response = client.get("/api/settings/auth/openai/account/callback?code=abc")
         self.assertEqual(response.status_code, 502, msg=response.text)
         self.assertEqual(response.json()["error_code"], "NETWORK_REACHABILITY_ERROR")
+        self.assertEqual(response.json()["failure_class"], "network")
+        self.assertEqual(response.json()["user_message"], "Required network endpoint is not reachable.")
         self.assertIn("unreachable", response.json()["detail"])
 
     def test_agent_tools_credential_resolve_route_surfaces_credential_resolution_error_code(self) -> None:
@@ -11749,6 +11937,8 @@ class HubApiAsyncRouteTests(unittest.TestCase):
                 response = client.post("/api/chats/chat-1/start")
         self.assertEqual(response.status_code, 400, msg=response.text)
         self.assertEqual(response.json()["error_code"], "CONFIG_ERROR")
+        self.assertEqual(response.json()["failure_class"], "configuration")
+        self.assertEqual(response.json()["user_message"], "Configuration is invalid.")
 
     def test_create_chat_route_surfaces_mount_visibility_error_code(self) -> None:
         app = self._build_app()

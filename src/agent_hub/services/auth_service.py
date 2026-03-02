@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -106,12 +107,9 @@ class AuthService:
         self,
         *,
         artifact_publish_base_url: str,
-        request_host: str,
-        request_context: dict[str, Any] | None,
         discover_bridge_hosts: Callable[[], tuple[list[str], dict[str, Any]]],
         normalize_host: Callable[[Any], str],
     ) -> tuple[list[str], dict[str, Any]]:
-        del request_host, request_context
         candidate_hosts: list[str] = []
 
         def add_host(raw_value: Any) -> None:
@@ -148,6 +146,12 @@ class AuthService:
         classify_callback_error: Callable[[BaseException], str],
         logger: Any,
     ) -> AuthCallbackForwardResult:
+        del request_host
+        started_at = time.monotonic()
+
+        def elapsed_ms() -> int:
+            return max(0, int((time.monotonic() - started_at) * 1000))
+
         callback_query = callback_query_summary(query)
         normalized_context = dict(request_context or {})
         log_extra_base = {
@@ -157,13 +161,11 @@ class AuthService:
             "chat_id": "",
             "project_id": "",
             "request_id": "",
-            "duration_ms": 0,
-            "error_class": "",
+            "duration_ms": elapsed_ms(),
+            "error_class": "none",
         }
         candidate_hosts, bridge_diagnostics = self._candidate_hosts(
             artifact_publish_base_url=artifact_publish_base_url,
-            request_host=request_host,
-            request_context=normalized_context,
             discover_bridge_hosts=discover_bridge_hosts,
             normalize_host=normalize_host,
         )
@@ -218,7 +220,7 @@ class AuthService:
                 session.id,
                 redacted_target_url,
                 self.callback_forward_timeout_seconds,
-                extra={**log_extra_base, "result": "request"},
+                extra={**log_extra_base, "result": "request", "duration_ms": elapsed_ms(), "error_class": "none"},
             )
             try:
                 with urllib.request.urlopen(request, timeout=self.callback_forward_timeout_seconds) as response:
@@ -230,7 +232,7 @@ class AuthService:
                     session.id,
                     redacted_target_url,
                     status_code,
-                    extra={**log_extra_base, "result": "success"},
+                    extra={**log_extra_base, "result": "success", "duration_ms": elapsed_ms(), "error_class": "none"},
                 )
                 forwarded_successfully = True
                 break
@@ -246,7 +248,12 @@ class AuthService:
                     session.id,
                     redacted_target_url,
                     status_code,
-                    extra={**log_extra_base, "result": "http_error", "error_class": "http_error"},
+                    extra={
+                        **log_extra_base,
+                        "result": "http_error",
+                        "duration_ms": elapsed_ms(),
+                        "error_class": "http_error",
+                    },
                 )
                 forwarded_successfully = True
                 break
@@ -264,7 +271,12 @@ class AuthService:
                     error_class,
                     type(exc).__name__,
                     str(exc),
-                    extra={**log_extra_base, "result": "upstream_error", "error_class": error_class},
+                    extra={
+                        **log_extra_base,
+                        "result": "upstream_error",
+                        "duration_ms": elapsed_ms(),
+                        "error_class": error_class,
+                    },
                 )
                 continue
 
@@ -283,7 +295,12 @@ class AuthService:
                 attempted,
                 callback_path,
                 json.dumps(callback_query, sort_keys=True),
-                extra={**log_extra_base, "result": "failed", "error_class": failure_reason},
+                extra={
+                    **log_extra_base,
+                    "result": "failed",
+                    "duration_ms": elapsed_ms(),
+                    "error_class": failure_reason,
+                },
             )
             raise NetworkReachabilityError(
                 "Failed to forward OAuth callback to login container. "
