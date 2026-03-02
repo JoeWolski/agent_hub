@@ -1,34 +1,57 @@
 # Validation Manifest: ground-up-architecture-overhaul
 
 Date: 2026-03-01
-Branch: master
+Branch: joew/ground-up-architecture-overhaul
 
 ## Commands
 
-1) uv run pytest tests/test_agent_core_shared.py tests/test_agent_core_config.py -q
+1) uv run --python 3.13 -m pytest tests/test_agent_core_config.py -q
 - exit: 0
-- result: 14 passed in 0.02s
+- result: 5 passed in 0.01s
 
-2) uv run pytest tests/test_hub_and_cli.py -k "host_identity or runtime_identity or config or prepare_chat_runtime_config" -q
+2) uv run --python 3.13 -m pytest tests/test_hub_and_cli.py -k "config or settings_payload" -q
 - exit: 0
-- result: 54 passed, 275 deselected in 1.53s
+- result: 54 passed, 290 deselected, 10 warnings in 2.48s
 
-3) uv run pytest tests/test_hub_and_cli.py -k "config or settings_payload" -q
+3) uv run --python 3.13 -m pytest tests/test_hub_and_cli.py -k "prepare_chat_runtime_config" -q
 - exit: 0
-- result: 49 passed, 280 deselected in 1.49s
+- result: 3 passed, 341 deselected in 0.17s
 
-4) uv run pytest tests/test_hub_and_cli.py -k "prepare_chat_runtime_config" -q
+4) uv run --python 3.13 -m pytest tests/test_hub_and_cli.py -k "project_build or create_and_start_chat or artifacts or credentials" -q
 - exit: 0
-- result: 3 passed, 326 deselected in 0.20s
+- result: 31 passed, 313 deselected, 2 warnings in 1.82s
 
-5) uv run pytest tests/test_hub_and_cli.py -k "host_identity or runtime_identity" -q
+5) uv run --python 3.13 -m pytest tests/integration/test_hub_chat_lifecycle_api.py -q
 - exit: 0
-- result: 5 passed, 324 deselected in 0.29s
+- result: 6 passed, 12 warnings in 4.26s
 
-6) uv run pytest tests/test_hub_and_cli.py -k "prepare_agent_cli_command or launch_profile" -q
-- exit: 5
-- result: 329 deselected (no tests match selector in current test suite)
+6) uv run --python 3.13 -m pytest tests/integration/test_agent_tools_ack_routes.py -q
+- exit: 0
+- result: 2 passed, 4 warnings in 0.09s
+
+7) uv run --python 3.13 -m pytest tests/integration/test_runtime_workspace_ownership.py -q
+- exit: 0
+- result: 1 passed in 3.56s
+
+8) uv run --python 3.13 -m pytest tests/integration/test_chat_lifecycle_ready.py -q
+- exit: 0
+- result: 3 passed in 0.02s
+
+9) uv run --python 3.13 -m pytest tests/test_preflight_integration_env.py -q
+- exit: 0
+- result: 2 passed in 0.01s
+
+10) uv run python tools/testing/run_integration.py --mode direct-agent-cli --preflight
+- exit: 0
+- result: 14 passed in 3.10s (integration mode preflight + selected suite run)
+
+11) uv run python tools/testing/run_integration.py --mode hub-api-e2e --preflight
+- exit: 0
+- result: 18 passed, 16 warnings in 8.74s (integration mode preflight + selected suite run)
+
+12) uv run --python 3.13 -m pytest tests/test_hub_and_cli.py -q
+- exit: 0
+- result: 344 passed, 46 warnings, 3 subtests passed in 23.08s
 
 ## Notes
-- The `prepare_agent_cli_command or launch_profile` selector from task contracts currently matches no tests in `tests/test_hub_and_cli.py`.
-- Adjacent launch/runtime behavior is covered by existing runtime/config identity tests above.
+- `/workspace/tmp` now resolves and is writable in this run context; ownership and preflight suites complete successfully.

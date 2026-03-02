@@ -3,13 +3,25 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+    import tomli as tomllib
 
 from agent_core.errors import ConfigError
 
 
 _SECTION_KEYS = ("identity", "paths", "providers", "mcp", "auth", "logging", "runtime")
-_LEGACY_PROVIDER_DEFAULT_KEYS = ("model", "model_provider", "model_reasoning_effort")
+RUNTIME_RUN_MODE_DOCKER = "docker"
+RUNTIME_RUN_MODE_NATIVE = "native"
+RUNTIME_RUN_MODE_AUTO = "auto"
+RUNTIME_RUN_MODE_CHOICES = (
+    RUNTIME_RUN_MODE_DOCKER,
+    RUNTIME_RUN_MODE_NATIVE,
+    RUNTIME_RUN_MODE_AUTO,
+)
+DEFAULT_RUNTIME_RUN_MODE = RUNTIME_RUN_MODE_DOCKER
 
 
 def _ensure_dict(value: object, *, label: str) -> dict[str, Any]:
@@ -73,6 +85,7 @@ class LoggingConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
+    run_mode: str = DEFAULT_RUNTIME_RUN_MODE
     values: dict[str, Any] = field(default_factory=dict)
 
 
@@ -93,13 +106,18 @@ class AgentRuntimeConfig:
             raise ConfigError("Config payload root must be a table/object.")
 
         raw = dict(payload)
+        missing_sections = [section for section in _SECTION_KEYS if section not in raw]
+        if missing_sections:
+            raise ConfigError(
+                "Config payload missing required sections: " + ", ".join(missing_sections)
+            )
 
         identity = IdentityConfig(values=_copy_section_values(raw.get("identity"), section="identity"))
         paths = PathsConfig(values=_copy_section_values(raw.get("paths"), section="paths"))
         mcp = MCPConfig(values=_copy_section_values(raw.get("mcp"), section="mcp"))
         auth = AuthConfig(values=_copy_section_values(raw.get("auth"), section="auth"))
         logging = LoggingConfig(values=_copy_section_values(raw.get("logging"), section="logging"))
-        runtime = RuntimeConfig(values=_copy_section_values(raw.get("runtime"), section="runtime"))
+        runtime = _parse_runtime(raw)
         providers = _parse_providers(raw)
 
         extras = {k: v for k, v in raw.items() if k not in _SECTION_KEYS}
@@ -134,10 +152,6 @@ def _parse_providers(raw_root: dict[str, Any]) -> ProvidersConfig:
     providers_raw = _ensure_dict(raw_root.get("providers"), label="section 'providers'")
     defaults_raw = _ensure_dict(providers_raw.get("defaults"), label="section 'providers.defaults'")
 
-    for legacy_key in _LEGACY_PROVIDER_DEFAULT_KEYS:
-        if legacy_key in raw_root and legacy_key not in defaults_raw:
-            defaults_raw[legacy_key] = raw_root[legacy_key]
-
     defaults = ProviderDefaultsConfig(
         model=_ensure_optional_str(defaults_raw.pop("model", None), label="providers.defaults.model"),
         model_provider=_ensure_optional_str(
@@ -160,6 +174,23 @@ def _parse_providers(raw_root: dict[str, Any]) -> ProvidersConfig:
     return ProvidersConfig(defaults=defaults, entries=entries)
 
 
+def parse_runtime_run_mode(value: object, *, label: str = "runtime.run_mode") -> str:
+    if value is None:
+        return DEFAULT_RUNTIME_RUN_MODE
+    if not isinstance(value, str):
+        raise ConfigError(f"{label} must be one of: {', '.join(RUNTIME_RUN_MODE_CHOICES)}.")
+    resolved = value.strip().lower()
+    if resolved not in RUNTIME_RUN_MODE_CHOICES:
+        raise ConfigError(f"{label} must be one of: {', '.join(RUNTIME_RUN_MODE_CHOICES)}.")
+    return resolved
+
+
+def _parse_runtime(raw_root: dict[str, Any]) -> RuntimeConfig:
+    runtime_raw = _ensure_dict(raw_root.get("runtime"), label="section 'runtime'")
+    run_mode = parse_runtime_run_mode(runtime_raw.pop("run_mode", None))
+    return RuntimeConfig(run_mode=run_mode, values=runtime_raw)
+
+
 def load_agent_runtime_config(path: str | Path) -> AgentRuntimeConfig:
     return AgentRuntimeConfig.from_toml_path(path)
 
@@ -178,6 +209,12 @@ __all__ = [
     "ProviderDefaultsConfig",
     "ProvidersConfig",
     "RuntimeConfig",
+    "DEFAULT_RUNTIME_RUN_MODE",
+    "RUNTIME_RUN_MODE_AUTO",
+    "RUNTIME_RUN_MODE_CHOICES",
+    "RUNTIME_RUN_MODE_DOCKER",
+    "RUNTIME_RUN_MODE_NATIVE",
     "load_agent_runtime_config",
     "load_agent_runtime_config_dict",
+    "parse_runtime_run_mode",
 ]

@@ -1,19 +1,34 @@
 # Verification Report: Ground-Up Architecture Overhaul
 
 ## Cycle Summary
-- Implemented AOH-01 helper extraction and delegation in CLI/Hub.
-- Implemented AOH-02 foundation with typed runtime config loader and startup fail-fast parse validation.
-- Added focused unit tests for shared helpers and config parsing.
+- Implemented AOH-02 strict canonical config contract with config-first runtime identity/run-mode/default handling and explicit override precedence.
+- Implemented AOH-03 deterministic runtime identity/mount behavior with strict invalid-state/input failures and DIND-only branch exceptions.
+- Implemented AOH-04 service-boundary extraction for settings/auth domains with route behavior preserved.
+- Implemented AOH-05 fallback pruning and cleanup in runtime/state execution paths.
 
 ## Command Results
-- `uv run pytest tests/test_agent_core_shared.py tests/test_agent_core_config.py -q`: PASS (14 passed)
-- `uv run pytest tests/test_hub_and_cli.py -k "host_identity or runtime_identity or config or prepare_chat_runtime_config" -q`: PASS (54 passed)
-- `uv run pytest tests/test_hub_and_cli.py -k "config or settings_payload" -q`: PASS (49 passed)
-- `uv run pytest tests/test_hub_and_cli.py -k "prepare_chat_runtime_config" -q`: PASS (3 passed)
-- `uv run pytest tests/test_hub_and_cli.py -k "host_identity or runtime_identity" -q`: PASS (5 passed)
-- `uv run pytest tests/test_hub_and_cli.py -k "prepare_agent_cli_command or launch_profile" -q`: NO MATCH (329 deselected, exit 5)
+- `uv run --python 3.13 -m pytest tests/test_agent_core_config.py -q`: PASS (5 passed)
+- `uv run --python 3.13 -m pytest tests/test_hub_and_cli.py -k "config or settings_payload" -q`: PASS (51 passed)
+- `uv run --python 3.13 -m pytest tests/test_hub_and_cli.py -k "prepare_chat_runtime_config" -q`: PASS (3 passed)
+- `uv run --python 3.13 -m pytest tests/test_hub_and_cli.py -k "project_build or create_and_start_chat or artifacts or credentials" -q`: PASS (31 passed)
+- `uv run --python 3.13 -m pytest tests/test_hub_and_cli.py -q`: PASS (344 passed)
+- `uv run --python 3.13 -m pytest tests/integration/test_hub_chat_lifecycle_api.py -q`: PASS (6 passed)
+- `uv run --python 3.13 -m pytest tests/integration/test_agent_tools_ack_routes.py -q`: PASS (2 passed)
+- `uv run --python 3.13 -m pytest tests/integration/test_chat_lifecycle_ready.py -q`: PASS (3 passed)
+- `uv run --python 3.13 -m pytest tests/test_preflight_integration_env.py -q`: PASS (2 passed)
+- `uv run --python 3.13 -m pytest tests/integration/test_runtime_workspace_ownership.py -q`: PASS (1 passed)
+- `uv run python tools/testing/run_integration.py --mode direct-agent-cli --preflight`: PASS (14 passed)
+- `uv run python tools/testing/run_integration.py --mode hub-api-e2e --preflight`: PASS (18 passed, 16 warnings)
 
 ## Assessment
-- Extracted helper behavior remains stable in validated paths.
-- Config parse failures now fail startup deterministically in both CLI and Hub entrypoints.
-- Full canonical SSOT runtime consumption is not complete; loaded config is validated but not yet the sole runtime source.
+- Canonical config parse validation is now strict and deterministic for required schema sections.
+- Hub and CLI now consume parsed runtime config for key defaults/resolution paths instead of validation-only loading.
+- Hub settings and auth callback routing behavior remained stable after service extraction and delegation.
+- Required integration verification commands now complete in this environment.
+
+## Verification Status
+- AOH-01: COMPLETE.
+- AOH-02: COMPLETE.
+- AOH-03: COMPLETE.
+- AOH-04: COMPLETE.
+- AOH-05: COMPLETE.

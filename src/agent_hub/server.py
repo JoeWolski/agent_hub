@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import codecs
 import fcntl
 import hashlib
 import html
@@ -23,7 +22,6 @@ import subprocess
 import shutil
 import sys
 import tempfile
-import termios
 import time
 import urllib.error
 import urllib.parse
@@ -40,12 +38,46 @@ from typing import Any, Callable
 import click
 from agent_cli import cli as agent_cli_image
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException, Request, UploadFile, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 
-from agent_core import ConfigError, load_agent_runtime_config
+from agent_core import (
+    AgentRuntimeConfig,
+    ConfigError,
+    CredentialResolutionError,
+    DEFAULT_RUNTIME_RUN_MODE,
+    IdentityError,
+    MountVisibilityError,
+    NetworkReachabilityError,
+    load_agent_runtime_config,
+)
+from agent_core import identity as core_identity
+from agent_core import launch as core_launch
+from agent_core import logging as core_logging
+from agent_core import paths as core_paths
 from agent_core import shared as core_shared
+from agent_hub.api import register_hub_routes
+from agent_hub.domains import (
+    AuthDomain,
+    AutoConfigDomain,
+    ChatRuntimeDomain,
+    CredentialsDomain,
+    ProjectDomain,
+    RuntimeDomain,
+)
+from agent_hub.services.artifacts_service import ArtifactsService
+from agent_hub.services.auth_service import AuthService
+from agent_hub.services.auto_config_service import AutoConfigService
+from agent_hub.services.app_state_service import AppStateService
+from agent_hub.services.chat_service import ChatService
+from agent_hub.services.credentials_service import CredentialsService
+from agent_hub.services.event_service import EventService
+from agent_hub.services.lifecycle_service import LifecycleService
+from agent_hub.services.project_service import ProjectService
+from agent_hub.services.runtime_service import RuntimeService
+from agent_hub.services.settings_service import SettingsService
+from agent_hub.integrations import run_command
+from agent_hub.store import HubStateStore
 
 
 STATE_FILE_NAME = "state.json"
@@ -165,6 +197,15 @@ AGENT_LABEL_BY_TYPE = {
     AGENT_TYPE_CLAUDE: "Claude",
     AGENT_TYPE_GEMINI: "Gemini CLI",
 }
+
+
+def _agent_command_for_type(agent_type: str) -> str:
+    normalized = str(agent_type or "").strip().lower()
+    command = AGENT_COMMAND_BY_TYPE.get(normalized)
+    if command is None:
+        supported = ", ".join(sorted(AGENT_COMMAND_BY_TYPE.keys()))
+        raise HTTPException(status_code=400, detail=f"agent_type must be one of: {supported}.")
+    return command
 AGENT_CAPABILITY_DEFAULT_MODELS_BY_TYPE = {
     AGENT_TYPE_CODEX: ["default"],
     AGENT_TYPE_CLAUDE: ["default"],
@@ -613,31 +654,15 @@ def _render_prompt_template(prompt_file_name: str, **values: Any) -> str:
 
 
 def _default_data_dir() -> Path:
-    return Path.home() / ".local" / "share" / "agent-hub"
+    return core_paths.default_agent_hub_data_dir()
 
 
 def _default_config_file() -> Path:
-    config_file = _repo_root() / "config" / "agent.config.toml"
-    if config_file.exists():
-        return config_file
-
-    fallback = Path.cwd() / "config" / "agent.config.toml"
-    if fallback.exists():
-        return fallback
-
-    return config_file
+    return core_shared.default_config_file(_repo_root(), cwd=Path.cwd())
 
 
 def _default_system_prompt_file() -> Path:
-    system_prompt_file = _repo_root() / SYSTEM_PROMPT_FILE_NAME
-    if system_prompt_file.exists():
-        return system_prompt_file
-
-    fallback = Path.cwd() / SYSTEM_PROMPT_FILE_NAME
-    if fallback.exists():
-        return fallback
-
-    return system_prompt_file
+    return core_shared.default_system_prompt_file(_repo_root(), SYSTEM_PROMPT_FILE_NAME, cwd=Path.cwd())
 
 
 def _frontend_dist_dir() -> Path:
@@ -663,6 +688,27 @@ def _normalize_chat_agent_type(raw_value: Any, *, strict: bool = False) -> str:
         supported = ", ".join(sorted(SUPPORTED_CHAT_AGENT_TYPES))
         raise HTTPException(status_code=400, detail=f"agent_type must be one of: {supported}.")
     return DEFAULT_CHAT_AGENT_TYPE
+
+
+def _resolve_optional_chat_agent_type(raw_value: Any, *, default_value: str) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        return _normalize_chat_agent_type(default_value, strict=True)
+    return _normalize_chat_agent_type(value, strict=True)
+
+
+def _normalize_state_chat_agent_type(raw_value: Any, *, chat_id: str) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        return DEFAULT_CHAT_AGENT_TYPE
+    try:
+        return _normalize_chat_agent_type(value, strict=True)
+    except HTTPException as exc:
+        detail = str(exc.detail or "invalid agent_type")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid chat state for chat '{chat_id}': {detail}",
+        ) from exc
 
 
 def _cli_arg_matches_option(arg: str, *, long_option: str, short_option: str | None = None) -> bool:
@@ -775,7 +821,31 @@ def _strip_explicit_codex_default_model(agent_args: list[str]) -> list[str]:
     return filtered
 
 
-def _apply_default_model_for_agent(agent_type: str, agent_args: list[str]) -> list[str]:
+def _runtime_default_model_for_agent(agent_type: str, runtime_config: AgentRuntimeConfig | None) -> str:
+    if runtime_config is None:
+        return DEFAULT_CLAUDE_MODEL if agent_type == AGENT_TYPE_CLAUDE else ""
+
+    provider_entry = runtime_config.providers.entries.get(agent_type)
+    if isinstance(provider_entry, dict):
+        provider_model = str(provider_entry.get("model") or "").strip()
+        if provider_model:
+            return provider_model
+
+    default_model = str(runtime_config.providers.defaults.model or "").strip()
+    default_provider = str(runtime_config.providers.defaults.model_provider or "").strip().lower()
+    if default_model and (not default_provider or default_provider == str(agent_type or "").strip().lower()):
+        return default_model
+
+    if agent_type == AGENT_TYPE_CLAUDE:
+        return DEFAULT_CLAUDE_MODEL
+    return ""
+
+
+def _apply_default_model_for_agent(
+    agent_type: str,
+    agent_args: list[str],
+    runtime_config: AgentRuntimeConfig | None = None,
+) -> list[str]:
     normalized_args = [str(arg) for arg in agent_args if str(arg).strip()]
     if agent_type != AGENT_TYPE_CLAUDE:
         if agent_type == AGENT_TYPE_CODEX:
@@ -783,7 +853,10 @@ def _apply_default_model_for_agent(agent_type: str, agent_args: list[str]) -> li
         return normalized_args
     if _has_cli_option(normalized_args, long_option="--model", short_option="-m"):
         return normalized_args
-    return ["--model", DEFAULT_CLAUDE_MODEL, *normalized_args]
+    resolved_model = _runtime_default_model_for_agent(agent_type, runtime_config)
+    if not resolved_model:
+        return normalized_args
+    return ["--model", resolved_model, *normalized_args]
 
 
 def _normalize_chat_layout_engine(raw_value: Any, *, strict: bool = False) -> str:
@@ -794,6 +867,16 @@ def _normalize_chat_layout_engine(raw_value: Any, *, strict: bool = False) -> st
         supported = ", ".join(sorted(SUPPORTED_CHAT_LAYOUT_ENGINES))
         raise HTTPException(status_code=400, detail=f"chat_layout_engine must be one of: {supported}.")
     return DEFAULT_CHAT_LAYOUT_ENGINE
+
+
+@lru_cache(maxsize=1)
+def _settings_service_defaults() -> SettingsService:
+    return SettingsService(
+        default_agent_type=DEFAULT_CHAT_AGENT_TYPE,
+        default_chat_layout_engine=DEFAULT_CHAT_LAYOUT_ENGINE,
+        normalize_chat_agent_type=_normalize_chat_agent_type,
+        normalize_chat_layout_engine=_normalize_chat_layout_engine,
+    )
 
 
 def _normalize_chat_status(raw_value: Any, *, strict: bool = False) -> str:
@@ -819,14 +902,72 @@ def _normalize_optional_int(raw_value: Any) -> int | None:
     return None
 
 
+class _StructuredLogDefaultsFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return core_logging.StructuredLogDefaultsFilter().filter(record)
+
+
 def _configure_hub_logging(level: str) -> None:
     normalized = _normalize_log_level(level)
-    handler = logging.StreamHandler(sys.__stderr__)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    LOGGER.handlers.clear()
-    LOGGER.addHandler(handler)
-    LOGGER.setLevel(getattr(logging, normalized.upper(), logging.INFO))
-    LOGGER.propagate = False
+    core_logging.configure_structured_logger(LOGGER, level=normalized)
+
+
+def _resolve_hub_log_level(log_level: str | None, runtime_config: AgentRuntimeConfig | None) -> str:
+    cli_value = str(log_level or "").strip()
+    if cli_value:
+        return _normalize_log_level(cli_value)
+
+    config_value = ""
+    if runtime_config is not None and isinstance(runtime_config.logging.values, dict):
+        config_value = str(runtime_config.logging.values.get("level") or "").strip()
+    if config_value:
+        return _normalize_log_level(config_value)
+    return _normalize_log_level(os.environ.get("AGENT_HUB_LOG_LEVEL", "info"))
+
+
+def _configure_domain_log_levels(runtime_config: AgentRuntimeConfig | None) -> None:
+    if runtime_config is None or not isinstance(runtime_config.logging.values, dict):
+        return
+    core_logging.configure_domain_log_levels(
+        domains=runtime_config.logging.values.get("domains"),
+        logger_prefix="agent_hub",
+        normalize_level=_normalize_log_level,
+    )
+
+
+def _core_error_payload(exc: BaseException) -> tuple[int, dict[str, Any]]:
+    if isinstance(exc, ConfigError):
+        return 400, {"error_code": "CONFIG_ERROR", "detail": str(exc)}
+    if isinstance(exc, IdentityError):
+        return 400, {"error_code": "IDENTITY_ERROR", "detail": str(exc)}
+    if isinstance(exc, MountVisibilityError):
+        return 409, {"error_code": "MOUNT_VISIBILITY_ERROR", "detail": str(exc)}
+    if isinstance(exc, NetworkReachabilityError):
+        return 502, {"error_code": "NETWORK_REACHABILITY_ERROR", "detail": str(exc)}
+    if isinstance(exc, CredentialResolutionError):
+        return 401, {"error_code": "CREDENTIAL_RESOLUTION_ERROR", "detail": str(exc)}
+    return 500, {"error_code": "INTERNAL_ERROR", "detail": str(exc)}
+
+
+def _http_error_code(status_code: int) -> str:
+    status = int(status_code or 500)
+    if status == 400:
+        return "BAD_REQUEST"
+    if status == 401:
+        return "UNAUTHORIZED"
+    if status == 403:
+        return "FORBIDDEN"
+    if status == 404:
+        return "NOT_FOUND"
+    if status == 409:
+        return "CONFLICT"
+    if status == 422:
+        return "UNPROCESSABLE_ENTITY"
+    if status == 429:
+        return "RATE_LIMITED"
+    if status in {500, 502, 503, 504}:
+        return "UPSTREAM_ERROR"
+    return f"HTTP_{status}"
 
 
 def _uvicorn_log_level(hub_level: str) -> str:
@@ -1056,23 +1197,13 @@ def _run(
     check: bool = True,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
-    resolved_env: dict[str, str] | None = None
-    if env:
-        resolved_env = dict(os.environ)
-        for key, value in env.items():
-            resolved_env[str(key)] = str(value)
-    result = subprocess.run(
+    return run_command(
         cmd,
-        cwd=str(cwd) if cwd else None,
-        check=False,
-        text=True,
-        capture_output=capture,
-        env=resolved_env,
+        cwd=cwd,
+        capture=capture,
+        check=check,
+        env=env,
     )
-    if check and result.returncode != 0:
-        message = (result.stdout or "") + (result.stderr or "")
-        raise HTTPException(status_code=400, detail=f"Command failed ({cmd[0]}): {message.strip()}")
-    return result
 
 
 def _run_logged(
@@ -1164,52 +1295,8 @@ def _new_state() -> dict[str, Any]:
         "version": 1,
         "projects": {},
         "chats": {},
-        "settings": {
-            "default_agent_type": DEFAULT_CHAT_AGENT_TYPE,
-            "chat_layout_engine": DEFAULT_CHAT_LAYOUT_ENGINE,
-            "git_user_name": "",
-            "git_user_email": "",
-        },
+        "settings": _settings_service_defaults().empty_settings_payload(),
     }
-
-
-def _normalize_git_identity_setting(raw_value: Any, *, field_name: str, strict: bool = False) -> str:
-    value = _compact_whitespace(str(raw_value or "").strip())
-    if any(char in value for char in ("\r", "\n", "\x00")):
-        if strict:
-            raise HTTPException(status_code=400, detail=f"{field_name} must not contain control characters.")
-        value = value.replace("\r", " ").replace("\n", " ").replace("\x00", "")
-        value = _compact_whitespace(value)
-    if len(value) > 256:
-        if strict:
-            raise HTTPException(status_code=400, detail=f"{field_name} must be 256 characters or fewer.")
-        value = value[:256].strip()
-    return value
-
-
-def _normalize_hub_settings_payload(raw_settings: Any) -> dict[str, Any]:
-    if not isinstance(raw_settings, dict):
-        raw_settings = {}
-    normalized = {
-        "default_agent_type": _normalize_chat_agent_type(
-            raw_settings.get("default_agent_type") or raw_settings.get("defaultAgentType")
-        ),
-        "chat_layout_engine": _normalize_chat_layout_engine(
-            raw_settings.get("chat_layout_engine") or raw_settings.get("chatLayoutEngine")
-        ),
-        "git_user_name": _normalize_git_identity_setting(
-            raw_settings.get("git_user_name", raw_settings.get("gitUserName")),
-            field_name="git_user_name",
-        ),
-        "git_user_email": _normalize_git_identity_setting(
-            raw_settings.get("git_user_email", raw_settings.get("gitUserEmail")),
-            field_name="git_user_email",
-        ),
-    }
-    if bool(normalized["git_user_name"]) != bool(normalized["git_user_email"]):
-        normalized["git_user_name"] = ""
-        normalized["git_user_email"] = ""
-    return normalized
 
 
 def _normalize_project_credential_binding(raw_binding: Any) -> dict[str, Any]:
@@ -1297,7 +1384,7 @@ def _normalize_reasoning_mode_options_for_agent(agent_type: str, raw_values: Any
 
 
 def _agent_capability_defaults_for_type(agent_type: str) -> dict[str, Any]:
-    resolved_type = _normalize_chat_agent_type(agent_type)
+    resolved_type = _normalize_chat_agent_type(agent_type, strict=True)
     default_models = AGENT_CAPABILITY_DEFAULT_MODELS_BY_TYPE.get(
         resolved_type,
         AGENT_CAPABILITY_DEFAULT_MODELS_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE],
@@ -1339,7 +1426,7 @@ def _normalize_agent_capabilities_payload(raw_payload: Any) -> dict[str, Any]:
         for raw_agent in raw_agents:
             if not isinstance(raw_agent, dict):
                 continue
-            resolved_type = _normalize_chat_agent_type(raw_agent.get("agent_type"))
+            resolved_type = _normalize_chat_agent_type(raw_agent.get("agent_type"), strict=True)
             raw_agent_map[resolved_type] = raw_agent
 
     normalized_agents: list[dict[str, Any]] = []
@@ -1824,9 +1911,7 @@ def _agent_capability_provider_for_command(command: str) -> str:
 
 
 def _ensure_agent_capability_runtime_image(agent_provider: str) -> str:
-    normalized_provider = _normalize_chat_agent_type(agent_provider)
-    if normalized_provider not in SUPPORTED_CHAT_AGENT_TYPES:
-        raise RuntimeError(f"Unsupported capability discovery provider: {agent_provider}")
+    normalized_provider = _normalize_chat_agent_type(agent_provider, strict=True)
     base_image = agent_cli_image.DEFAULT_BASE_IMAGE
     runtime_image = agent_cli_image._default_runtime_image_for_provider(normalized_provider)
     try:
@@ -2131,8 +2216,14 @@ def _base64url_encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def _github_sign_rs256(private_key_pem: str, message: bytes) -> bytes:
-    temp_key_path = Path("/tmp") / f".agent_hub_github_app_key_{uuid.uuid4().hex}.pem"
+def _github_sign_rs256(
+    private_key_pem: str,
+    message: bytes,
+    temp_root_dir: Path,
+) -> bytes:
+    temp_root = Path(temp_root_dir).resolve()
+    temp_root.mkdir(parents=True, exist_ok=True)
+    temp_key_path = temp_root / f".agent_hub_github_app_key_{uuid.uuid4().hex}.pem"
     _write_private_env_file(temp_key_path, private_key_pem)
     try:
         result = subprocess.run(
@@ -2152,7 +2243,7 @@ def _github_sign_rs256(private_key_pem: str, message: bytes) -> bytes:
     return result.stdout
 
 
-def _github_app_jwt(settings: GithubAppSettings) -> str:
+def _github_app_jwt(settings: GithubAppSettings, temp_root_dir: Path) -> str:
     now = int(time.time())
     payload = {
         "iat": now - 30,
@@ -2162,7 +2253,7 @@ def _github_app_jwt(settings: GithubAppSettings) -> str:
     header_segment = _base64url_encode(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode("utf-8"))
     payload_segment = _base64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     signing_input = f"{header_segment}.{payload_segment}".encode("ascii")
-    signature_segment = _base64url_encode(_github_sign_rs256(settings.private_key, signing_input))
+    signature_segment = _base64url_encode(_github_sign_rs256(settings.private_key, signing_input, temp_root_dir))
     return f"{header_segment}.{payload_segment}.{signature_segment}"
 
 
@@ -3865,50 +3956,97 @@ def _normalize_csv(value: str | None) -> str:
     return core_shared.normalize_csv(value)
 
 
-def _parse_non_negative_int_env(var_name: str, fallback: int) -> int:
-    raw = str(os.environ.get(var_name, "")).strip()
-    if not raw:
-        return int(fallback)
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"Invalid {var_name}: expected integer, got {raw!r}") from exc
-    if value < 0:
-        raise RuntimeError(f"Invalid {var_name}: expected non-negative integer, got {raw!r}")
-    return value
+@dataclass(frozen=True)
+class RuntimeIdentityEnvOverrides:
+    uid_raw: str = ""
+    gid_raw: str = ""
+    supplementary_gids: str = ""
+    shared_root: str = ""
+    username: str = ""
 
 
-def _resolve_hub_runtime_identity() -> tuple[int, int, str]:
-    host_uid_raw = str(os.environ.get(AGENT_HUB_HOST_UID_ENV, "")).strip()
-    host_gid_raw = str(os.environ.get(AGENT_HUB_HOST_GID_ENV, "")).strip()
-    host_supp_gids = _normalize_csv(str(os.environ.get(AGENT_HUB_HOST_SUPP_GIDS_ENV, "")))
+def _runtime_identity_env_overrides() -> RuntimeIdentityEnvOverrides:
+    return RuntimeIdentityEnvOverrides(
+        uid_raw=str(os.environ.get(AGENT_HUB_HOST_UID_ENV, "")).strip(),
+        gid_raw=str(os.environ.get(AGENT_HUB_HOST_GID_ENV, "")).strip(),
+        supplementary_gids=_normalize_csv(str(os.environ.get(AGENT_HUB_HOST_SUPP_GIDS_ENV, ""))),
+        shared_root=str(os.environ.get(AGENT_HUB_SHARED_ROOT_ENV, "")).strip(),
+        username=str(os.environ.get(AGENT_HUB_HOST_USER_ENV, "")).strip(),
+    )
+
+
+def _resolve_hub_runtime_identity(
+    runtime_config: AgentRuntimeConfig | None = None,
+    env_overrides: RuntimeIdentityEnvOverrides | None = None,
+) -> tuple[int, int, str]:
+    identity_config = core_identity.parse_runtime_identity_config(runtime_config)
+    host_supp_gids = env_overrides.supplementary_gids if env_overrides is not None else ""
+    default_supplementary = _default_supplementary_gids() if not host_supp_gids else host_supp_gids
+    if identity_config.uid_raw or identity_config.gid_raw:
+        uid, gid = core_identity.parse_configured_uid_gid(
+            identity_config,
+            error_factory=lambda message: IdentityError(message),
+        )
+        resolved_supplementary = identity_config.supplementary_gids or default_supplementary
+        assert uid is not None and gid is not None
+        return uid, gid, resolved_supplementary
+
+    host_uid_raw = env_overrides.uid_raw if env_overrides is not None else ""
+    host_gid_raw = env_overrides.gid_raw if env_overrides is not None else ""
     if host_uid_raw or host_gid_raw:
         if not host_uid_raw or not host_gid_raw:
-            raise RuntimeError(
+            raise IdentityError(
                 f"{AGENT_HUB_HOST_UID_ENV} and {AGENT_HUB_HOST_GID_ENV} must be set together."
             )
-        uid = _parse_non_negative_int_env(AGENT_HUB_HOST_UID_ENV, os.getuid())
-        gid = _parse_non_negative_int_env(AGENT_HUB_HOST_GID_ENV, os.getgid())
+        uid = core_identity.parse_non_negative_int_value(
+            host_uid_raw,
+            source_name=AGENT_HUB_HOST_UID_ENV,
+            error_factory=lambda message: IdentityError(message),
+        )
+        gid = core_identity.parse_non_negative_int_value(
+            host_gid_raw,
+            source_name=AGENT_HUB_HOST_GID_ENV,
+            error_factory=lambda message: IdentityError(message),
+        )
         return uid, gid, host_supp_gids
 
-    shared_root_raw = str(os.environ.get(AGENT_HUB_SHARED_ROOT_ENV, "")).strip()
+    shared_root_raw = identity_config.shared_root or (env_overrides.shared_root if env_overrides is not None else "")
     if shared_root_raw:
         try:
             metadata = Path(shared_root_raw).stat()
         except OSError as exc:
-            raise RuntimeError(
+            raise IdentityError(
                 f"Failed to stat {AGENT_HUB_SHARED_ROOT_ENV}={shared_root_raw!r}: {exc}"
             ) from exc
         return int(metadata.st_uid), int(metadata.st_gid), host_supp_gids
 
-    return os.getuid(), os.getgid(), (_default_supplementary_gids() if not host_supp_gids else host_supp_gids)
+    return os.getuid(), os.getgid(), default_supplementary
+
+
+def _resolve_hub_effective_run_mode(runtime_config: AgentRuntimeConfig | None) -> tuple[str, str]:
+    configured = DEFAULT_RUNTIME_RUN_MODE
+    if runtime_config is not None:
+        configured = str(runtime_config.runtime.run_mode or DEFAULT_RUNTIME_RUN_MODE).strip().lower()
+    configured = configured or DEFAULT_RUNTIME_RUN_MODE
+    effective = "docker" if configured == "auto" else configured
+    return configured, effective
+
+
+def _validate_hub_runtime_run_mode(runtime_config: AgentRuntimeConfig | None) -> None:
+    configured, effective = _resolve_hub_effective_run_mode(runtime_config)
+    if effective == "docker":
+        return
+    raise ConfigError(
+        "Agent Hub only supports effective docker runtime mode; "
+        f"set runtime.run_mode to 'docker' or 'auto' (configured={configured!r}, effective={effective!r})."
+    )
 
 
 def _parse_gid_csv(value: str) -> list[int]:
     return core_shared.parse_gid_csv(
         value,
-        strict=False,
-        error_factory=lambda message: RuntimeError(message),
+        strict=True,
+        error_factory=lambda message: IdentityError(message),
     )
 
 
@@ -4206,14 +4344,22 @@ def _signal_process_group_winch(pid: int) -> None:
         pass
 
 
-def _resolve_hub_runtime_username(uid: int) -> str:
-    configured = str(os.environ.get(AGENT_HUB_HOST_USER_ENV, "")).strip()
+def _resolve_hub_runtime_username(
+    uid: int,
+    runtime_config: AgentRuntimeConfig | None = None,
+    env_overrides: RuntimeIdentityEnvOverrides | None = None,
+) -> str:
+    if runtime_config is not None:
+        configured_identity_user = core_identity.parse_runtime_identity_config(runtime_config).username
+        if configured_identity_user:
+            return configured_identity_user
+    configured = env_overrides.username if env_overrides is not None else ""
     if configured:
         return configured
     try:
         return pwd.getpwuid(int(uid)).pw_name
     except (KeyError, ValueError) as exc:
-        raise RuntimeError(
+        raise IdentityError(
             "Host username resolution failed for runtime identity "
             f"(uid={uid}). Set {AGENT_HUB_HOST_USER_ENV}."
         ) from exc
@@ -4224,23 +4370,53 @@ class HubState:
         self,
         data_dir: Path,
         config_file: Path,
+        runtime_config: AgentRuntimeConfig | None = None,
+        runtime_identity_overrides: RuntimeIdentityEnvOverrides | None = None,
         system_prompt_file: Path | None = None,
         hub_host: str = DEFAULT_HOST,
         hub_port: int = DEFAULT_PORT,
         artifact_publish_base_url: str | None = None,
         ui_lifecycle_debug: bool = False,
     ):
-        self.local_uid, self.local_gid, self.local_supp_gids = _resolve_hub_runtime_identity()
-        self.local_user = _resolve_hub_runtime_username(self.local_uid)
+        self.runtime_config = runtime_config
+        if runtime_identity_overrides is not None:
+            self.runtime_identity_overrides = runtime_identity_overrides
+        elif self.runtime_config is None:
+            self.runtime_identity_overrides = _runtime_identity_env_overrides()
+        else:
+            self.runtime_identity_overrides = RuntimeIdentityEnvOverrides()
+        _validate_hub_runtime_run_mode(self.runtime_config)
+        self.local_uid, self.local_gid, self.local_supp_gids = _resolve_hub_runtime_identity(
+            self.runtime_config,
+            self.runtime_identity_overrides,
+        )
+        self.local_user = _resolve_hub_runtime_username(
+            self.local_uid,
+            self.runtime_config,
+            self.runtime_identity_overrides,
+        )
         self.local_umask = "0022"
-        self.host_agent_home = (Path.home() / ".agent-home" / self.local_user).resolve()
+        self.runtime_identity = core_identity.RuntimeIdentity(
+            username=self.local_user,
+            uid=int(self.local_uid),
+            gid=int(self.local_gid),
+            supplementary_gids=self.local_supp_gids,
+            umask=self.local_umask,
+        )
+        self.settings_service = SettingsService(
+            default_agent_type=DEFAULT_CHAT_AGENT_TYPE,
+            default_chat_layout_engine=DEFAULT_CHAT_LAYOUT_ENGINE,
+            normalize_chat_agent_type=_normalize_chat_agent_type,
+            normalize_chat_layout_engine=_normalize_chat_layout_engine,
+        )
+        self.data_dir = Path(data_dir).resolve()
+        self.host_agent_home = (self.data_dir / "agent-home" / self.local_user).resolve()
         self.host_codex_dir = self.host_agent_home / ".codex"
         self.agent_tools_mcp_runtime_script = (
             self.host_codex_dir / AGENT_TOOLS_MCP_RUNTIME_DIR_NAME / AGENT_TOOLS_MCP_RUNTIME_FILE_NAME
         )
         self.openai_codex_auth_file = self.host_codex_dir / OPENAI_CODEX_AUTH_FILE_NAME
 
-        self.data_dir = data_dir
         self.config_file = config_file
         self.system_prompt_file = Path(system_prompt_file or _default_system_prompt_file())
         self.hub_host = str(hub_host or DEFAULT_HOST)
@@ -4249,33 +4425,55 @@ class HubState:
             artifact_publish_base_url,
             self.hub_port,
         )
-        self.ui_lifecycle_debug = bool(ui_lifecycle_debug)
-        self.state_file = self.data_dir / STATE_FILE_NAME
-        self.agent_capabilities_cache_file = self.data_dir / AGENT_CAPABILITIES_CACHE_FILE_NAME
-        self.project_dir = self.data_dir / "projects"
-        self.chat_dir = self.data_dir / "chats"
-        self.log_dir = self.data_dir / "logs"
-        self.runtime_tmp_dir = self.data_dir / RUNTIME_TMP_ROOT_DIR_NAME
-        self.runtime_project_tmp_dir = self.runtime_tmp_dir / RUNTIME_TMP_PROJECTS_DIR_NAME
-        self.artifacts_dir = self.data_dir / ARTIFACT_STORAGE_DIR_NAME
-        self.chat_artifacts_dir = self.artifacts_dir / ARTIFACT_STORAGE_CHAT_DIR_NAME
-        self.session_artifacts_dir = self.artifacts_dir / ARTIFACT_STORAGE_SESSION_DIR_NAME
-        self.secrets_dir = self.data_dir / SECRETS_DIR_NAME
-        self.chat_runtime_configs_dir = self.data_dir / CHAT_RUNTIME_CONFIGS_DIR_NAME
-        self.openai_credentials_file = self.secrets_dir / OPENAI_CREDENTIALS_FILE_NAME
-        self.github_app_settings_file = self.secrets_dir / GITHUB_APP_SETTINGS_FILE_NAME
-        self.github_app_installation_file = self.secrets_dir / GITHUB_APP_INSTALLATION_FILE_NAME
-        self.github_tokens_file = self.secrets_dir / GITHUB_TOKENS_FILE_NAME
-        self.gitlab_tokens_file = self.secrets_dir / GITLAB_TOKENS_FILE_NAME
-        self.git_credentials_dir = self.secrets_dir / GIT_CREDENTIALS_DIR_NAME
-        self.github_app_settings: GithubAppSettings | None = None
-        self.github_app_settings_error = ""
+        self.auth_domain = AuthDomain(state=self)
+        self.auto_config_domain = AutoConfigDomain(state=self)
+        self.chat_runtime_domain = ChatRuntimeDomain(state=self)
+        self.credentials_domain = CredentialsDomain(state=self)
+        self.project_domain = ProjectDomain(state=self)
+        self.runtime_domain = RuntimeDomain(
+            runtime_factory=ChatRuntime,
+            is_process_running=lambda pid: _is_process_running(pid),
+            signal_process_group_winch=lambda pid: _signal_process_group_winch(pid),
+            chat_log_path=self.chat_log,
+            on_runtime_exit=lambda chat_id, exit_code: self._record_chat_runtime_exit(
+                chat_id,
+                exit_code,
+                reason="chat_runtime_reader_completed",
+            ),
+            collect_submitted_prompts=self._collect_submitted_prompts_from_input,
+            record_submitted_prompt=self._record_submitted_prompt,
+            terminal_queue_max=TERMINAL_QUEUE_MAX,
+            default_cols=DEFAULT_PTY_COLS,
+            default_rows=DEFAULT_PTY_ROWS,
+        )
+        # Back-compat aliases for existing tests and transitional callers.
+        self._runtime_lock = self.runtime_domain._runtime_lock
+        self._chat_runtimes = self.runtime_domain._chat_runtimes
+        self.auth_service = AuthService(
+            domain=self.auth_domain,
+            default_artifact_publish_host=DEFAULT_ARTIFACT_PUBLISH_HOST,
+            callback_forward_timeout_seconds=OPENAI_ACCOUNT_CALLBACK_FORWARD_TIMEOUT_SECONDS,
+        )
+        self.project_service = ProjectService(domain=self.project_domain)
+        self.chat_service = ChatService(domain=self.chat_runtime_domain)
+        self.runtime_service = RuntimeService(state=self)
+        self.credentials_service = CredentialsService(
+            domain=self.credentials_domain,
+            agent_tools_token_header=AGENT_TOOLS_TOKEN_HEADER,
+        )
+        self.artifacts_service = ArtifactsService(
+            state=self,
+            agent_tools_token_header=AGENT_TOOLS_TOKEN_HEADER,
+            artifact_token_header="x-agent-hub-artifact-token",
+        )
+        self.auto_config_service = AutoConfigService(domain=self.auto_config_domain)
+        self.app_state_service = AppStateService(state=self)
+        self.event_service = EventService(state=self)
+        self.lifecycle_service = LifecycleService(state=self)
         self._lock = Lock()
-        self._runtime_lock = Lock()
         self._events_lock = Lock()
         self._project_build_lock = Lock()
         self._project_build_threads: dict[str, Thread] = {}
-        self._chat_runtimes: dict[str, ChatRuntime] = {}
         self._event_listeners: set[queue.Queue[dict[str, Any] | None]] = set()
         self._openai_login_lock = Lock()
         self._openai_login_session: OpenAIAccountLoginSession | None = None
@@ -4301,6 +4499,33 @@ class HubState:
         self._auto_config_requests: dict[str, AutoConfigRequestState] = {}
         self._project_build_requests_lock = Lock()
         self._project_build_requests: dict[str, ProjectBuildRequestState] = {}
+        self.ui_lifecycle_debug = bool(ui_lifecycle_debug)
+        self.state_file = self.data_dir / STATE_FILE_NAME
+        self._state_store = HubStateStore(
+            state_file=self.state_file,
+            lock=self._lock,
+            new_state_factory=_new_state,
+        )
+        self._migrate_legacy_state_once()
+        self.agent_capabilities_cache_file = self.data_dir / AGENT_CAPABILITIES_CACHE_FILE_NAME
+        self.project_dir = self.data_dir / "projects"
+        self.chat_dir = self.data_dir / "chats"
+        self.log_dir = self.data_dir / "logs"
+        self.runtime_tmp_dir = self.data_dir / RUNTIME_TMP_ROOT_DIR_NAME
+        self.runtime_project_tmp_dir = self.runtime_tmp_dir / RUNTIME_TMP_PROJECTS_DIR_NAME
+        self.artifacts_dir = self.data_dir / ARTIFACT_STORAGE_DIR_NAME
+        self.chat_artifacts_dir = self.artifacts_dir / ARTIFACT_STORAGE_CHAT_DIR_NAME
+        self.session_artifacts_dir = self.artifacts_dir / ARTIFACT_STORAGE_SESSION_DIR_NAME
+        self.secrets_dir = self.data_dir / SECRETS_DIR_NAME
+        self.chat_runtime_configs_dir = self.data_dir / CHAT_RUNTIME_CONFIGS_DIR_NAME
+        self.openai_credentials_file = self.secrets_dir / OPENAI_CREDENTIALS_FILE_NAME
+        self.github_app_settings_file = self.secrets_dir / GITHUB_APP_SETTINGS_FILE_NAME
+        self.github_app_installation_file = self.secrets_dir / GITHUB_APP_INSTALLATION_FILE_NAME
+        self.github_tokens_file = self.secrets_dir / GITHUB_TOKENS_FILE_NAME
+        self.gitlab_tokens_file = self.secrets_dir / GITLAB_TOKENS_FILE_NAME
+        self.git_credentials_dir = self.secrets_dir / GIT_CREDENTIALS_DIR_NAME
+        self.github_app_settings: GithubAppSettings | None = None
+        self.github_app_settings_error = ""
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.project_dir.mkdir(parents=True, exist_ok=True)
         self.chat_dir.mkdir(parents=True, exist_ok=True)
@@ -4360,16 +4585,36 @@ class HubState:
         for project_id in rebuild_project_ids:
             self._schedule_project_build(project_id)
 
+    def _migrate_legacy_state_once(self) -> None:
+        raw_state = self._state_store.load_raw()
+        chats = raw_state.get("chats")
+        if not isinstance(chats, dict):
+            return
+        changed = False
+        for chat in chats.values():
+            if not isinstance(chat, dict):
+                continue
+            legacy_args = chat.get("codex_args")
+            current_args = chat.get("agent_args")
+            if isinstance(current_args, list):
+                normalized_args = [str(arg) for arg in current_args]
+                if normalized_args != current_args:
+                    chat["agent_args"] = normalized_args
+                    changed = True
+            elif isinstance(legacy_args, list):
+                chat["agent_args"] = [str(arg) for arg in legacy_args]
+                changed = True
+            else:
+                chat["agent_args"] = []
+                changed = True
+            if "codex_args" in chat:
+                chat.pop("codex_args", None)
+                changed = True
+        if changed:
+            self._state_store.save_raw(raw_state)
+
     def load(self) -> dict[str, Any]:
-        with self._lock:
-            if not self.state_file.exists():
-                return _new_state()
-            try:
-                loaded = json.loads(self.state_file.read_text())
-            except json.JSONDecodeError:
-                return _new_state()
-        if not isinstance(loaded, dict):
-            return _new_state()
+        loaded = self._state_store.load_raw()
         projects = loaded.get("projects")
         chats = loaded.get("chats")
         if not isinstance(projects, dict):
@@ -4380,20 +4625,19 @@ class HubState:
             "version": loaded.get("version", 1),
             "projects": projects,
             "chats": chats,
-            "settings": _normalize_hub_settings_payload(loaded.get("settings")),
+            "settings": self.settings_service.settings_payload(loaded),
         }
-        for chat in state["chats"].values():
+        state_needs_save = False
+        for chat_id, chat in state["chats"].items():
             if not isinstance(chat, dict):
                 continue
-            legacy_args = chat.get("codex_args")
             current_args = chat.get("agent_args")
             if isinstance(current_args, list):
                 chat["agent_args"] = [str(arg) for arg in current_args]
-            elif isinstance(legacy_args, list):
-                chat["agent_args"] = [str(arg) for arg in legacy_args]
             else:
                 chat["agent_args"] = []
-            chat["agent_type"] = _normalize_chat_agent_type(chat.get("agent_type"))
+                state_needs_save = True
+            chat["agent_type"] = _normalize_state_chat_agent_type(chat.get("agent_type"), chat_id=str(chat_id))
             chat["status"] = _normalize_chat_status(chat.get("status"))
             chat["status_reason"] = _compact_whitespace(str(chat.get("status_reason") or ""))
             chat["last_status_transition_at"] = str(
@@ -4432,6 +4676,8 @@ class HubState:
             ready_ack_meta = chat.get("ready_ack_meta")
             chat["ready_ack_meta"] = ready_ack_meta if isinstance(ready_ack_meta, dict) else {}
             chat["create_request_id"] = _compact_whitespace(str(chat.get("create_request_id") or "")).strip()
+        if state_needs_save:
+            self.save(state, reason="state_migrate_legacy_codex_args")
         return state
 
     @staticmethod
@@ -4696,7 +4942,7 @@ class HubState:
             return self._agent_capabilities_payload_locked()
 
     def _discover_agent_capabilities_for_type(self, agent_type: str, previous: dict[str, Any]) -> dict[str, Any]:
-        resolved_type = _normalize_chat_agent_type(agent_type)
+        resolved_type = _normalize_chat_agent_type(agent_type, strict=True)
         commands = AGENT_CAPABILITY_DISCOVERY_COMMANDS_BY_TYPE.get(resolved_type, ())
         probe_run_args = _agent_capability_probe_docker_run_args(
             local_uid=self.local_uid,
@@ -4926,9 +5172,7 @@ class HubState:
         }
 
     def save(self, state: dict[str, Any], reason: str = "") -> None:
-        with self._lock:
-            with self.state_file.open("w", encoding="utf-8") as fp:
-                json.dump(state, fp, indent=2)
+        self._state_store.save_raw(state)
         self._emit_state_changed(reason=reason)
 
     def _transition_chat_status(
@@ -5046,7 +5290,7 @@ class HubState:
 
     def settings_payload(self) -> dict[str, Any]:
         state = self.load()
-        return _normalize_hub_settings_payload(state.get("settings"))
+        return self.settings_service.settings_payload(state)
 
     def runtime_flags_payload(self) -> dict[str, Any]:
         return {
@@ -5058,43 +5302,8 @@ class HubState:
         return str(settings.get("default_agent_type") or DEFAULT_CHAT_AGENT_TYPE)
 
     def update_settings(self, update: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(update, dict):
-            raise HTTPException(status_code=400, detail="Invalid settings payload.")
-        has_default_agent_type = "default_agent_type" in update or "defaultAgentType" in update
-        has_chat_layout_engine = "chat_layout_engine" in update or "chatLayoutEngine" in update
-        has_git_user_name = "git_user_name" in update or "gitUserName" in update
-        has_git_user_email = "git_user_email" in update or "gitUserEmail" in update
-        if not has_default_agent_type and not has_chat_layout_engine and not has_git_user_name and not has_git_user_email:
-            raise HTTPException(status_code=400, detail="No settings values provided.")
         state = self.load()
-        settings = _normalize_hub_settings_payload(state.get("settings"))
-        if has_default_agent_type:
-            settings["default_agent_type"] = _normalize_chat_agent_type(
-                update.get("default_agent_type", update.get("defaultAgentType")),
-                strict=True,
-            )
-        if has_chat_layout_engine:
-            settings["chat_layout_engine"] = _normalize_chat_layout_engine(
-                update.get("chat_layout_engine", update.get("chatLayoutEngine")),
-                strict=True,
-            )
-        if has_git_user_name:
-            settings["git_user_name"] = _normalize_git_identity_setting(
-                update.get("git_user_name", update.get("gitUserName")),
-                field_name="git_user_name",
-                strict=True,
-            )
-        if has_git_user_email:
-            settings["git_user_email"] = _normalize_git_identity_setting(
-                update.get("git_user_email", update.get("gitUserEmail")),
-                field_name="git_user_email",
-                strict=True,
-            )
-        if bool(settings["git_user_name"]) != bool(settings["git_user_email"]):
-            raise HTTPException(
-                status_code=400,
-                detail="git_user_name and git_user_email must both be set or both be empty.",
-            )
+        settings = self.settings_service.update_settings(state, update)
         state["settings"] = settings
         self.save(state, reason="settings_updated")
         return settings
@@ -5959,7 +6168,7 @@ class HubState:
             "User-Agent": "agent-hub",
         }
         if auth_mode == "app":
-            headers["Authorization"] = f"Bearer {_github_app_jwt(settings)}"
+            headers["Authorization"] = f"Bearer {_github_app_jwt(settings, self.secrets_dir / 'tmp')}"
         elif auth_mode == "installation":
             resolved_token = str(token or "").strip()
             if not resolved_token:
@@ -7367,6 +7576,11 @@ class HubState:
         del workspace
         return int(self.local_uid), int(self.local_gid), self.local_supp_gids
 
+    def _runtime_run_mode(self) -> str:
+        if self.runtime_config is None:
+            return DEFAULT_RUNTIME_RUN_MODE
+        return str(self.runtime_config.runtime.run_mode or DEFAULT_RUNTIME_RUN_MODE)
+
     def _prepare_agent_cli_command(
         self,
         *,
@@ -7374,6 +7588,7 @@ class HubState:
         container_project_name: str,
         runtime_config_file: Path,
         agent_type: str,
+        run_mode: str,
         agent_tools_url: str,
         agent_tools_token: str,
         agent_tools_project_id: str = "",
@@ -7397,44 +7612,11 @@ class HubState:
         runtime_tmp_mount: str = "",
     ) -> list[str]:
         runtime_uid, runtime_gid, runtime_supp_gids = self._runtime_identity_for_workspace(workspace)
-        agent_command = AGENT_COMMAND_BY_TYPE.get(agent_type, AGENT_COMMAND_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE])
-        cmd = [
-            "uv",
-            "run",
-            "--project",
-            str(_repo_root()),
-            "agent_cli",
-            "--agent-command",
-            agent_command,
-            "--project",
-            str(workspace),
-            "--container-project-name",
-            container_project_name,
-            "--agent-home-path",
-            str(self.host_agent_home),
-            "--config-file",
-            str(runtime_config_file),
-            "--system-prompt-file",
-            str(self.system_prompt_file),
-            "--local-uid",
-            str(runtime_uid),
-            "--local-gid",
-            str(runtime_gid),
-            "--bootstrap-as-root",
-            "--local-user",
-            self.local_user,
-            "--no-alt-screen",
-        ]
-        if runtime_supp_gids:
-            cmd.extend(["--local-supplementary-gids", runtime_supp_gids])
-        if not allocate_tty:
-            cmd.append("--no-tty")
-        if resume and agent_type == AGENT_TYPE_CODEX:
-            cmd.append("--resume")
-        cmd.extend(self._openai_credentials_arg())
+        normalized_agent_type = _normalize_chat_agent_type(agent_type, strict=True)
+        agent_command = _agent_command_for_type(normalized_agent_type)
+        project_base_args: list[str] = []
         if snapshot_tag:
-            self._append_project_base_args(cmd, workspace, project)
-            cmd.extend(["--snapshot-image-tag", snapshot_tag])
+            self._append_project_base_args(project_base_args, workspace, project)
 
         normalized_ro_mounts = [str(mount) for mount in (ro_mounts or []) if str(mount or "").strip()]
         normalized_rw_mounts = [str(mount) for mount in (rw_mounts or []) if str(mount or "").strip()]
@@ -7447,53 +7629,58 @@ class HubState:
             if not has_workspace_tmp_mount:
                 normalized_rw_mounts.append(f"{normalized_runtime_tmp_mount}:{DEFAULT_CONTAINER_TMP_DIR}")
 
-        for mount in normalized_ro_mounts:
-            cmd.extend(["--ro-mount", mount])
-        for mount in normalized_rw_mounts:
-            cmd.extend(["--rw-mount", mount])
-
-        if setup_script:
-            cmd.extend(["--setup-script", setup_script])
-        if prepare_snapshot_only:
-            cmd.append("--prepare-snapshot-only")
-        if project_in_image:
-            cmd.append("--project-in-image")
-
+        command_env_vars: list[str] = []
         if artifacts_url:
-            cmd.extend(["--env-var", f"AGENT_ARTIFACTS_URL={artifacts_url}"])
+            command_env_vars.append(f"AGENT_ARTIFACTS_URL={artifacts_url}")
         if artifacts_token:
-            cmd.extend(["--env-var", f"AGENT_ARTIFACT_TOKEN={artifacts_token}"])
+            command_env_vars.append(f"AGENT_ARTIFACT_TOKEN={artifacts_token}")
 
-        cmd.extend(["--env-var", f"{AGENT_TOOLS_URL_ENV}={agent_tools_url}"])
-        cmd.extend(["--env-var", f"{AGENT_TOOLS_TOKEN_ENV}={agent_tools_token}"])
-        cmd.extend(["--env-var", f"{AGENT_TOOLS_PROJECT_ID_ENV}={agent_tools_project_id}"])
-        cmd.extend(["--env-var", f"{AGENT_TOOLS_CHAT_ID_ENV}={agent_tools_chat_id}"])
+        command_env_vars.append(f"{AGENT_TOOLS_URL_ENV}={agent_tools_url}")
+        command_env_vars.append(f"{AGENT_TOOLS_TOKEN_ENV}={agent_tools_token}")
+        command_env_vars.append(f"{AGENT_TOOLS_PROJECT_ID_ENV}={agent_tools_project_id}")
+        command_env_vars.append(f"{AGENT_TOOLS_CHAT_ID_ENV}={agent_tools_chat_id}")
         if normalized_runtime_tmp_mount:
-            cmd.extend(["--env-var", f"{AGENT_HUB_TMP_HOST_PATH_ENV}={normalized_runtime_tmp_mount}"])
+            command_env_vars.append(f"{AGENT_HUB_TMP_HOST_PATH_ENV}={normalized_runtime_tmp_mount}")
         normalized_ready_ack_guid = str(ready_ack_guid or "").strip()
         if normalized_ready_ack_guid:
-            cmd.extend(["--env-var", f"{AGENT_TOOLS_READY_ACK_GUID_ENV}={normalized_ready_ack_guid}"])
+            command_env_vars.append(f"{AGENT_TOOLS_READY_ACK_GUID_ENV}={normalized_ready_ack_guid}")
         for env_entry in self._git_identity_env_vars_from_settings():
-            cmd.extend(["--env-var", env_entry])
+            command_env_vars.append(env_entry)
 
         for env_entry in env_vars or []:
             if _is_reserved_env_entry(str(env_entry)):
                 continue
             if str(env_entry).split("=", 1)[0].strip() == AGENT_HUB_TMP_HOST_PATH_ENV:
                 continue
-            cmd.extend(["--env-var", env_entry])
+            command_env_vars.append(str(env_entry))
 
-        if extra_args:
-            cmd.append("--")
-            cmd.extend(extra_args)
-        return cmd
-
-    @staticmethod
-    def _extract_container_args_from_command(cmd: list[str]) -> list[str]:
-        for index, token in enumerate(cmd):
-            if token == "--":
-                return [str(item) for item in cmd[index + 1 :]]
-        return []
+        spec = core_launch.LaunchSpec(
+            repo_root=_repo_root(),
+            workspace=workspace,
+            container_project_name=container_project_name,
+            agent_home_path=self.host_agent_home,
+            runtime_config_file=runtime_config_file,
+            system_prompt_file=self.system_prompt_file,
+            agent_command=agent_command,
+            run_mode=str(run_mode),
+            local_uid=int(runtime_uid),
+            local_gid=int(runtime_gid),
+            local_user=self.local_user,
+            local_supplementary_gids=runtime_supp_gids,
+            allocate_tty=allocate_tty,
+            resume=bool(resume and normalized_agent_type == AGENT_TYPE_CODEX),
+            snapshot_tag=str(snapshot_tag or ""),
+            ro_mounts=tuple(normalized_ro_mounts),
+            rw_mounts=tuple(normalized_rw_mounts),
+            env_vars=tuple(command_env_vars),
+            extra_args=tuple(str(arg) for arg in (extra_args or [])),
+            openai_credentials_args=tuple(self._openai_credentials_arg()),
+            base_args=tuple(project_base_args),
+            setup_script=str(setup_script or ""),
+            prepare_snapshot_only=prepare_snapshot_only,
+            project_in_image=project_in_image,
+        )
+        return core_launch.compile_agent_cli_command(spec)
 
     def _launch_profile_from_command(
         self,
@@ -7511,10 +7698,8 @@ class HubState:
         if snapshot_tag:
             runtime_image = str(snapshot_tag)
             if prepare_snapshot_only:
-                try:
-                    runtime_image = str(agent_cli_image._snapshot_setup_runtime_image_for_snapshot(snapshot_tag))
-                except Exception:
-                    runtime_image = str(snapshot_tag)
+                runtime_image = str(agent_cli_image._snapshot_setup_runtime_image_for_snapshot(snapshot_tag))
+        parsed = core_launch.parse_compiled_agent_cli_command(command)
 
         return {
             "mode": str(mode or "").strip(),
@@ -7522,14 +7707,14 @@ class HubState:
             "workspace": str(workspace),
             "runtime_config_file": str(runtime_config_file),
             "container_project_name": str(container_project_name),
-            "agent_type": _normalize_chat_agent_type(agent_type),
+            "agent_type": _normalize_chat_agent_type(agent_type, strict=True),
             "snapshot_tag": str(snapshot_tag or ""),
             "runtime_image": runtime_image,
             "prepare_snapshot_only": bool(prepare_snapshot_only),
-            "ro_mounts": _cli_option_values(command, long_option="--ro-mount"),
-            "rw_mounts": _cli_option_values(command, long_option="--rw-mount"),
-            "env_vars": _cli_option_values(command, long_option="--env-var"),
-            "container_args": self._extract_container_args_from_command(command),
+            "ro_mounts": list(parsed.ro_mounts),
+            "rw_mounts": list(parsed.rw_mounts),
+            "env_vars": list(parsed.env_vars),
+            "container_args": list(parsed.container_args),
             "command": [str(item) for item in command],
         }
 
@@ -7553,6 +7738,7 @@ class HubState:
             container_project_name=_container_project_name(project_for_launch.get("name") or project_for_launch.get("id")),
             runtime_config_file=self.config_file,
             agent_type=DEFAULT_CHAT_AGENT_TYPE,
+            run_mode=self._runtime_run_mode(),
             agent_tools_url=f"{self.artifact_publish_base_url}/api/projects/{resolved_project_id}/agent-tools",
             agent_tools_token="snapshot-token",
             agent_tools_project_id=resolved_project_id,
@@ -7609,7 +7795,7 @@ class HubState:
         workspace = self._ensure_chat_clone(chat, project)
         self._sync_checkout_to_remote(workspace, project)
         container_project_name = _container_project_name(project.get("name") or project.get("id"))
-        agent_type = _normalize_chat_agent_type(chat.get("agent_type"))
+        agent_type = _normalize_chat_agent_type(chat.get("agent_type"), strict=True)
         runtime_config_file = self._prepare_chat_runtime_config(
             chat_id,
             agent_type=agent_type,
@@ -7634,6 +7820,7 @@ class HubState:
             container_project_name=container_project_name,
             runtime_config_file=runtime_config_file,
             agent_type=agent_type,
+            run_mode=self._runtime_run_mode(),
             agent_tools_url=self._chat_agent_tools_url(chat_id),
             agent_tools_token=agent_tools_token,
             agent_tools_project_id=str(project.get("id") or ""),
@@ -7743,6 +7930,7 @@ class HubState:
             container_project_name=container_project_name,
             runtime_config_file=runtime_config_file,
             agent_type=resolved_agent_type,
+            run_mode=self._runtime_run_mode(),
             agent_tools_url=agent_tools_url,
             agent_tools_token=session_token,
             agent_tools_project_id="",
@@ -7862,7 +8050,10 @@ class HubState:
         validation_error = _project_repo_url_validation_error(normalized_repo_url)
         if validation_error:
             raise HTTPException(status_code=400, detail=validation_error)
-        resolved_agent_type = _normalize_chat_agent_type(agent_type)
+        resolved_agent_type = _resolve_optional_chat_agent_type(
+            agent_type,
+            default_value=self.default_chat_agent_type(),
+        )
         if agent_args is None:
             normalized_agent_args: list[str] = []
         elif isinstance(agent_args, list):
@@ -8621,221 +8812,22 @@ class HubState:
 
         if not query:
             raise HTTPException(status_code=400, detail="Missing callback query parameters.")
-
-        callback_query_summary = _openai_callback_query_summary(query)
-        normalized_context = dict(request_context or {})
-
-        candidate_hosts: list[str] = ["127.0.0.1", "localhost"]
-        normalized_request_host = _normalize_callback_forward_host(request_host)
-        if not normalized_request_host:
-            normalized_request_host = _normalize_callback_forward_host(normalized_context.get("client_host") or "")
-        if normalized_request_host and normalized_request_host not in candidate_hosts:
-            candidate_hosts.append(normalized_request_host)
-
-        forwarded_host = _normalize_callback_forward_host(normalized_context.get("forwarded_host") or "")
-        if forwarded_host and forwarded_host not in candidate_hosts:
-            candidate_hosts.append(forwarded_host)
-        x_forwarded_host = _normalize_callback_forward_host(normalized_context.get("x_forwarded_host") or "")
-        if x_forwarded_host and x_forwarded_host not in candidate_hosts:
-            candidate_hosts.append(x_forwarded_host)
-        host_header_host = _normalize_callback_forward_host(normalized_context.get("host_header_host") or "")
-        if host_header_host and host_header_host not in candidate_hosts:
-            candidate_hosts.append(host_header_host)
-
-        artifact_publish_host = _normalize_callback_forward_host(
-            urllib.parse.urlsplit(str(self.artifact_publish_base_url or "")).hostname or ""
-        )
-        if artifact_publish_host and artifact_publish_host not in candidate_hosts:
-            candidate_hosts.append(artifact_publish_host)
-        if DEFAULT_ARTIFACT_PUBLISH_HOST not in candidate_hosts:
-            candidate_hosts.append(DEFAULT_ARTIFACT_PUBLISH_HOST)
-        try:
-            resolved_default_host = _normalize_callback_forward_host(
-                socket.gethostbyname(DEFAULT_ARTIFACT_PUBLISH_HOST)
-            )
-            if resolved_default_host and resolved_default_host not in candidate_hosts:
-                candidate_hosts.append(resolved_default_host)
-        except OSError:
-            pass
-        bridge_hosts, bridge_diagnostics = _discover_openai_callback_bridge_hosts()
-        for bridge_host in bridge_hosts:
-            if bridge_host not in candidate_hosts:
-                candidate_hosts.append(bridge_host)
-
-        LOGGER.info(
-            (
-                "OpenAI callback forward resolution "
-                "session_id=%s container=%s callback_path=%s callback_port=%s "
-                "callback_query=%s request_context=%s bridge_routing=%s candidate_hosts=%s"
-            ),
-            session.id,
-            session.container_name,
-            callback_path,
-            callback_port,
-            json.dumps(callback_query_summary, sort_keys=True),
-            json.dumps(
-                {
-                    "client_host": normalized_context.get("client_host") or "",
-                    "forwarded_host": forwarded_host,
-                    "forwarded_proto": normalized_context.get("forwarded_proto") or "",
-                    "forwarded_port": normalized_context.get("forwarded_host_port"),
-                    "x_forwarded_host": x_forwarded_host,
-                    "x_forwarded_proto": normalized_context.get("x_forwarded_proto") or "",
-                    "x_forwarded_port": normalized_context.get("x_forwarded_port"),
-                    "host_header_host": host_header_host,
-                    "host_header_port": normalized_context.get("host_header_port"),
-                },
-                sort_keys=True,
-            ),
-            json.dumps(bridge_diagnostics, sort_keys=True),
-            ", ".join(candidate_hosts),
-        )
-
-        status_code = 0
-        response_body = ""
-        target_origin = ""
-        last_exc: BaseException | None = None
-        failure_categories: list[str] = []
-        forwarded_successfully = False
-
-        LOGGER.info(
-            (
-                "OpenAI callback forward attempting container loopback primary "
-                "session_id=%s container=%s target=http://127.0.0.1:%s%s"
-            ),
-            session.id,
-            session.container_name,
-            callback_port,
-            callback_path,
-        )
-        container_fallback = _forward_openai_callback_via_container_loopback(
-            session.container_name,
+        callback_result = self.auth_service.forward_openai_account_callback(
+            session=session,
             callback_port=callback_port,
             callback_path=callback_path,
             query=query,
+            artifact_publish_base_url=self.artifact_publish_base_url,
+            request_host=request_host,
+            request_context=request_context,
+            discover_bridge_hosts=_discover_openai_callback_bridge_hosts,
+            normalize_host=_normalize_callback_forward_host,
+            callback_query_summary=_openai_callback_query_summary,
+            redact_url_query_values=_redact_url_query_values,
+            host_port_netloc=_host_port_netloc,
+            classify_callback_error=_classify_openai_callback_forward_error,
+            logger=LOGGER,
         )
-        if container_fallback.ok:
-            status_code = int(container_fallback.status_code or 0)
-            response_body = container_fallback.response_body
-            target_origin = f"container://{session.container_name}/127.0.0.1:{callback_port}"
-            forwarded_successfully = True
-            LOGGER.info(
-                (
-                    "OpenAI callback forward container loopback response session_id=%s "
-                    "container=%s status=%s error_class=none"
-                ),
-                session.id,
-                session.container_name,
-                status_code,
-            )
-        elif container_fallback.attempted:
-            error_class = str(container_fallback.error_class or "container_exec_failed")
-            failure_categories.append(error_class)
-            LOGGER.warning(
-                (
-                    "OpenAI callback forward container loopback error session_id=%s "
-                    "container=%s error_class=%s detail=%s"
-                ),
-                session.id,
-                session.container_name,
-                error_class,
-                container_fallback.error_detail,
-            )
-        else:
-            LOGGER.info(
-                (
-                    "OpenAI callback forward container loopback skipped "
-                    "session_id=%s container=%s reason=%s"
-                ),
-                session.id,
-                session.container_name,
-                container_fallback.error_class or "not_attempted",
-            )
-
-        for candidate_host in candidate_hosts:
-            if forwarded_successfully:
-                break
-            target_url = urllib.parse.urlunparse(
-                ("http", _host_port_netloc(candidate_host, callback_port), callback_path, "", query, "")
-            )
-            redacted_target_url = _redact_url_query_values(target_url)
-            request = urllib.request.Request(target_url, method="GET")
-            LOGGER.info(
-                "OpenAI callback forward upstream request session_id=%s target=%s timeout_sec=%.1f",
-                session.id,
-                redacted_target_url,
-                OPENAI_ACCOUNT_CALLBACK_FORWARD_TIMEOUT_SECONDS,
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=OPENAI_ACCOUNT_CALLBACK_FORWARD_TIMEOUT_SECONDS) as response:
-                    status_code = int(response.getcode() or 0)
-                    response_body = response.read().decode("utf-8", errors="ignore")
-                target_origin = f"http://{_host_port_netloc(candidate_host, callback_port)}"
-                LOGGER.info(
-                    "OpenAI callback forward upstream response session_id=%s target=%s status=%s error_class=none",
-                    session.id,
-                    redacted_target_url,
-                    status_code,
-                )
-                forwarded_successfully = True
-                break
-            except urllib.error.HTTPError as exc:
-                status_code = int(exc.code or 0)
-                response_body = exc.read().decode("utf-8", errors="ignore")
-                target_origin = f"http://{_host_port_netloc(candidate_host, callback_port)}"
-                LOGGER.warning(
-                    (
-                        "OpenAI callback forward upstream response session_id=%s target=%s "
-                        "status=%s error_class=http_error"
-                    ),
-                    session.id,
-                    redacted_target_url,
-                    status_code,
-                )
-                forwarded_successfully = True
-                break
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                last_exc = exc
-                error_class = _classify_openai_callback_forward_error(exc)
-                failure_categories.append(error_class)
-                LOGGER.warning(
-                    (
-                        "OpenAI callback forward upstream error session_id=%s target=%s "
-                        "error_class=%s error_type=%s detail=%s"
-                    ),
-                    session.id,
-                    redacted_target_url,
-                    error_class,
-                    type(exc).__name__,
-                    str(exc),
-                )
-                continue
-
-        if not forwarded_successfully:
-            attempted = ", ".join(f"http://{_host_port_netloc(host, callback_port)}" for host in candidate_hosts)
-            if session.container_name:
-                attempted = f"{attempted}, container://{session.container_name}/127.0.0.1:{callback_port}"
-            failure_reason = "all_upstream_targets_failed"
-            if failure_categories:
-                failure_reason = "+".join(sorted(set(failure_categories)))
-            LOGGER.error(
-                (
-                    "OpenAI callback forward failed session_id=%s failure_reason=%s "
-                    "attempted_origins=%s callback_path=%s callback_query=%s"
-                ),
-                session.id,
-                failure_reason,
-                attempted,
-                callback_path,
-                json.dumps(callback_query_summary, sort_keys=True),
-            )
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Failed to forward OAuth callback to login container. "
-                    f"Reason: {failure_reason}. Attempted: {attempted}"
-                ),
-            ) from last_exc
 
         with self._openai_login_lock:
             current = self._openai_login_session
@@ -8854,18 +8846,22 @@ class HubState:
                 "status=%s response_summary_present=%s"
             ),
             session.id,
-            target_origin,
+            callback_result.target_origin,
             callback_path,
-            status_code,
-            bool(response_body),
+            callback_result.status_code,
+            bool(callback_result.response_body),
         )
 
         return {
             "forwarded": True,
-            "status_code": status_code,
-            "target_origin": target_origin,
+            "status_code": callback_result.status_code,
+            "target_origin": callback_result.target_origin,
             "target_path": callback_path,
-            "response_summary": _short_summary(ANSI_ESCAPE_RE.sub("", response_body), max_words=28, max_chars=220),
+            "response_summary": _short_summary(
+                ANSI_ESCAPE_RE.sub("", callback_result.response_body),
+                max_words=28,
+                max_chars=220,
+            ),
         }
 
     def chat_workdir(self, chat_id: str) -> Path:
@@ -10475,7 +10471,10 @@ class HubState:
             "rw_mounts": rw_mounts,
             "env_vars": env_vars,
             "agent_args": agent_args or [],
-            "agent_type": _normalize_chat_agent_type(agent_type),
+            "agent_type": _resolve_optional_chat_agent_type(
+                agent_type,
+                default_value=self.default_chat_agent_type(),
+            ),
             "status": CHAT_STATUS_STOPPED,
             "status_reason": CHAT_STATUS_REASON_CHAT_CREATED,
             "last_status_transition_at": now,
@@ -10536,9 +10535,13 @@ class HubState:
         resolved_agent_type = (
             self.default_chat_agent_type()
             if agent_type is None
-            else _normalize_chat_agent_type(agent_type)
+            else _normalize_chat_agent_type(agent_type, strict=True)
         )
-        normalized_agent_args = _apply_default_model_for_agent(resolved_agent_type, normalized_agent_args)
+        normalized_agent_args = _apply_default_model_for_agent(
+            resolved_agent_type,
+            normalized_agent_args,
+            self.runtime_config,
+        )
         normalized_request_id = _compact_whitespace(str(request_id or "")).strip()
         if normalized_request_id:
             existing_chat = self._chat_for_create_request(
@@ -10620,7 +10623,7 @@ class HubState:
             if field not in patch:
                 continue
             if field == "agent_type":
-                chat[field] = _normalize_chat_agent_type(patch[field])
+                chat[field] = _normalize_chat_agent_type(patch[field], strict=True)
                 continue
             chat[field] = patch[field]
 
@@ -10702,38 +10705,13 @@ class HubState:
 
     @staticmethod
     def _queue_put(listener: queue.Queue[str | None], value: str | None) -> None:
-        try:
-            listener.put_nowait(value)
-            return
-        except queue.Full:
-            pass
-
-        try:
-            listener.get_nowait()
-        except queue.Empty:
-            return
-
-        try:
-            listener.put_nowait(value)
-        except queue.Full:
-            return
+        RuntimeDomain.queue_put(listener, value)
 
     def _pop_runtime(self, chat_id: str) -> ChatRuntime | None:
-        with self._runtime_lock:
-            return self._chat_runtimes.pop(chat_id, None)
+        return self.runtime_domain._pop_runtime(chat_id)  # type: ignore[return-value]
 
     def _close_runtime(self, chat_id: str) -> None:
-        runtime = self._pop_runtime(chat_id)
-        if runtime is None:
-            return
-        listeners = list(runtime.listeners)
-        runtime.listeners.clear()
-        try:
-            os.close(runtime.master_fd)
-        except OSError:
-            pass
-        for listener in listeners:
-            self._queue_put(listener, None)
+        self.runtime_domain.close_runtime(chat_id)
 
     def _runtime_for_chat(self, chat_id: str) -> ChatRuntime | None:
         with self._runtime_lock:
@@ -10746,118 +10724,23 @@ class HubState:
         return None
 
     def _broadcast_runtime_output(self, chat_id: str, text: str) -> None:
-        if not text:
-            return
-        with self._runtime_lock:
-            runtime = self._chat_runtimes.get(chat_id)
-            listeners = list(runtime.listeners) if runtime else []
-        for listener in listeners:
-            self._queue_put(listener, text)
+        self.runtime_domain._broadcast_runtime_output(chat_id, text)
 
     def _runtime_reader_loop(self, chat_id: str, master_fd: int, log_path: Path) -> None:
-        decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            with log_path.open("ab") as log_file:
-                while True:
-                    try:
-                        chunk = os.read(master_fd, 4096)
-                    except OSError:
-                        break
-                    if not chunk:
-                        break
-                    log_file.write(chunk)
-                    log_file.flush()
-                    decoded = decoder.decode(chunk)
-                    if decoded:
-                        self._broadcast_runtime_output(chat_id, decoded)
-                tail = decoder.decode(b"", final=True)
-                if tail:
-                    self._broadcast_runtime_output(chat_id, tail)
-        finally:
-            runtime = self._pop_runtime(chat_id)
-            listeners = list(runtime.listeners) if runtime else []
-            exit_code: int | None = None
-            if runtime:
-                polled_exit_code = runtime.process.poll()
-                if isinstance(polled_exit_code, int):
-                    exit_code = polled_exit_code
-                runtime.listeners.clear()
-            try:
-                os.close(master_fd)
-            except OSError:
-                pass
-            for listener in listeners:
-                self._queue_put(listener, None)
-            if runtime is not None:
-                self._record_chat_runtime_exit(
-                    chat_id,
-                    exit_code,
-                    reason="chat_runtime_reader_completed",
-                )
+        self.runtime_domain._runtime_reader_loop(chat_id, master_fd, log_path)
 
     def _register_runtime(self, chat_id: str, process: subprocess.Popen, master_fd: int) -> None:
-        previous = self._pop_runtime(chat_id)
-        if previous is not None:
-            try:
-                os.close(previous.master_fd)
-            except OSError:
-                pass
-            for listener in list(previous.listeners):
-                self._queue_put(listener, None)
-
-        with self._runtime_lock:
-            self._chat_runtimes[chat_id] = ChatRuntime(process=process, master_fd=master_fd)
-
-        reader_thread = Thread(
-            target=self._runtime_reader_loop,
-            args=(chat_id, master_fd, self.chat_log(chat_id)),
-            daemon=True,
-        )
-        reader_thread.start()
+        self.runtime_domain._register_runtime(chat_id, process, master_fd)
 
     def _spawn_chat_process(self, chat_id: str, cmd: list[str]) -> subprocess.Popen:
-        master_fd, slave_fd = os.openpty()
-        try:
-            self._set_terminal_size(slave_fd, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS)
-            proc = subprocess.Popen(
-                cmd,
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                close_fds=True,
-                start_new_session=True,
-            )
-        except Exception:
-            try:
-                os.close(master_fd)
-            except OSError:
-                pass
-            try:
-                os.close(slave_fd)
-            except OSError:
-                pass
-            raise
-
-        try:
-            os.close(slave_fd)
-        except OSError:
-            pass
-
-        self._register_runtime(chat_id, proc, master_fd)
-        return proc
+        return self.runtime_domain.spawn_chat_process(chat_id, cmd)  # type: ignore[return-value]
 
     @staticmethod
     def _set_terminal_size(fd: int, cols: int, rows: int) -> None:
-        safe_cols = max(1, int(cols))
-        safe_rows = max(1, int(rows))
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", safe_rows, safe_cols, 0, 0))
+        RuntimeDomain._set_terminal_size(fd, cols, rows)
 
     def _chat_log_history(self, chat_id: str) -> str:
-        log_path = self.chat_log(chat_id)
-        if not log_path.exists():
-            return ""
-        return log_path.read_text(encoding="utf-8", errors="ignore")
+        return self.runtime_domain._chat_log_history(chat_id)
 
     def attach_terminal(self, chat_id: str) -> tuple[queue.Queue[str | None], str]:
         runtime = self._runtime_for_chat(chat_id)
@@ -11419,8 +11302,7 @@ class HubState:
         self.cancel_openai_account_login()
         state = self.load()
 
-        with self._runtime_lock:
-            runtime_ids = list(self._chat_runtimes.keys())
+        runtime_ids = self.runtime_domain.runtime_ids()
         for chat_id in runtime_ids:
             self._close_runtime(chat_id)
 
@@ -11473,8 +11355,7 @@ class HubState:
 
     def shutdown(self) -> dict[str, int]:
         self.cancel_openai_account_login()
-        with self._runtime_lock:
-            runtime_ids = list(self._chat_runtimes.keys())
+        runtime_ids = self.runtime_domain.runtime_ids()
         for chat_id in runtime_ids:
             self._close_runtime(chat_id)
 
@@ -11662,6 +11543,7 @@ class HubState:
             container_project_name=_container_project_name(project.get("name") or project.get("id")),
             runtime_config_file=self.config_file,
             agent_type=DEFAULT_CHAT_AGENT_TYPE,
+            run_mode=self._runtime_run_mode(),
             agent_tools_url=f"{self.artifact_publish_base_url}/api/projects/{resolved_project_id}/agent-tools",
             agent_tools_token="snapshot-token",
             agent_tools_project_id=resolved_project_id,
@@ -11819,7 +11701,10 @@ class HubState:
             chat_copy["ro_mounts"] = list(chat_copy.get("ro_mounts") or [])
             chat_copy["rw_mounts"] = list(chat_copy.get("rw_mounts") or [])
             chat_copy["env_vars"] = list(chat_copy.get("env_vars") or [])
-            chat_copy["agent_type"] = _normalize_chat_agent_type(chat_copy.get("agent_type"))
+            chat_copy["agent_type"] = _normalize_state_chat_agent_type(
+                chat_copy.get("agent_type"),
+                chat_id=str(chat_id),
+            )
             chat_copy["setup_snapshot_image"] = str(chat_copy.get("setup_snapshot_image") or "")
             cleaned_artifacts = _normalize_chat_artifacts(chat_copy.get("artifacts"))
             if chat_id in state["chats"] and cleaned_artifacts != _normalize_chat_artifacts(state["chats"][chat_id].get("artifacts")):
@@ -11979,7 +11864,7 @@ class HubState:
 
         state["chats"] = chats
         state["projects"] = list(project_map.values())
-        state["settings"] = _normalize_hub_settings_payload(state.get("settings"))
+        state["settings"] = self.settings_service.settings_payload(state)
         return state
 
     def start_chat(self, chat_id: str, *, resume: bool = False) -> dict[str, Any]:
@@ -12026,7 +11911,7 @@ class HubState:
             ready_ack_guid = _new_ready_ack_guid()
             agent_tools_url = self._chat_agent_tools_url(chat_id)
             agent_tools_project_id = str(project.get("id") or "")
-            agent_type = _normalize_chat_agent_type(chat.get("agent_type"))
+            agent_type = _normalize_chat_agent_type(chat.get("agent_type"), strict=True)
             runtime_config_file = self._prepare_chat_runtime_config(
                 chat_id,
                 agent_type=agent_type,
@@ -12036,7 +11921,6 @@ class HubState:
                 agent_tools_chat_id=chat_id,
                 trusted_project_path=_container_workspace_path_for_project(project.get("name") or project.get("id")),
             )
-            agent_command = AGENT_COMMAND_BY_TYPE.get(agent_type, AGENT_COMMAND_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE])
             chat["agent_type"] = agent_type
             container_workspace = _container_workspace_path_for_project(project.get("name") or project.get("id"))
             chat_tmp_workspace = self.chat_tmp_workdir(agent_tools_project_id, chat_id)
@@ -12054,6 +11938,7 @@ class HubState:
                 container_project_name=_container_project_name(project.get("name") or project.get("id")),
                 runtime_config_file=runtime_config_file,
                 agent_type=agent_type,
+                run_mode=self._runtime_run_mode(),
                 agent_tools_url=agent_tools_url,
                 agent_tools_token=agent_tools_token,
                 agent_tools_project_id=agent_tools_project_id,
@@ -12894,8 +12779,8 @@ def _html_page() -> str:
 @click.option("--clean-start", is_flag=True, default=False, help="Clear hub chat artifacts and cached setup images before serving.")
 @click.option(
     "--log-level",
-    default=os.environ.get("AGENT_HUB_LOG_LEVEL", "info"),
-    show_default=True,
+    default=None,
+    show_default="config logging.level, env AGENT_HUB_LOG_LEVEL, or info",
     type=click.Choice(HUB_LOG_LEVEL_CHOICES, case_sensitive=False),
     help="Hub logging verbosity (applies to Agent Hub logs and Uvicorn).",
 )
@@ -12915,21 +12800,64 @@ def main(
     artifact_publish_base_url: str,
     frontend_build: bool,
     clean_start: bool,
-    log_level: str,
+    log_level: str | None,
     ui_lifecycle_debug: bool,
     reload: bool,
 ) -> None:
-    normalized_log_level = _normalize_log_level(log_level)
-    _configure_hub_logging(normalized_log_level)
-    LOGGER.info("Starting Agent Hub host=%s port=%s log_level=%s reload=%s", host, port, normalized_log_level, reload)
     if _default_config_file() and not Path(config_file).exists():
         raise click.ClickException(f"Missing config file: {config_file}")
     if _default_system_prompt_file() and not Path(system_prompt_file).exists():
         raise click.ClickException(f"Missing system prompt file: {system_prompt_file}")
     try:
-        load_agent_runtime_config(config_file)
+        runtime_config = load_agent_runtime_config(config_file)
     except ConfigError as exc:
+        click.echo(
+            json.dumps(
+                {
+                    "event": "agent_hub_config_load_error",
+                    "config_path": str(config_file),
+                    "error": str(exc),
+                },
+                sort_keys=True,
+            ),
+            err=True,
+        )
         raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(
+            {
+                "event": "agent_hub_config_loaded",
+                "config_path": str(config_file),
+                "run_mode": str(runtime_config.runtime.run_mode or ""),
+            },
+            sort_keys=True,
+        ),
+        err=True,
+    )
+    try:
+        _validate_hub_runtime_run_mode(runtime_config)
+    except (ValueError, ConfigError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    normalized_log_level = _resolve_hub_log_level(log_level, runtime_config)
+    _configure_hub_logging(normalized_log_level)
+    _configure_domain_log_levels(runtime_config)
+    LOGGER.info(
+        "Starting Agent Hub host=%s port=%s log_level=%s reload=%s",
+        host,
+        port,
+        normalized_log_level,
+        reload,
+        extra={
+            "component": "startup",
+            "operation": "hub_start",
+            "result": "started",
+            "request_id": "",
+            "project_id": "",
+            "chat_id": "",
+            "duration_ms": 0,
+            "error_class": "",
+        },
+    )
     if frontend_build:
         _ensure_frontend_built(data_dir)
 
@@ -12937,15 +12865,29 @@ def main(
         state = HubState(
             data_dir=data_dir,
             config_file=config_file,
+            runtime_config=runtime_config,
             system_prompt_file=system_prompt_file,
             hub_host=host,
             hub_port=port,
             artifact_publish_base_url=artifact_publish_base_url,
             ui_lifecycle_debug=ui_lifecycle_debug,
         )
-    except ValueError as exc:
+    except (ValueError, ConfigError) as exc:
         raise click.ClickException(str(exc)) from exc
-    LOGGER.info("Artifact publish base URL: %s", state.artifact_publish_base_url)
+    LOGGER.info(
+        "Artifact publish base URL: %s",
+        state.artifact_publish_base_url,
+        extra={
+            "component": "startup",
+            "operation": "artifact_publish_base_url",
+            "result": "resolved",
+            "request_id": "",
+            "project_id": "",
+            "chat_id": "",
+            "duration_ms": 0,
+            "error_class": "",
+        },
+    )
     if clean_start:
         summary = state.clean_start()
         click.echo(
@@ -12959,1001 +12901,67 @@ def main(
 
     app = FastAPI()
     app.state.hub_state = state
+
+    @app.exception_handler(ConfigError)
+    async def _handle_config_error(_request: Request, exc: ConfigError) -> JSONResponse:
+        status, payload = _core_error_payload(exc)
+        return JSONResponse(status_code=status, content=payload)
+
+    @app.exception_handler(IdentityError)
+    async def _handle_identity_error(_request: Request, exc: IdentityError) -> JSONResponse:
+        status, payload = _core_error_payload(exc)
+        return JSONResponse(status_code=status, content=payload)
+
+    @app.exception_handler(MountVisibilityError)
+    async def _handle_mount_visibility_error(_request: Request, exc: MountVisibilityError) -> JSONResponse:
+        status, payload = _core_error_payload(exc)
+        return JSONResponse(status_code=status, content=payload)
+
+    @app.exception_handler(NetworkReachabilityError)
+    async def _handle_network_reachability_error(_request: Request, exc: NetworkReachabilityError) -> JSONResponse:
+        status, payload = _core_error_payload(exc)
+        return JSONResponse(status_code=status, content=payload)
+
+    @app.exception_handler(CredentialResolutionError)
+    async def _handle_credential_resolution_error(_request: Request, exc: CredentialResolutionError) -> JSONResponse:
+        status, payload = _core_error_payload(exc)
+        return JSONResponse(status_code=status, content=payload)
+
+    @app.exception_handler(HTTPException)
+    async def _handle_http_exception(_request: Request, exc: HTTPException) -> JSONResponse:
+        return JSONResponse(
+            status_code=int(exc.status_code or 500),
+            content={"error_code": _http_error_code(int(exc.status_code or 500)), "detail": exc.detail},
+            headers=getattr(exc, "headers", None),
+        )
+
     frontend_dist = _frontend_dist_dir()
     frontend_index = _frontend_index_file()
 
-    @app.get("/", response_class=HTMLResponse)
-    def index():
-        if frontend_index.is_file():
-            return FileResponse(frontend_index)
-        return HTMLResponse(_frontend_not_built_page(), status_code=503)
-
-    @app.websocket("/api/events")
-    async def ws_events(websocket: WebSocket) -> None:
-        listener = state.attach_events()
-        await websocket.accept()
-        LOGGER.debug("Hub events websocket connected.")
-        snapshot_event = {
-            "type": EVENT_TYPE_SNAPSHOT,
-            "payload": state.events_snapshot(),
-            "sent_at": _iso_now(),
-        }
-        await websocket.send_text(json.dumps(snapshot_event))
-
-        async def stream_events() -> None:
-            while True:
-                try:
-                    event = await asyncio.to_thread(listener.get, True, 0.5)
-                except queue.Empty:
-                    continue
-                if event is None:
-                    break
-                await websocket.send_text(json.dumps(event))
-
-        async def consume_input() -> None:
-            while True:
-                try:
-                    message = await websocket.receive_text()
-                except WebSocketDisconnect:
-                    return
-                if not message:
-                    continue
-                payload: Any = None
-                try:
-                    payload = json.loads(message)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(payload, dict) and str(payload.get("type") or "") == "ping":
-                    await websocket.send_text(
-                        json.dumps({"type": "pong", "payload": {"at": _iso_now()}, "sent_at": _iso_now()})
-                    )
-
-        sender = asyncio.create_task(stream_events())
-        receiver = asyncio.create_task(consume_input())
-        try:
-            done, pending = await asyncio.wait({sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            for task in done:
-                exc = task.exception()
-                if exc and not isinstance(exc, WebSocketDisconnect):
-                    raise exc
-        except WebSocketDisconnect:
-            pass
-        finally:
-            state._event_queue_put(listener, None)
-            state.detach_events(listener)
-            if not sender.done():
-                sender.cancel()
-            if not receiver.done():
-                receiver.cancel()
-            LOGGER.debug("Hub events websocket disconnected.")
-
-    @app.get("/api/state")
-    def api_state() -> dict[str, Any]:
-        return state.state_payload()
-
-    @app.get("/api/settings")
-    def api_settings() -> dict[str, Any]:
-        return {"settings": state.settings_payload()}
-
-    @app.get("/api/runtime-flags")
-    def api_runtime_flags() -> dict[str, Any]:
-        return state.runtime_flags_payload()
-
-    @app.patch("/api/settings")
-    async def api_update_settings(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        updated = state.update_settings(payload)
-        return {"settings": updated}
-
-    @app.get("/api/agent-capabilities")
-    def api_agent_capabilities() -> dict[str, Any]:
-        return state.agent_capabilities_payload()
-
-    @app.post("/api/agent-capabilities/discover")
-    def api_discover_agent_capabilities() -> dict[str, Any]:
-        return state.start_agent_capabilities_discovery()
-
-    @app.get("/api/settings/auth")
-    def api_auth_settings() -> dict[str, Any]:
-        return state.auth_settings_payload()
-
-    @app.post("/api/settings/auth/openai/connect")
-    async def api_connect_openai(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        verify = _coerce_bool(payload.get("verify"), default=True, field_name="verify")
-        return {"provider": state.connect_openai(payload.get("api_key"), verify=verify)}
-
-    @app.post("/api/settings/auth/openai/disconnect")
-    def api_disconnect_openai() -> dict[str, Any]:
-        return {"provider": state.disconnect_openai()}
-
-    @app.post("/api/settings/auth/github-app/connect")
-    async def api_connect_github_app(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        return {"provider": state.connect_github_app(payload.get("installation_id"))}
-
-    @app.post("/api/settings/auth/github-app/setup/start")
-    async def api_start_github_app_setup(request: Request) -> dict[str, Any]:
-        origin = f"{request.url.scheme}://{request.url.netloc}"
-        raw_body = await request.body()
-        if raw_body:
-            try:
-                payload = json.loads(raw_body.decode("utf-8", errors="ignore"))
-            except json.JSONDecodeError as exc:
-                raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-            if payload is not None and not isinstance(payload, dict):
-                raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-            if isinstance(payload, dict) and "origin" in payload:
-                origin = str(payload.get("origin") or "").strip()
-        return state.start_github_app_setup(origin=origin)
-
-    @app.get("/api/settings/auth/github-app/setup/session")
-    def api_github_app_setup_session() -> dict[str, Any]:
-        return state.github_app_setup_session_payload()
-
-    @app.get("/api/settings/auth/github-app/setup/callback", response_class=HTMLResponse)
-    def api_github_app_setup_callback(request: Request) -> HTMLResponse:
-        denied_error = str(request.query_params.get("error") or "").strip()
-        state_value = str(request.query_params.get("state") or "").strip()
-        if denied_error:
-            message = str(request.query_params.get("error_description") or denied_error).strip()
-            state.fail_github_app_setup(message=message or denied_error, state_value=state_value)
-            return HTMLResponse(
-                _github_app_setup_callback_page(
-                    success=False,
-                    message=message or "GitHub app setup was cancelled.",
-                ),
-                status_code=400,
-            )
-
-        code = str(request.query_params.get("code") or "").strip()
-        try:
-            payload = state.complete_github_app_setup(code=code, state_value=state_value)
-            app_slug = str(payload.get("app_slug") or "")
-            return HTMLResponse(
-                _github_app_setup_callback_page(
-                    success=True,
-                    message="GitHub App setup completed. Return to Agent Hub and select the installation to connect.",
-                    app_slug=app_slug,
-                )
-            )
-        except HTTPException as exc:
-            return HTMLResponse(
-                _github_app_setup_callback_page(
-                    success=False,
-                    message=str(exc.detail or "GitHub app setup failed."),
-                ),
-                status_code=int(exc.status_code or 400),
-            )
-
-    @app.post("/api/settings/auth/github-app/disconnect")
-    def api_disconnect_github_app() -> dict[str, Any]:
-        return {"provider": state.disconnect_github_app()}
-
-    @app.get("/api/settings/auth/github-app/installations")
-    def api_list_github_installations() -> dict[str, Any]:
-        return state.list_github_app_installations()
-
-    @app.post("/api/settings/auth/github-tokens/connect")
-    async def api_connect_github_token(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        return {
-            "provider": state.connect_github_personal_access_token(
-                payload.get("personal_access_token"),
-                host=payload.get("host"),
-            )
-        }
-
-    @app.delete("/api/settings/auth/github-tokens/{token_id}")
-    def api_disconnect_github_personal_access_token(token_id: str) -> dict[str, Any]:
-        return {"provider": state.disconnect_github_personal_access_token(token_id)}
-
-    @app.post("/api/settings/auth/github-tokens/disconnect")
-    def api_disconnect_github_personal_access_tokens() -> dict[str, Any]:
-        return {"provider": state.disconnect_github_personal_access_tokens()}
-
-    @app.post("/api/settings/auth/gitlab-tokens/connect")
-    async def api_connect_gitlab_token(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        return {
-            "provider": state.connect_gitlab_personal_access_token(
-                payload.get("personal_access_token"),
-                host=payload.get("host"),
-            )
-        }
-
-    @app.delete("/api/settings/auth/gitlab-tokens/{token_id}")
-    def api_disconnect_gitlab_personal_access_token(token_id: str) -> dict[str, Any]:
-        return {"provider": state.disconnect_gitlab_personal_access_token(token_id)}
-
-    @app.post("/api/settings/auth/gitlab-tokens/disconnect")
-    def api_disconnect_gitlab_personal_access_tokens() -> dict[str, Any]:
-        return {"provider": state.disconnect_gitlab_personal_access_tokens()}
-
-    @app.post("/api/settings/auth/openai/title-test")
-    async def api_test_openai_chat_title_generation(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        return state.test_openai_chat_title_generation(payload.get("prompt"))
-
-    @app.post("/api/settings/auth/openai/account/disconnect")
-    def api_disconnect_openai_account() -> dict[str, Any]:
-        return {"provider": state.disconnect_openai_account()}
-
-    @app.get("/api/settings/auth/openai/account/session")
-    def api_openai_account_session() -> dict[str, Any]:
-        return state.openai_account_session_payload()
-
-    @app.post("/api/settings/auth/openai/account/start")
-    async def api_start_openai_account_login(request: Request) -> dict[str, Any]:
-        method = "browser_callback"
-        raw_body = await request.body()
-        if raw_body:
-            try:
-                payload = json.loads(raw_body.decode("utf-8", errors="ignore"))
-            except json.JSONDecodeError as exc:
-                raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-            if payload is not None and not isinstance(payload, dict):
-                raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-            if isinstance(payload, dict):
-                method = _normalize_openai_account_login_method(payload.get("method"))
-        return state.start_openai_account_login(method=method)
-
-    @app.post("/api/settings/auth/openai/account/cancel")
-    def api_cancel_openai_account_login() -> dict[str, Any]:
-        return state.cancel_openai_account_login()
-
-    @app.get("/api/settings/auth/openai/account/callback")
-    def api_openai_account_callback(request: Request) -> dict[str, Any]:
-        callback_path = str(request.query_params.get("callback_path") or "")
-        query_items = [(key, value) for key, value in request.query_params.multi_items() if key != "callback_path"]
-        request_client_host = request.client.host if request.client is not None else ""
-        request_context = _openai_callback_request_context_from_request(request)
-        forwarded = state.forward_openai_account_callback(
-            urllib.parse.urlencode(query_items, doseq=True),
-            path=callback_path,
-            request_host=request_client_host,
-            request_context=request_context,
-        )
-        payload = state.openai_account_session_payload()
-        payload["callback"] = forwarded
-        return payload
-
-    @app.post("/api/projects/auto-configure")
-    async def api_auto_configure_project(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        agent_args = payload.get("agent_args")
-        if agent_args is None:
-            agent_args = []
-        if not isinstance(agent_args, list):
-            raise HTTPException(status_code=400, detail="agent_args must be an array.")
-        agent_type = (
-            _normalize_chat_agent_type(payload.get("agent_type"), strict=True)
-            if "agent_type" in payload
-            else AGENT_TYPE_CODEX
-        )
-        recommendation = await asyncio.to_thread(
-            state.auto_configure_project,
-            repo_url=payload.get("repo_url"),
-            default_branch=payload.get("default_branch"),
-            request_id=payload.get("request_id"),
-            agent_type=agent_type,
-            agent_args=[str(arg) for arg in agent_args if str(arg).strip()],
-        )
-        return {"recommendation": recommendation}
-
-    @app.post("/api/projects/auto-configure/cancel")
-    async def api_cancel_auto_configure_project(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        return state.cancel_auto_configure_project(
-            request_id=payload.get("request_id"),
-        )
-
-    @app.post("/api/projects")
-    async def api_create_project(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        repo_url = str(payload.get("repo_url", "")).strip()
-        name = payload.get("name")
-        if name is not None:
-            name = str(name).strip() or None
-        branch = payload.get("default_branch")
-        setup_script = payload.get("setup_script")
-        base_image_mode = _normalize_base_image_mode(payload.get("base_image_mode"))
-        base_image_value = str(payload.get("base_image_value") or "").strip()
-        default_ro_mounts = _parse_mounts(_empty_list(payload.get("default_ro_mounts")), "default read-only mount")
-        default_rw_mounts = _parse_mounts(_empty_list(payload.get("default_rw_mounts")), "default read-write mount")
-        default_env_vars = _parse_env_vars(_empty_list(payload.get("default_env_vars")))
-        credential_binding = _normalize_project_credential_binding(payload.get("credential_binding"))
-        if setup_script is not None:
-            setup_script = str(setup_script).strip()
-        if isinstance(branch, str):
-            branch = branch.strip() or None
-        project = await asyncio.to_thread(
-            state.add_project,
-            repo_url=repo_url,
-            name=name,
-            default_branch=branch,
-            setup_script=setup_script,
-            base_image_mode=base_image_mode,
-            base_image_value=base_image_value,
-            default_ro_mounts=default_ro_mounts,
-            default_rw_mounts=default_rw_mounts,
-            default_env_vars=default_env_vars,
-            credential_binding=credential_binding,
-        )
-        return {
-            "project": project
-        }
-
-    @app.patch("/api/projects/{project_id}")
-    async def api_update_project(project_id: str, request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        update: dict[str, Any] = {}
-        if "setup_script" in payload:
-            script = payload.get("setup_script")
-            update["setup_script"] = str(script).strip() if script is not None else ""
-        if "name" in payload:
-            name = payload.get("name")
-            update["name"] = str(name).strip() if name is not None else ""
-        if "default_branch" in payload:
-            branch = payload.get("default_branch")
-            update["default_branch"] = str(branch).strip() if branch is not None else ""
-        if "base_image_mode" in payload:
-            update["base_image_mode"] = _normalize_base_image_mode(payload.get("base_image_mode"))
-        if "base_image_value" in payload:
-            value = payload.get("base_image_value")
-            update["base_image_value"] = str(value).strip() if value is not None else ""
-        if "default_ro_mounts" in payload:
-            update["default_ro_mounts"] = _parse_mounts(
-                _empty_list(payload.get("default_ro_mounts")),
-                "default read-only mount",
-            )
-        if "default_rw_mounts" in payload:
-            update["default_rw_mounts"] = _parse_mounts(
-                _empty_list(payload.get("default_rw_mounts")),
-                "default read-write mount",
-            )
-        if "default_env_vars" in payload:
-            update["default_env_vars"] = _parse_env_vars(_empty_list(payload.get("default_env_vars")))
-        if "credential_binding" in payload:
-            update["credential_binding"] = _normalize_project_credential_binding(payload.get("credential_binding"))
-        if not update:
-            raise HTTPException(status_code=400, detail="No patch values provided.")
-        project = await asyncio.to_thread(state.update_project, project_id, update)
-        return {"project": project}
-
-    @app.get("/api/projects/{project_id}/credential-binding")
-    def api_project_credential_binding(project_id: str) -> dict[str, Any]:
-        return state.project_credential_binding_payload(project_id)
-
-    @app.post("/api/projects/{project_id}/credential-binding")
-    async def api_project_credential_binding_update(project_id: str, request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        return state.attach_project_credentials(
-            project_id=project_id,
-            mode=payload.get("mode"),
-            credential_ids=payload.get("credential_ids"),
-            source="settings_api",
-        )
-
-    @app.delete("/api/projects/{project_id}")
-    def api_delete_project(project_id: str) -> None:
-        state.delete_project(project_id)
-
-    @app.post("/api/projects/{project_id}/build/cancel")
-    def api_cancel_project_build(project_id: str) -> dict[str, Any]:
-        return state.cancel_project_build(project_id)
-
-    @app.get("/api/projects/{project_id}/build-logs", response_class=PlainTextResponse)
-    def api_project_build_logs(project_id: str) -> str:
-        project = state.project(project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="Project not found.")
-        log_path = state.project_build_log(project_id)
-        if not log_path.exists():
-            return ""
-        return log_path.read_text(encoding="utf-8", errors="ignore")
-
-    @app.get("/api/projects/{project_id}/launch-profile")
-    def api_project_launch_profile(project_id: str) -> dict[str, Any]:
-        return {"launch_profile": state.project_snapshot_launch_profile(project_id)}
-
-    @app.post("/api/projects/{project_id}/chats/start")
-    async def api_start_new_chat_for_project(project_id: str, request: Request) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
-        body = await request.body()
-        if body:
-            try:
-                parsed_payload = json.loads(body.decode("utf-8"))
-            except json.JSONDecodeError as exc:
-                raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-            if not isinstance(parsed_payload, dict):
-                raise HTTPException(status_code=400, detail="Request body must be an object.")
-            payload = parsed_payload
-
-        agent_args = payload.get("agent_args")
-        if agent_args is None and "codex_args" in payload:
-            agent_args = payload.get("codex_args")
-        if agent_args is None:
-            agent_args = []
-        if not isinstance(agent_args, list):
-            raise HTTPException(status_code=400, detail="agent_args must be an array.")
-        request_id_raw = payload.get("request_id")
-        request_id = _compact_whitespace(str(request_id_raw or "")).strip()
-        agent_type = (
-            _normalize_chat_agent_type(payload.get("agent_type"), strict=True)
-            if "agent_type" in payload
-            else state.default_chat_agent_type()
-        )
-        start_kwargs: dict[str, Any] = {
-            "agent_args": [str(arg) for arg in agent_args],
-            "agent_type": agent_type,
-        }
-        if request_id:
-            start_kwargs["request_id"] = request_id
-        chat = await asyncio.to_thread(
-            state.create_and_start_chat,
-            project_id,
-            **start_kwargs,
-        )
-        return {
-            "chat": chat
-        }
-
-    @app.post("/api/chats")
-    async def api_create_chat(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        project_id = str(payload.get("project_id", "")).strip()
-        if not project_id:
-            raise HTTPException(status_code=400, detail="project_id is required.")
-
-        profile = payload.get("profile")
-        if profile is not None:
-            profile = str(profile).strip()
-
-        ro_mounts = _parse_mounts(_empty_list(payload.get("ro_mounts")), "read-only mount")
-        rw_mounts = _parse_mounts(_empty_list(payload.get("rw_mounts")), "read-write mount")
-        env_vars = _parse_env_vars(_empty_list(payload.get("env_vars")))
-        agent_args = payload.get("agent_args")
-        if agent_args is None and "codex_args" in payload:
-            agent_args = payload.get("codex_args")
-        if agent_args is None:
-            agent_args = []
-        if not isinstance(agent_args, list):
-            raise HTTPException(status_code=400, detail="agent_args must be an array.")
-        agent_type = (
-            _normalize_chat_agent_type(payload.get("agent_type"), strict=True)
-            if "agent_type" in payload
-            else state.default_chat_agent_type()
-        )
-        chat = await asyncio.to_thread(
-            state.create_chat,
-            project_id,
-            profile,
-            ro_mounts,
-            rw_mounts,
-            env_vars,
-            agent_args=[str(arg) for arg in agent_args],
-            agent_type=agent_type,
-        )
-        return {
-            "chat": chat
-        }
-
-    @app.post("/api/chats/{chat_id}/start")
-    def api_start_chat(chat_id: str) -> dict[str, Any]:
-        return {"chat": state.start_chat(chat_id)}
-
-    @app.get("/api/chats/{chat_id}/launch-profile")
-    def api_chat_launch_profile(chat_id: str, resume: bool = False) -> dict[str, Any]:
-        return {"launch_profile": state.chat_launch_profile(chat_id, resume=resume)}
-
-    @app.post("/api/chats/{chat_id}/refresh-container")
-    def api_refresh_chat_container(chat_id: str) -> dict[str, Any]:
-        return {"chat": state.refresh_chat_container(chat_id)}
-
-    @app.post("/api/chats/{chat_id}/close")
-    def api_close_chat(chat_id: str) -> dict[str, Any]:
-        return {"chat": state.close_chat(chat_id)}
-
-    @app.patch("/api/chats/{chat_id}")
-    async def api_patch_chat(chat_id: str, request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        update: dict[str, Any] = {}
-        if "profile" in payload:
-            update["profile"] = str(payload.get("profile") or "").strip()
-        if "ro_mounts" in payload:
-            update["ro_mounts"] = _parse_mounts(_empty_list(payload.get("ro_mounts")), "read-only mount")
-        if "rw_mounts" in payload:
-            update["rw_mounts"] = _parse_mounts(_empty_list(payload.get("rw_mounts")), "read-write mount")
-        if "env_vars" in payload:
-            update["env_vars"] = _parse_env_vars(_empty_list(payload.get("env_vars")))
-        args_key = "agent_args" if "agent_args" in payload else "codex_args" if "codex_args" in payload else ""
-        if args_key:
-            args = payload.get(args_key)
-            if not isinstance(args, list):
-                raise HTTPException(status_code=400, detail="agent_args must be an array.")
-            update["agent_args"] = [str(arg) for arg in args]
-        if "agent_type" in payload:
-            update["agent_type"] = _normalize_chat_agent_type(payload.get("agent_type"), strict=True)
-        if not update:
-            raise HTTPException(status_code=400, detail="No patch values provided.")
-        return {"chat": state.update_chat(chat_id, update)}
-
-    @app.delete("/api/chats/{chat_id}")
-    def api_delete_chat(chat_id: str) -> None:
-        state.delete_chat(chat_id)
-
-    @app.post("/api/chats/{chat_id}/title-prompt")
-    async def api_chat_title_prompt(chat_id: str, request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        return state.record_chat_title_prompt(chat_id, payload.get("prompt"))
-
-    @app.get("/api/chats/{chat_id}/artifacts")
-    def api_list_chat_artifacts(chat_id: str) -> dict[str, Any]:
-        return {"artifacts": state.list_chat_artifacts(chat_id)}
-
-    @app.post("/api/chats/{chat_id}/artifacts/publish")
-    async def api_publish_chat_artifact(chat_id: str, request: Request) -> dict[str, Any]:
-        auth_header = str(request.headers.get("authorization") or "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        if not token:
-            token = str(request.headers.get("x-agent-hub-artifact-token") or "").strip()
-
-        chat = state.chat(chat_id)
-        if chat is None:
-            raise HTTPException(status_code=404, detail="Chat not found.")
-        state._require_artifact_publish_token(chat, token)
-        workspace = state.chat_workdir(chat_id).resolve()
-        if not workspace.exists():
-            raise HTTPException(status_code=409, detail="Chat workspace is unavailable.")
-        payload, staged_paths = await _parse_artifact_request_payload(
-            request,
-            context=f"/api/chats/{chat_id}/artifacts/publish",
-            workspace=workspace,
-        )
-        try:
-            artifact = state.publish_chat_artifact(
-                chat_id=chat_id,
-                token=token,
-                submitted_path=payload.get("path"),
-                name=payload.get("name"),
-            )
-        except HTTPException as exc:
-            LOGGER.warning(
-                "artifacts publish failed for chat_id=%s: %s",
-                chat_id,
-                exc.detail,
-            )
-            raise
-        finally:
-            _cleanup_uploaded_artifact_paths(staged_paths)
-        return {"artifact": artifact}
-
-    @app.get("/api/chats/{chat_id}/artifacts/{artifact_id}/download")
-    def api_download_chat_artifact(chat_id: str, artifact_id: str) -> FileResponse:
-        artifact_path, filename, media_type = state.resolve_chat_artifact_download(chat_id, artifact_id)
-        return FileResponse(path=str(artifact_path), filename=filename, media_type=media_type)
-
-    @app.get("/api/chats/{chat_id}/artifacts/{artifact_id}/preview")
-    def api_preview_chat_artifact(chat_id: str, artifact_id: str) -> FileResponse:
-        artifact_path, media_type = state.resolve_chat_artifact_preview(chat_id, artifact_id)
-        return FileResponse(path=str(artifact_path), media_type=media_type)
-
-    @app.get("/api/chats/{chat_id}/agent-tools/credentials")
-    def api_agent_tools_list_credentials(chat_id: str, request: Request) -> dict[str, Any]:
-        auth_header = str(request.headers.get("authorization") or "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        if not token:
-            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
-        chat = state.chat(chat_id)
-        if chat is None:
-            raise HTTPException(status_code=404, detail="Chat not found.")
-        state._require_agent_tools_token(chat, token)
-        return state.agent_tools_credentials_list_payload(chat_id)
-
-    @app.post("/api/chats/{chat_id}/agent-tools/credentials/resolve")
-    async def api_agent_tools_resolve_credentials(chat_id: str, request: Request) -> dict[str, Any]:
-        auth_header = str(request.headers.get("authorization") or "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        if not token:
-            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
-        chat = state.chat(chat_id)
-        if chat is None:
-            raise HTTPException(status_code=404, detail="Chat not found.")
-        state._require_agent_tools_token(chat, token)
-        payload = await request.json()
-        if payload is None:
-            payload = {}
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        return state.resolve_agent_tools_credentials(
-            chat_id=chat_id,
-            mode=payload.get("mode"),
-            credential_ids=payload.get("credential_ids"),
-        )
-
-    @app.post("/api/chats/{chat_id}/agent-tools/project-binding")
-    async def api_agent_tools_attach_project_binding(chat_id: str, request: Request) -> dict[str, Any]:
-        auth_header = str(request.headers.get("authorization") or "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        if not token:
-            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
-        chat = state.chat(chat_id)
-        if chat is None:
-            raise HTTPException(status_code=404, detail="Chat not found.")
-        state._require_agent_tools_token(chat, token)
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        return state.attach_agent_tools_project_credentials(
-            chat_id=chat_id,
-            mode=payload.get("mode"),
-            credential_ids=payload.get("credential_ids"),
-        )
-
-    @app.post("/api/chats/{chat_id}/agent-tools/ack")
-    async def api_agent_tools_ack_chat_ready(chat_id: str, request: Request) -> dict[str, Any]:
-        auth_header = str(request.headers.get("authorization") or "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        if not token:
-            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
-        payload = await request.json()
-        if payload is None:
-            payload = {}
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        acknowledgement = state.acknowledge_agent_tools_chat_ready(
-            chat_id=chat_id,
-            token=token,
-            guid=payload.get("guid"),
-            stage=payload.get("stage"),
-            meta=payload.get("meta"),
-        )
-        return {"ack": acknowledgement}
-
-    @app.post("/api/chats/{chat_id}/agent-tools/artifacts/submit")
-    async def api_agent_tools_submit_chat_artifact(chat_id: str, request: Request) -> dict[str, Any]:
-        auth_header = str(request.headers.get("authorization") or "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        if not token:
-            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
-
-        chat = state.chat(chat_id)
-        if chat is None:
-            raise HTTPException(status_code=404, detail="Chat not found.")
-        state._require_agent_tools_token(chat, token)
-        workspace = state.chat_workdir(chat_id).resolve()
-        if not workspace.exists():
-            raise HTTPException(status_code=409, detail="Chat workspace is unavailable.")
-        payload, staged_paths = await _parse_artifact_request_payload(
-            request,
-            context=f"/api/chats/{chat_id}/agent-tools/artifacts/submit",
-            workspace=workspace,
-        )
-        try:
-            artifact = state.submit_chat_artifact(
-                chat_id=chat_id,
-                token=token,
-                submitted_path=payload.get("path"),
-                name=payload.get("name"),
-            )
-        except HTTPException as exc:
-            LOGGER.warning(
-                "agent-tools artifact submit failed for chat_id=%s: %s",
-                chat_id,
-                exc.detail,
-            )
-            raise
-        finally:
-            _cleanup_uploaded_artifact_paths(staged_paths)
-        return {"artifact": artifact}
-
-    @app.get("/api/agent-tools/sessions/{session_id}/credentials")
-    def api_agent_tools_session_list_credentials(session_id: str, request: Request) -> dict[str, Any]:
-        auth_header = str(request.headers.get("authorization") or "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        if not token:
-            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
-        state.require_agent_tools_session_token(session_id, token)
-        return state.agent_tools_session_credentials_list_payload(session_id)
-
-    @app.post("/api/agent-tools/sessions/{session_id}/credentials/resolve")
-    async def api_agent_tools_session_resolve_credentials(session_id: str, request: Request) -> dict[str, Any]:
-        auth_header = str(request.headers.get("authorization") or "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        if not token:
-            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
-        state.require_agent_tools_session_token(session_id, token)
-        payload = await request.json()
-        if payload is None:
-            payload = {}
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        return state.resolve_agent_tools_session_credentials(
-            session_id=session_id,
-            mode=payload.get("mode"),
-            credential_ids=payload.get("credential_ids"),
-        )
-
-    @app.post("/api/agent-tools/sessions/{session_id}/project-binding")
-    async def api_agent_tools_session_attach_project_binding(session_id: str, request: Request) -> dict[str, Any]:
-        auth_header = str(request.headers.get("authorization") or "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        if not token:
-            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
-        state.require_agent_tools_session_token(session_id, token)
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        return state.attach_agent_tools_session_project_credentials(
-            session_id=session_id,
-            mode=payload.get("mode"),
-            credential_ids=payload.get("credential_ids"),
-        )
-
-    @app.post("/api/agent-tools/sessions/{session_id}/ack")
-    async def api_agent_tools_ack_session_ready(session_id: str, request: Request) -> dict[str, Any]:
-        auth_header = str(request.headers.get("authorization") or "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        if not token:
-            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
-        payload = await request.json()
-        if payload is None:
-            payload = {}
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        acknowledgement = state.acknowledge_agent_tools_session_ready(
-            session_id=session_id,
-            token=token,
-            guid=payload.get("guid"),
-            stage=payload.get("stage"),
-            meta=payload.get("meta"),
-        )
-        return {"ack": acknowledgement}
-
-    @app.post("/api/agent-tools/sessions/{session_id}/artifacts/publish")
-    async def api_publish_session_artifact(session_id: str, request: Request) -> dict[str, Any]:
-        auth_header = str(request.headers.get("authorization") or "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        if not token:
-            token = str(request.headers.get("x-agent-hub-artifact-token") or "").strip()
-
-        session = state._agent_tools_session(session_id)
-        state._require_session_artifact_publish_token(session, token)
-        workspace = Path(str(session.get("workspace") or "")).resolve()
-        if not workspace.exists():
-            raise HTTPException(status_code=409, detail="Session workspace is unavailable.")
-        payload, staged_paths = await _parse_artifact_request_payload(
-            request,
-            context=f"/api/agent-tools/sessions/{session_id}/artifacts/publish",
-            workspace=workspace,
-        )
-        try:
-            artifact = state.publish_session_artifact(
-                session_id=session_id,
-                token=token,
-                submitted_path=payload.get("path"),
-                name=payload.get("name"),
-            )
-        except HTTPException as exc:
-            LOGGER.warning(
-                "session artifact publish failed for session_id=%s: %s",
-                session_id,
-                exc.detail,
-            )
-            raise
-        finally:
-            _cleanup_uploaded_artifact_paths(staged_paths)
-        return {"artifact": artifact}
-
-    @app.post("/api/agent-tools/sessions/{session_id}/artifacts/submit")
-    async def api_agent_tools_submit_session_artifact(session_id: str, request: Request) -> dict[str, Any]:
-        auth_header = str(request.headers.get("authorization") or "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        if not token:
-            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
-
-        session = state.require_agent_tools_session_token(session_id, token)
-        workspace = Path(str(session.get("workspace") or "")).resolve()
-        if not workspace.exists():
-            raise HTTPException(status_code=409, detail="Session workspace is unavailable.")
-        payload, staged_paths = await _parse_artifact_request_payload(
-            request,
-            context=f"/api/agent-tools/sessions/{session_id}/artifacts/submit",
-            workspace=workspace,
-        )
-        try:
-            artifact = state.submit_session_artifact(
-                session_id=session_id,
-                token=token,
-                submitted_path=payload.get("path"),
-                name=payload.get("name"),
-            )
-        except HTTPException as exc:
-            LOGGER.warning(
-                "session artifact submit failed for session_id=%s: %s",
-                session_id,
-                exc.detail,
-            )
-            raise
-        finally:
-            _cleanup_uploaded_artifact_paths(staged_paths)
-        return {"artifact": artifact}
-
-    @app.get("/api/agent-tools/sessions/{session_id}/artifacts/{artifact_id}/download")
-    def api_download_session_artifact(session_id: str, artifact_id: str) -> FileResponse:
-        artifact_path, filename, media_type = state.resolve_session_artifact_download(session_id, artifact_id)
-        return FileResponse(path=str(artifact_path), filename=filename, media_type=media_type)
-
-    @app.get("/api/agent-tools/sessions/{session_id}/artifacts/{artifact_id}/preview")
-    def api_preview_session_artifact(session_id: str, artifact_id: str) -> FileResponse:
-        artifact_path, media_type = state.resolve_session_artifact_preview(session_id, artifact_id)
-        return FileResponse(path=str(artifact_path), media_type=media_type)
-
-    @app.get("/api/chats/{chat_id}/logs", response_class=PlainTextResponse)
-    def api_chat_logs(chat_id: str) -> str:
-        chat = state.chat(chat_id)
-        if chat is None:
-            raise HTTPException(status_code=404, detail="Chat not found.")
-        log_path = state.chat_log(chat_id)
-        if not log_path.exists():
-            return ""
-        return log_path.read_text(encoding="utf-8", errors="ignore")
-
-    @app.websocket("/api/chats/{chat_id}/terminal")
-    async def ws_chat_terminal(chat_id: str, websocket: WebSocket) -> None:
-        chat = state.chat(chat_id)
-        if chat is None:
-            await websocket.close(code=4404)
-            return
-
-        try:
-            listener, backlog = state.attach_terminal(chat_id)
-        except HTTPException as exc:
-            await websocket.close(code=4409, reason=str(exc.detail))
-            return
-
-        await websocket.accept()
-        if backlog:
-            try:
-                await websocket.send_text(backlog)
-            except WebSocketDisconnect:
-                state._queue_put(listener, None)
-                state.detach_terminal(chat_id, listener)
-                return
-
-        async def stream_output() -> None:
-            while True:
-                try:
-                    chunk = await asyncio.to_thread(listener.get, True, 0.25)
-                except queue.Empty:
-                    continue
-                if chunk is None:
-                    break
-                try:
-                    await websocket.send_text(chunk)
-                except WebSocketDisconnect:
-                    break
-
-        async def stream_input() -> None:
-            while True:
-                message = await websocket.receive_text()
-                payload: Any = None
-                try:
-                    payload = json.loads(message)
-                except json.JSONDecodeError:
-                    state.write_terminal_input(chat_id, message)
-                    continue
-
-                if isinstance(payload, dict):
-                    message_type = str(payload.get("type") or "")
-                    if message_type == "resize":
-                        state.resize_terminal(chat_id, int(payload.get("cols") or 0), int(payload.get("rows") or 0))
-                        continue
-                    if message_type == "submit":
-                        state.submit_chat_input_buffer(chat_id)
-                        continue
-                    if message_type == "input":
-                        state.write_terminal_input(chat_id, str(payload.get("data") or ""))
-                        continue
-
-                state.write_terminal_input(chat_id, message)
-
-        sender = asyncio.create_task(stream_output())
-        receiver = asyncio.create_task(stream_input())
-        try:
-            done, pending = await asyncio.wait({sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            for task in done:
-                exc = task.exception()
-                if exc and not isinstance(exc, WebSocketDisconnect):
-                    raise exc
-        except WebSocketDisconnect:
-            pass
-        finally:
-            state._queue_put(listener, None)
-            state.detach_terminal(chat_id, listener)
-            if not sender.done():
-                sender.cancel()
-            if not receiver.done():
-                receiver.cancel()
-
-    assets_dir = frontend_dist / "assets"
-    if assets_dir.is_dir():
-        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="frontend-assets")
-
-    @app.on_event("shutdown")
-    async def app_shutdown() -> None:
-        try:
-            summary = state.shutdown()
-            if summary["closed_chats"] > 0:
-                click.echo(
-                    "Shutdown cleanup completed: "
-                    f"stopped_chats={summary['stopped_chats']} "
-                    f"closed_chats={summary['closed_chats']}"
-                )
-        except Exception as exc:  # pragma: no cover - defensive shutdown guard
-            click.echo(f"Shutdown cleanup failed: {exc}", err=True)
-
-    @app.get("/{path:path}")
-    def spa(path: str):
-        if path.startswith("api/"):
-            raise HTTPException(status_code=404, detail="Not found.")
-        candidate = frontend_dist / path
-        if candidate.is_file():
-            return FileResponse(candidate)
-        if frontend_index.is_file():
-            return FileResponse(frontend_index)
-        return HTMLResponse(_frontend_not_built_page(), status_code=503)
+    register_hub_routes(
+        app,
+        state=state,
+        frontend_dist=frontend_dist,
+        frontend_index=frontend_index,
+        logger=LOGGER,
+        event_type_snapshot=EVENT_TYPE_SNAPSHOT,
+        agent_type_codex=AGENT_TYPE_CODEX,
+        iso_now=_iso_now,
+        frontend_not_built_page=_frontend_not_built_page,
+        coerce_bool=_coerce_bool,
+        github_app_setup_callback_page=_github_app_setup_callback_page,
+        normalize_openai_account_login_method=_normalize_openai_account_login_method,
+        openai_callback_request_context_from_request=_openai_callback_request_context_from_request,
+        normalize_chat_agent_type=_normalize_chat_agent_type,
+        normalize_base_image_mode=_normalize_base_image_mode,
+        normalize_project_credential_binding=_normalize_project_credential_binding,
+        parse_mounts=_parse_mounts,
+        empty_list=_empty_list,
+        parse_env_vars=_parse_env_vars,
+        compact_whitespace=_compact_whitespace,
+        parse_artifact_request_payload=_parse_artifact_request_payload,
+        cleanup_uploaded_artifact_paths=_cleanup_uploaded_artifact_paths,
+    )
 
     uvicorn.run(app, host=host, port=port, reload=reload, log_level=_uvicorn_log_level(normalized_log_level))
 

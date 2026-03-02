@@ -4,7 +4,10 @@ import abc
 import json
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
+
+if TYPE_CHECKING:
+    from agent_core import AgentRuntimeConfig
 
 def _strip_mcp_server_toml(config_text: str, server_name: str) -> str:
     if not config_text:
@@ -28,6 +31,7 @@ class AgentProvider(abc.ABC):
         explicit_args: Iterable[str],
         shared_prompt_context: str,
         no_alt_screen: bool,
+        runtime_config: AgentRuntimeConfig,
     ) -> list[str]:
         """Returns the default flags required to run the agent."""
         pass
@@ -72,9 +76,23 @@ class CodexProvider(AgentProvider):
         explicit_args: Iterable[str],
         shared_prompt_context: str,
         no_alt_screen: bool,
+        runtime_config: AgentRuntimeConfig,
     ) -> list[str]:
         parsed_args = [str(arg) for arg in explicit_args]
         flags: list[str] = []
+
+        configured_approval = str(
+            runtime_config.runtime.values.get("codex_approval_policy")
+            or runtime_config.runtime.values.get("approval_policy")
+            or runtime_config.extras.get("approval_policy")
+            or "never"
+        ).strip()
+        configured_sandbox = str(
+            runtime_config.runtime.values.get("codex_sandbox_mode")
+            or runtime_config.runtime.values.get("sandbox_mode")
+            or runtime_config.extras.get("sandbox_mode")
+            or "danger-full-access"
+        ).strip()
         
         def has_cli_option(args: list[str], *, long_option: str, short_option: str | None = None) -> bool:
             return any(arg == long_option or arg.startswith(f"{long_option}=") or (short_option and (arg == short_option or arg.startswith(f"{short_option}="))) for arg in args)
@@ -97,9 +115,9 @@ class CodexProvider(AgentProvider):
         bypass_all = has_cli_option(parsed_args, long_option="--dangerously-bypass-approvals-and-sandbox")
         if not bypass_all:
             if not has_cli_option(parsed_args, long_option="--ask-for-approval", short_option="-a"):
-                flags.extend(["--ask-for-approval", "never"])
+                flags.extend(["--ask-for-approval", configured_approval or "never"])
             if not has_cli_option(parsed_args, long_option="--sandbox", short_option="-s"):
-                flags.extend(["--sandbox", "danger-full-access"])
+                flags.extend(["--sandbox", configured_sandbox or "danger-full-access"])
         
         if shared_prompt_context and not has_codex_config_override(parsed_args, key="developer_instructions"):
             flags.extend(
@@ -158,6 +176,7 @@ class ClaudeProvider(AgentProvider):
         explicit_args: Iterable[str],
         shared_prompt_context: str,
         no_alt_screen: bool,
+        runtime_config: AgentRuntimeConfig,
     ) -> list[str]:
         parsed_args = [str(arg) for arg in explicit_args]
         flags: list[str] = []
@@ -165,8 +184,13 @@ class ClaudeProvider(AgentProvider):
         def has_cli_option(args: list[str], *, long_option: str, short_option: str | None = None) -> bool:
             return any(arg == long_option or arg.startswith(f"{long_option}=") or (short_option and (arg == short_option or arg.startswith(f"{short_option}="))) for arg in args)
 
+        default_model = "opus"
+        configured_model = str(runtime_config.providers.defaults.model or "").strip()
+        configured_provider = str(runtime_config.providers.defaults.model_provider or "").strip().lower()
+        if configured_model and configured_provider in {"", "claude", "anthropic"}:
+            default_model = configured_model
         if not has_cli_option(parsed_args, long_option="--model", short_option="-m"):
-            flags.extend(["--model", "opus"])
+            flags.extend(["--model", default_model])
         if not has_cli_option(parsed_args, long_option="--dangerously-skip-permissions"):
             flags.append("--dangerously-skip-permissions")
 
@@ -229,7 +253,9 @@ class GeminiProvider(AgentProvider):
         explicit_args: Iterable[str],
         shared_prompt_context: str,
         no_alt_screen: bool,
+        runtime_config: AgentRuntimeConfig,
     ) -> list[str]:
+        del shared_prompt_context, no_alt_screen, runtime_config
         parsed_args = [str(arg) for arg in explicit_args]
         flags: list[str] = []
         
@@ -316,4 +342,9 @@ def get_provider(name: str) -> AgentProvider:
         "claude": ClaudeProvider(),
         "gemini": GeminiProvider(),
     }
-    return providers.get(name, CodexProvider())
+    normalized = str(name or "").strip().lower()
+    provider = providers.get(normalized)
+    if provider is None:
+        supported = ", ".join(sorted(providers.keys()))
+        raise ValueError(f"Unknown agent provider '{name}'. Supported providers: {supported}.")
+    return provider

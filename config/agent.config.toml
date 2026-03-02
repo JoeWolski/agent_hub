@@ -5,6 +5,7 @@ web_search = "live"
 project_doc_auto_load = true
 project_doc_fallback_filenames = ["AGENTS.md"]
 project_doc_auto_load_extra_filenames = [
+  "SYSTEM_PROMPT.md",
   "docs/repo-map.md",
   "docs/agent-mcp.md",
   "docs/agent-setup.md",
@@ -16,3 +17,17 @@ hide_full_access_warning = true
 
 [tui]
 animations = false
+
+[identity]
+
+[paths]
+
+[providers]
+
+[mcp]
+
+[auth]
+
+[logging]
+
+[runtime]

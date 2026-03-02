@@ -42,7 +42,7 @@ def test_repo_root_falls_back_to_start_parent_without_pyproject(tmp_path: Path) 
     assert shared.repo_root(start_file) == start_dir
 
 
-def test_default_config_file_prefers_repo_then_cwd(tmp_path: Path) -> None:
+def test_default_config_file_is_canonical_repo_path(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     cwd = tmp_path / "cwd"
     (repo_root / "config").mkdir(parents=True)
@@ -56,13 +56,13 @@ def test_default_config_file_prefers_repo_then_cwd(tmp_path: Path) -> None:
     assert shared.default_config_file(repo_root, cwd=cwd) == repo_cfg
 
     repo_cfg.unlink()
-    assert shared.default_config_file(repo_root, cwd=cwd) == cwd_cfg
+    assert shared.default_config_file(repo_root, cwd=cwd) == repo_cfg
 
     cwd_cfg.unlink()
     assert shared.default_config_file(repo_root, cwd=cwd) == repo_cfg
 
 
-def test_default_system_prompt_file_prefers_repo_then_cwd(tmp_path: Path) -> None:
+def test_default_system_prompt_file_is_canonical_repo_path(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     cwd = tmp_path / "cwd"
     repo_root.mkdir(parents=True)
@@ -77,7 +77,7 @@ def test_default_system_prompt_file_prefers_repo_then_cwd(tmp_path: Path) -> Non
     assert shared.default_system_prompt_file(repo_root, name, cwd=cwd) == repo_prompt
 
     repo_prompt.unlink()
-    assert shared.default_system_prompt_file(repo_root, name, cwd=cwd) == cwd_prompt
+    assert shared.default_system_prompt_file(repo_root, name, cwd=cwd) == repo_prompt
 
     cwd_prompt.unlink()
     assert shared.default_system_prompt_file(repo_root, name, cwd=cwd) == repo_prompt

@@ -20,7 +20,7 @@ docker build \
 Because `agent_hub` launches nested chat containers through the host Docker daemon, host paths must be reachable by the host daemon with the same absolute path values used inside this container.
 
 ```bash
-export AGENT_HUB_SHARED_ROOT=/tmp/agent_hub_shared
+export AGENT_HUB_SHARED_ROOT=/workspace/tmp/agent_hub_shared
 mkdir -p "${AGENT_HUB_SHARED_ROOT}"
 
 docker run --rm -it \

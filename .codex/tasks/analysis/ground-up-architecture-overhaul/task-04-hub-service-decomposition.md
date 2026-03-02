@@ -32,6 +32,7 @@ uv run pytest tests/integration/test_agent_tools_ack_routes.py -q
 - Required artifacts:
   - service boundary map
   - call graph from route -> service -> store/runtime
+  - implementation artifact: `docs/analysis/ground-up-architecture-overhaul/service_boundary_map.md`
 - Visualization design:
   - none required
 - Self-review gate:
@@ -50,19 +51,35 @@ uv run pytest tests/integration/test_agent_tools_ack_routes.py -q
 - service-level structured logger names (`hub.project`, `hub.chat`, etc.).
 
 ## Acceptance Criteria
-- [ ] HubState no longer owns all domains directly.
-- [ ] route behavior remains stable with passing regression suites.
+- [x] HubState no longer owns all domains directly.
+- [x] route behavior remains stable with passing regression suites.
 
 ## Status
-Status: TODO
+Status: COMPLETE
 
 ## Execution Log
 ```text
-command: pending
-result: pending
-notes: pending
+command: uv run pytest tests/test_hub_and_cli.py -k "project_build or create_and_start_chat or artifacts or credentials" -q
+result: 31 passed, 301 deselected, 3 warnings
+notes: chat/build/artifact/credential behavior stable after settings/auth service extraction
+
+command: uv run pytest tests/integration/test_hub_chat_lifecycle_api.py -q
+result: 6 passed, 12 warnings in 4.26s
+notes: API lifecycle routes remain stable after codex_args route contract tightening
+
+command: uv run pytest tests/integration/test_agent_tools_ack_routes.py -q
+result: 2 passed, 4 warnings in 0.09s
+notes: agent-tools ack route behavior stable
+
+command: uv run --python 3.13 -m pytest tests/test_hub_and_cli.py -k "project_build or create_and_start_chat or artifacts or credentials" -q
+result: 31 passed, 313 deselected, 2 warnings
+notes: chat/build/artifact/credential behavior remains stable after strict state validation updates
+
+command: uv run --python 3.13 -m pytest tests/integration/test_hub_chat_lifecycle_api.py -q
+result: 6 passed, 12 warnings in 4.26s
+notes: lifecycle API behavior remains stable
+
+command: uv run --python 3.13 -m pytest tests/integration/test_agent_tools_ack_routes.py -q
+result: 2 passed, 4 warnings in 0.09s
+notes: ack route behavior remains stable
 ```
-
-## Remaining Risks
-- inadvertent behavior drift during staged extraction.
-

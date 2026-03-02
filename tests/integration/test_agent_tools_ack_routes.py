@@ -23,7 +23,10 @@ class AgentToolsAckRouteIntegrationTests(unittest.TestCase):
         self.tmp_path = Path(self.tmp.name)
         self.data_dir = self.tmp_path / "hub"
         self.config = self.tmp_path / "agent.config.toml"
-        self.config.write_text("model = 'test'\n", encoding="utf-8")
+        self.config.write_text(
+            "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n",
+            encoding="utf-8",
+        )
         self.runner = CliRunner()
 
     def tearDown(self) -> None:

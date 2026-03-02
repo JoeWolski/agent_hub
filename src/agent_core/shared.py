@@ -14,15 +14,8 @@ def repo_root(start_file: Path) -> Path:
 
 
 def default_config_file(repo_root: Path, cwd: Path | None = None) -> Path:
+    del cwd
     config_file = repo_root / "config" / "agent.config.toml"
-    if config_file.exists():
-        return config_file
-
-    fallback_root = Path.cwd() if cwd is None else cwd
-    fallback = fallback_root / "config" / "agent.config.toml"
-    if fallback.exists():
-        return fallback
-
     return config_file
 
 
@@ -31,15 +24,8 @@ def default_system_prompt_file(
     system_prompt_file_name: str,
     cwd: Path | None = None,
 ) -> Path:
+    del cwd
     prompt_file = repo_root / str(system_prompt_file_name)
-    if prompt_file.exists():
-        return prompt_file
-
-    fallback_root = Path.cwd() if cwd is None else cwd
-    fallback = fallback_root / str(system_prompt_file_name)
-    if fallback.exists():
-        return fallback
-
     return prompt_file
 
 

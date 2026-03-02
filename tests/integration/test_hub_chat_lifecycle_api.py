@@ -25,7 +25,10 @@ class TestHubLifecycleApiIntegration:
         self.tmp_path = Path(self.tmp.name)
         self.data_dir = self.tmp_path / "hub"
         self.config = self.tmp_path / "agent.config.toml"
-        self.config.write_text("model = 'test'\n", encoding="utf-8")
+        self.config.write_text(
+            "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n",
+            encoding="utf-8",
+        )
         self.runner = CliRunner()
 
     def teardown_method(self) -> None:
@@ -113,6 +116,20 @@ class TestHubLifecycleApiIntegration:
         first_chat = first.json()["chat"]
         second_chat = second.json()["chat"]
         assert first_chat["id"] == second_chat["id"]
+
+    def test_project_chat_start_rejects_legacy_codex_args(self) -> None:
+        app = self._build_app()
+        state = app.state.hub_state
+        ids = self._seed_ready_project(state)
+
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/projects/{ids['project_id']}/chats/start",
+                json={"request_id": "req-legacy", "agent_type": "codex", "codex_args": []},
+            )
+
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"] == "codex_args is no longer supported; use agent_args."
 
     def test_chat_lifecycle_routes_and_events_snapshot(self) -> None:
         app = self._build_app()
