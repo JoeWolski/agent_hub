@@ -25,6 +25,7 @@ if str(HELPERS_DIR) not in sys.path:
     sys.path.insert(0, str(HELPERS_DIR))
 
 from helpers import insert_ready_project
+from conftest import canonical_runtime_config_text
 
 
 def _run(cmd: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -126,7 +127,7 @@ def test_real_hub_process_lifecycle_and_launch_profile(integration_tmp_dir: Path
 
     data_dir = integration_tmp_dir / "hub-data"
     config_file = integration_tmp_dir / "agent.config.toml"
-    config_file.write_text("model = 'test'\n", encoding="utf-8")
+    config_file.write_text(canonical_runtime_config_text(), encoding="utf-8")
 
     seed_state = hub_server.HubState(data_dir, config_file)
     repo_url = _seed_local_repo(integration_tmp_dir / "repos")

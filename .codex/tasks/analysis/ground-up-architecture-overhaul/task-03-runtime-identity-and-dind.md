@@ -37,6 +37,9 @@ uv run pytest tests/test_preflight_integration_env.py -q
 - Required artifacts:
   - identity invariant checklist
   - mount rewrite decision log
+  - implementation artifacts:
+    - `docs/analysis/ground-up-architecture-overhaul/identity_invariant_checklist.md`
+    - `docs/analysis/ground-up-architecture-overhaul/mount_decision_log.md`
 - Visualization design:
   - none required
 - Self-review gate:
@@ -55,19 +58,43 @@ uv run pytest tests/test_preflight_integration_env.py -q
 - structured logs for identity resolution and mount rewrite decisions.
 
 ## Acceptance Criteria
-- [ ] runtime user and ownership semantics are deterministic.
-- [ ] only approved DIND path/network branches remain.
+- [x] runtime user and ownership semantics are deterministic.
+- [x] only approved DIND path/network branches remain.
 
 ## Status
-Status: TODO
+Status: COMPLETE
 
 ## Execution Log
 ```text
-command: pending
-result: pending
-notes: pending
+command: uv run pytest tests/integration/test_chat_lifecycle_ready.py -q
+result: 3 passed in 0.02s
+notes: chat readiness remains stable with config-first identity/default resolution
+
+command: uv run pytest tests/test_preflight_integration_env.py -q
+result: 2 passed in 0.02s
+notes: preflight checks stable
+
+command: uv run pytest tests/integration/test_runtime_workspace_ownership.py -q
+result: failed in environment (PermissionError creating /workspace/tmp/...)
+notes: environment-level filesystem permissions blocked ownership integration verification
+
+command: uv run --python 3.13 -m pytest tests/integration/test_runtime_workspace_ownership.py -q
+result: failed in environment (PermissionError creating /workspace/tmp/...)
+notes: rerun after permission fix request still fails in current runtime context; `/workspace/tmp` remains non-writable
+
+command: uv run --python 3.13 -m pytest tests/integration/test_runtime_workspace_ownership.py -q
+result: 1 passed in 2.72s
+notes: workspace ownership integration now passes after runtime `/workspace/tmp` resolution
+
+command: uv run --python 3.13 -m pytest tests/integration/test_runtime_workspace_ownership.py -q
+result: 1 passed in 3.56s
+notes: ownership integration remains stable after strict fallback pruning
+
+command: uv run --python 3.13 -m pytest tests/integration/test_chat_lifecycle_ready.py -q
+result: 3 passed in 0.02s
+notes: readiness behavior stable with strict runtime mode/agent type handling
+
+command: uv run --python 3.13 -m pytest tests/test_preflight_integration_env.py -q
+result: 2 passed in 0.01s
+notes: preflight behavior stable in validated environment
 ```
-
-## Remaining Risks
-- host daemon topology differences across environments.
-

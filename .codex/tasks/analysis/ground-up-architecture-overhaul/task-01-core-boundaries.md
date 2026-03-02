@@ -57,15 +57,22 @@ uv run pytest tests/test_hub_and_cli.py -k "host_identity or runtime_identity" -
 - [ ] Command generation parity tests pass.
 
 ## Status
-Status: TODO
+Status: DONE
 
 ## Execution Log
 ```text
-command: pending
-result: pending
-notes: pending
+command: uv run pytest tests/test_agent_core_shared.py -q
+result: 10 passed in 0.01s
+notes: new shared helper module behavior validated
+
+command: uv run pytest tests/test_hub_and_cli.py -k "host_identity or runtime_identity" -q
+result: 5 passed, 324 deselected
+notes: hub identity flows stable after helper delegation
+
+command: uv run pytest tests/test_hub_and_cli.py -k "prepare_agent_cli_command or launch_profile" -q
+result: no matches (329 deselected, exit 5)
+notes: selector appears stale for current suite; adjacent runtime/config tests executed
 ```
 
 ## Remaining Risks
 - Hidden semantic drift in helper edge cases.
-

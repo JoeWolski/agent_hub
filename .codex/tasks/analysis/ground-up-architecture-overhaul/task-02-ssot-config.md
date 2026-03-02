@@ -35,6 +35,7 @@ uv run pytest tests/test_hub_and_cli.py -k "prepare_chat_runtime_config" -q
 - Required artifacts:
   - schema spec
   - env/flag to config mapping table
+  - implementation artifact: `docs/analysis/ground-up-architecture-overhaul/schema_mapping.md`
 - Visualization design:
   - none required
 - Self-review gate:
@@ -53,19 +54,31 @@ uv run pytest tests/test_hub_and_cli.py -k "prepare_chat_runtime_config" -q
 - config loader emits one structured startup summary and one structured error on failure.
 
 ## Acceptance Criteria
-- [ ] Every runtime field resolves from canonical config (with explicit overrides).
-- [ ] Invalid config fails startup deterministically.
+- [x] Every runtime field resolves from canonical config (with explicit overrides).
+- [x] Invalid config fails startup deterministically.
 
 ## Status
-Status: TODO
+Status: COMPLETE
 
 ## Execution Log
 ```text
-command: pending
-result: pending
-notes: pending
+command: uv run pytest tests/test_agent_core_config.py -q
+result: 5 passed in 0.01s
+notes: strict required-section validation + legacy provider-backfill removal validated
+
+command: uv run pytest tests/test_hub_and_cli.py -k "config or settings_payload" -q
+result: 49 passed, 280 deselected
+notes: startup/config payload behavior stable after strict canonical config adoption
+
+command: uv run pytest tests/test_hub_and_cli.py -k "prepare_chat_runtime_config" -q
+result: 3 passed, 326 deselected
+notes: runtime config materialization remains stable with strict schema
+
+command: uv run --python 3.13 -m pytest tests/test_hub_and_cli.py -k "config or settings_payload" -q
+result: 54 passed, 290 deselected, 10 warnings
+notes: startup/config payload behavior remains stable after config-first runtime identity and strict agent-type handling
+
+command: uv run --python 3.13 -m pytest tests/test_hub_and_cli.py -k "prepare_chat_runtime_config" -q
+result: 3 passed, 341 deselected
+notes: runtime config materialization remains stable after strict fallback pruning
 ```
-
-## Remaining Risks
-- Backward compatibility pressure from legacy env-based flows.
-

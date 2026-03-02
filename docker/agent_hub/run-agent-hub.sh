@@ -16,7 +16,7 @@ EOF
   exit 1
 fi
 
-shared_root="$(realpath -m "${AGENT_HUB_SHARED_ROOT:-/tmp/agent_hub_shared}")"
+shared_root="$(realpath -m "${AGENT_HUB_SHARED_ROOT:-/workspace/tmp/agent_hub_shared}")"
 data_dir="${AGENT_HUB_DATA_DIR:-${shared_root}/data}"
 config_file="${AGENT_HUB_CONFIG_FILE:-${shared_root}/config/agent.config.toml}"
 home_dir="${AGENT_HUB_HOME:-${shared_root}/home}"

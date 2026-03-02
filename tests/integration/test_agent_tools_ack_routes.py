@@ -23,7 +23,10 @@ class AgentToolsAckRouteIntegrationTests(unittest.TestCase):
         self.tmp_path = Path(self.tmp.name)
         self.data_dir = self.tmp_path / "hub"
         self.config = self.tmp_path / "agent.config.toml"
-        self.config.write_text("model = 'test'\n", encoding="utf-8")
+        self.config.write_text(
+            "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n",
+            encoding="utf-8",
+        )
         self.runner = CliRunner()
 
     def tearDown(self) -> None:
@@ -51,7 +54,7 @@ class AgentToolsAckRouteIntegrationTests(unittest.TestCase):
             with TestClient(app) as client:
                 response = client.post(
                     "/api/chats/chat-1/agent-tools/ack",
-                    headers={"authorization": "Bearer token-1"},
+                    headers={hub_server.AGENT_TOOLS_TOKEN_HEADER: "token-1"},
                     json={"guid": "guid-1", "stage": "container_bootstrapped", "meta": {}},
                 )
 

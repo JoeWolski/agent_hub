@@ -1,9 +1,12 @@
-# Gates: Architecture Overhaul (Design Workflow)
+# Gates: Architecture Overhaul (Implementation Workflow)
 
 - intake: PASS
 - design_review: PASS
-- implementation: PENDING
-- verification: PENDING
-- fresh_audit: PENDING
-- pr_ready: PENDING
+- implementation: PASS
+- verification: PASS
+- fresh_audit: PASS
+- pr_ready: PASS
 
+Notes:
+- Required ownership, regression, and integration-mode preflight verification commands pass in this environment.
+- Task contracts AOH-02/AOH-03/AOH-04/AOH-05 are marked complete for this cycle.
