@@ -62,3 +62,37 @@ def test_load_with_normalizer_error_does_not_write_partial_state() -> None:
             store.load(normalizer=raising_normalizer)
         persisted = json.loads(state_file.read_text(encoding="utf-8"))
         assert persisted == original
+
+
+def test_load_applies_step_migration_and_persists_target_version() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = Path(tmp) / "state.json"
+        state_file.write_text(json.dumps({"version": 0, "legacy": True}), encoding="utf-8")
+        store = _store_for(state_file)
+
+        loaded = store.load(
+            target_version=1,
+            migrations={
+                0: lambda state: {
+                    **state,
+                    "projects": {},
+                    "chats": {},
+                    "settings": {},
+                }
+            },
+        )
+
+        assert loaded["version"] == 1
+        persisted = json.loads(state_file.read_text(encoding="utf-8"))
+        assert persisted["version"] == 1
+        assert persisted["projects"] == {}
+
+
+def test_load_rejects_future_state_version() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = Path(tmp) / "state.json"
+        state_file.write_text(json.dumps({"version": 5}), encoding="utf-8")
+        store = _store_for(state_file)
+
+        with pytest.raises(RuntimeError, match="newer than supported target version"):
+            store.load(target_version=1, migrations={})

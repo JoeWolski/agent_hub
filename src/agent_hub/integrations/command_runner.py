@@ -4,7 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from fastapi import HTTPException
+from agent_core.errors import RuntimeCommandError
 
 
 def run_command(
@@ -30,6 +30,9 @@ def run_command(
     )
     if check and result.returncode != 0:
         message = (result.stdout or "") + (result.stderr or "")
-        raise HTTPException(status_code=400, detail=f"Command failed ({cmd[0]}): {message.strip()}")
+        raise RuntimeCommandError(
+            command=cmd,
+            exit_code=result.returncode,
+            output=message,
+        )
     return result
-

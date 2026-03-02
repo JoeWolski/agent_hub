@@ -32,7 +32,7 @@ class ArtifactsService:
         chat = self._state.chat(chat_id)
         if chat is None:
             raise HTTPException(status_code=404, detail="Chat not found.")
-        self._state._require_artifact_publish_token(chat, token)
+        self._state.require_artifact_publish_token(chat, token)
         workspace = self._state.chat_workdir(chat_id).resolve()
         if not workspace.exists():
             raise HTTPException(status_code=409, detail="Chat workspace is unavailable.")
@@ -56,7 +56,7 @@ class ArtifactsService:
         chat = self._state.chat(chat_id)
         if chat is None:
             raise HTTPException(status_code=404, detail="Chat not found.")
-        self._state._require_agent_tools_token(chat, token)
+        self._state.require_agent_tools_token(chat, token)
         workspace = self._state.chat_workdir(chat_id).resolve()
         if not workspace.exists():
             raise HTTPException(status_code=409, detail="Chat workspace is unavailable.")
@@ -71,8 +71,8 @@ class ArtifactsService:
         )
 
     def require_session_publish_workspace(self, *, session_id: str, token: Any) -> Path:
-        session = self._state._agent_tools_session(session_id)
-        self._state._require_session_artifact_publish_token(session, token)
+        session = self._state.agent_tools_session(session_id)
+        self._state.require_session_artifact_publish_token(session, token)
         workspace = Path(str(session.get("workspace") or "")).resolve()
         if not workspace.exists():
             raise HTTPException(status_code=409, detail="Session workspace is unavailable.")

@@ -84,13 +84,11 @@ class CodexProvider(AgentProvider):
         configured_approval = str(
             runtime_config.runtime.values.get("codex_approval_policy")
             or runtime_config.runtime.values.get("approval_policy")
-            or runtime_config.extras.get("approval_policy")
             or "never"
         ).strip()
         configured_sandbox = str(
             runtime_config.runtime.values.get("codex_sandbox_mode")
             or runtime_config.runtime.values.get("sandbox_mode")
-            or runtime_config.extras.get("sandbox_mode")
             or "danger-full-access"
         ).strip()
         

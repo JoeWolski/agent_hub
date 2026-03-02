@@ -16,6 +16,10 @@ from agent_core.errors import (
     IdentityError,
     MountVisibilityError,
     NetworkReachabilityError,
+    RuntimeCommandError,
+    RuntimeStateError,
+    StateStoreError,
+    typed_error_http_status,
     typed_error_metadata,
     typed_error_payload,
 )
@@ -23,27 +27,51 @@ from agent_hub import server as hub_server
 
 
 @pytest.mark.parametrize(
-    ("error", "error_code", "failure_class", "user_message"),
+    ("error", "error_code", "failure_class", "user_message", "http_status"),
     [
-        (ConfigError("config bad"), "CONFIG_ERROR", "configuration", "Configuration is invalid."),
-        (IdentityError("identity bad"), "IDENTITY_ERROR", "identity", "Runtime identity resolution failed."),
+        (ConfigError("config bad"), "CONFIG_ERROR", "configuration", "Configuration is invalid.", 400),
+        (IdentityError("identity bad"), "IDENTITY_ERROR", "identity", "Runtime identity resolution failed.", 400),
         (
             MountVisibilityError("mount bad"),
             "MOUNT_VISIBILITY_ERROR",
             "mount_visibility",
             "Mount path is not visible to the runtime.",
+            409,
         ),
         (
             NetworkReachabilityError("network bad"),
             "NETWORK_REACHABILITY_ERROR",
             "network",
             "Required network endpoint is not reachable.",
+            502,
         ),
         (
             CredentialResolutionError("credential bad"),
             "CREDENTIAL_RESOLUTION_ERROR",
             "credentials",
             "Credential resolution failed.",
+            401,
+        ),
+        (
+            RuntimeCommandError(command=["uv", "run", "agent_hub"], exit_code=7, output="See log at /tmp/run.log"),
+            "RUNTIME_COMMAND_ERROR",
+            "runtime_command",
+            "Runtime command execution failed.",
+            400,
+        ),
+        (
+            RuntimeStateError("chat is not running"),
+            "RUNTIME_STATE_ERROR",
+            "runtime_state",
+            "Runtime state operation failed.",
+            409,
+        ),
+        (
+            StateStoreError("state file is corrupt"),
+            "STATE_STORE_ERROR",
+            "state_store",
+            "Persistent state store operation failed.",
+            500,
         ),
     ],
 )
@@ -52,6 +80,7 @@ def test_typed_errors_expose_deterministic_metadata_and_payload(
     error_code: str,
     failure_class: str,
     user_message: str,
+    http_status: int,
 ) -> None:
     metadata = typed_error_metadata(error)
     assert metadata == {
@@ -66,12 +95,14 @@ def test_typed_errors_expose_deterministic_metadata_and_payload(
         "user_message": user_message,
         "detail": str(error),
     }
+    assert typed_error_http_status(error) == http_status
 
 
 def test_typed_error_helpers_return_none_for_untyped_exceptions() -> None:
     exc = RuntimeError("boom")
     assert typed_error_metadata(exc) is None
     assert typed_error_payload(exc) is None
+    assert typed_error_http_status(exc) is None
 
 
 def test_hub_core_error_payload_maps_typed_error_with_metadata() -> None:

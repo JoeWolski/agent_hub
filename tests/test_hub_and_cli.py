@@ -40,6 +40,10 @@ if str(SRC) not in sys.path:
 import agent_hub.server as hub_server
 import agent_hub.agent_tools_mcp as agent_tools_mcp
 import agent_cli.cli as image_cli
+from agent_cli.services import SnapshotService
+from agent_core import identity as core_identity
+from agent_core.errors import IdentityError
+from agent_core.errors import RuntimeCommandError
 from agent_core import launch as core_launch
 
 
@@ -278,6 +282,21 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(uid, 1234)
         self.assertEqual(gid, 2345)
         self.assertEqual(supplementary, "2345,3000,3001")
+
+    def test_resolve_hub_runtime_identity_delegates_to_core_resolver(self) -> None:
+        expected = core_identity.RuntimeIdentity(
+            username="ignored",
+            uid=1234,
+            gid=2345,
+            supplementary_gids="3000,3001",
+        )
+        with patch("agent_hub.server.core_identity.resolve_runtime_identity", return_value=expected) as resolve_mock:
+            uid, gid, supplementary = hub_server._resolve_hub_runtime_identity()
+
+        self.assertEqual(uid, 1234)
+        self.assertEqual(gid, 2345)
+        self.assertEqual(supplementary, "3000,3001")
+        resolve_mock.assert_called_once()
 
     def test_runtime_identity_with_config_partial_uid_gid_is_rejected(self) -> None:
         config_file = self.tmp_path / "identity-partial.config.toml"
@@ -805,16 +824,16 @@ class HubStateTests(unittest.TestCase):
     def test_ensure_agent_capability_runtime_image_uses_default_runtime_tag(self) -> None:
         expected_runtime_image = "agent-ubuntu2204-gemini:latest"
         with patch(
-            "agent_hub.server.agent_cli_image._default_runtime_image_for_provider",
+            "agent_hub.server._default_runtime_image_for_provider",
             return_value=expected_runtime_image,
         ) as default_runtime_image, patch(
-            "agent_hub.server.agent_cli_image._ensure_runtime_image_built_if_missing",
+            "agent_hub.server._ensure_runtime_image_built_if_missing",
         ) as ensure_runtime_image:
             runtime_image = hub_server._ensure_agent_capability_runtime_image(hub_server.AGENT_TYPE_GEMINI)
         self.assertEqual(runtime_image, expected_runtime_image)
         default_runtime_image.assert_called_once_with(hub_server.AGENT_TYPE_GEMINI)
         ensure_runtime_image.assert_called_once_with(
-            base_image=hub_server.agent_cli_image.DEFAULT_BASE_IMAGE,
+            base_image=hub_server.AGENT_CLI_BASE_IMAGE,
             target_image="agent-ubuntu2204-gemini:latest",
             agent_provider=hub_server.AGENT_TYPE_GEMINI,
         )
@@ -2197,8 +2216,8 @@ Gemini CLI
             "agent_hub.server.subprocess.Popen",
             side_effect=fake_popen,
         ), patch.object(
-            hub_server.HubState,
-            "_start_openai_login_reader",
+            self.state.openai_account_service,
+            "start_openai_login_reader",
             return_value=None,
         ):
             payload = self.state.start_openai_account_login(method="browser_callback")
@@ -2246,8 +2265,8 @@ Gemini CLI
             "agent_hub.server.subprocess.Popen",
             side_effect=fake_popen,
         ), patch.object(
-            hub_server.HubState,
-            "_start_openai_login_reader",
+            self.state.openai_account_service,
+            "start_openai_login_reader",
             return_value=None,
         ):
             payload = self.state.start_openai_account_login(method="device_auth")
@@ -2730,6 +2749,21 @@ Gemini CLI
             ["http://10.0.1.1:1455/auth/callback?code=abc&state=xyz"],
         )
 
+    def test_forward_openai_account_callback_rejects_invalid_session_callback_metadata(self) -> None:
+        self.state._openai_login_session = hub_server.OpenAIAccountLoginSession(
+            id="session-invalid-callback-metadata",
+            process=SimpleNamespace(pid=10001, poll=lambda: None),
+            container_name="container-invalid-callback-metadata",
+            started_at="2026-02-21T00:00:00Z",
+            status="waiting_for_browser",
+            callback_port=0,
+            callback_path="auth/callback",
+        )
+        with patch("agent_hub.server._is_process_running", return_value=True):
+            with self.assertRaises(HTTPException) as raised:
+                self.state.forward_openai_account_callback("code=abc&state=xyz", path="/auth/callback")
+        self.assertEqual(raised.exception.status_code, 409)
+
     def test_discover_openai_callback_bridge_hosts_uses_docker_bridge_only(self) -> None:
         with patch(
             "agent_hub.server._discover_linux_default_gateway_host",
@@ -2824,6 +2858,30 @@ Gemini CLI
             hub_server._agent_tools_mcp_source_path().read_text(encoding="utf-8"),
         )
         self.assertEqual(self.state.agent_tools_mcp_runtime_script.stat().st_mode & 0o700, 0o600)
+
+    def test_prepare_chat_runtime_config_fails_when_existing_mcp_script_read_fails(self) -> None:
+        self.state.agent_tools_mcp_runtime_script.parent.mkdir(parents=True, exist_ok=True)
+        self.state.agent_tools_mcp_runtime_script.write_text("# stale", encoding="utf-8")
+        original_read_text = Path.read_text
+
+        def failing_read_text(path_obj: Path, *args: Any, **kwargs: Any) -> str:
+            if path_obj == self.state.agent_tools_mcp_runtime_script:
+                raise OSError("permission denied")
+            return original_read_text(path_obj, *args, **kwargs)
+
+        with patch("pathlib.Path.read_text", autospec=True, side_effect=failing_read_text):
+            with self.assertRaisesRegex(
+                hub_server.ConfigError,
+                "Failed to read existing agent_tools MCP runtime script",
+            ):
+                self.state._prepare_chat_runtime_config(
+                    "chat-mcp-read-fail",
+                    agent_type="codex",
+                    agent_tools_url="http://host.docker.internal:8765/api/chats/chat-mcp-read-fail/agent-tools",
+                    agent_tools_token="mcp-token-test",
+                    agent_tools_project_id="project-mcp-test",
+                    agent_tools_chat_id="chat-mcp-read-fail",
+                )
 
     def test_prepare_chat_runtime_config_uses_json_for_gemini(self) -> None:
         self.config_file.write_text("[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n", encoding="utf-8")
@@ -3340,7 +3398,7 @@ Gemini CLI
             prepare_snapshot_only=True,
         )
 
-        expected_runtime_image = hub_server.agent_cli_image._snapshot_setup_runtime_image_for_snapshot(snapshot_tag)
+        expected_runtime_image = hub_server._snapshot_setup_runtime_image_for_snapshot(snapshot_tag)
         self.assertEqual(profile["mode"], "project_snapshot")
         self.assertEqual(profile["snapshot_tag"], snapshot_tag)
         self.assertEqual(profile["runtime_image"], expected_runtime_image)
@@ -5208,12 +5266,14 @@ Gemini CLI
             hub_server,
             "LOGGER",
         ) as fake_logger:
-            with self.assertRaises(HTTPException) as context:
+            with self.assertRaises(RuntimeCommandError) as context:
                 hub_server._run_logged(["uv", "run", "agent_hub"], log_path=log_path, check=True)
 
         contents = log_path.read_text(encoding="utf-8")
         self.assertIn("$ exit_code=7", contents)
-        self.assertEqual(str(context.exception.detail), "Command failed (uv) with exit code 7")
+        self.assertEqual(str(context.exception), f"Command failed (uv run agent_hub) with exit code 7: See log at {log_path}")
+        self.assertEqual(context.exception.error_code, "RUNTIME_COMMAND_ERROR")
+        self.assertEqual(context.exception.http_status, 400)
         self.assertTrue(fake_logger.warning.called)
 
     def test_delete_path_fails_fast_on_permission_error(self) -> None:
@@ -7934,6 +7994,82 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("System prompt file does not exist", result_flag.output)
             self.assertIn("System prompt file does not exist", result_equals.output)
 
+    def test_agent_cli_rejects_base_with_base_docker_context_or_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("[runtime]\n", encoding="utf-8")
+
+            runner = CliRunner()
+            result = runner.invoke(
+                image_cli.main,
+                [
+                    "--project",
+                    str(project),
+                    "--config-file",
+                    str(config),
+                    "--base",
+                    str(project),
+                    "--base-docker-context",
+                    str(project),
+                ],
+            )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("--base cannot be combined with --base-docker-context", result.output)
+
+    def test_agent_cli_rejects_base_image_with_base_docker_source_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("[runtime]\n", encoding="utf-8")
+
+            runner = CliRunner()
+            result = runner.invoke(
+                image_cli.main,
+                [
+                    "--project",
+                    str(project),
+                    "--config-file",
+                    str(config),
+                    "--base-image",
+                    "ubuntu:24.04",
+                    "--base-docker-context",
+                    str(project),
+                ],
+            )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("--base-image cannot be combined", result.output)
+
+    def test_agent_cli_rejects_base_image_tag_without_docker_source_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("[runtime]\n", encoding="utf-8")
+
+            runner = CliRunner()
+            result = runner.invoke(
+                image_cli.main,
+                [
+                    "--project",
+                    str(project),
+                    "--config-file",
+                    str(config),
+                    "--base-image-tag",
+                    "agent-custom-base:test",
+                ],
+            )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("--base-image-tag requires --base", result.output)
+
     def test_agent_cli_native_run_mode_from_config_fails_without_docker_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -7992,6 +8128,8 @@ class CliEnvVarTests(unittest.TestCase):
             ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
+                "agent_cli.cli._validate_rw_mount", return_value=None
+            ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
             ), patch(
                 "agent_cli.cli._run", side_effect=fake_run
@@ -8035,6 +8173,8 @@ class CliEnvVarTests(unittest.TestCase):
                 "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
             ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._validate_rw_mount", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
             ), patch(
@@ -8119,6 +8259,43 @@ class CliEnvVarTests(unittest.TestCase):
                 (1010, 2020, "config-user", "3000,3001"),
             )
 
+    def test_agent_cli_translates_identity_error_at_click_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n"
+                "[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n"
+                "[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nrun_mode = 'docker'\n",
+                encoding="utf-8",
+            )
+            system_prompt = tmp_path / "SYSTEM_PROMPT.md"
+            system_prompt.write_text("system prompt", encoding="utf-8")
+
+            runner = CliRunner()
+            with patch("agent_cli.cli._validate_daemon_visible_mount_source", return_value=None), patch(
+                "agent_cli.cli.core_identity.resolve_runtime_identity",
+                side_effect=IdentityError("identity exploded"),
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--system-prompt-file",
+                        str(system_prompt),
+                        "--run-mode",
+                        "docker",
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("identity exploded", result.output)
+
     def test_snapshot_setup_script_prepares_workspace_tmp(self) -> None:
         script = image_cli._build_snapshot_setup_shell_script(
             "echo hello",
@@ -8144,6 +8321,46 @@ class CliEnvVarTests(unittest.TestCase):
         self.assertTrue(first_runtime.startswith("agent-runtime-setup-"))
         self.assertTrue(second_runtime.startswith("agent-runtime-setup-"))
         self.assertNotEqual(first_runtime, second_runtime)
+
+    def test_snapshot_service_fails_fast_when_user_flag_missing_for_setup_rewrite(self) -> None:
+        service = SnapshotService(
+            none_provider=image_cli.AGENT_PROVIDER_NONE,
+            codex_provider=image_cli.AGENT_PROVIDER_CODEX,
+            claude_provider=image_cli.AGENT_PROVIDER_CLAUDE,
+            gemini_provider=image_cli.AGENT_PROVIDER_GEMINI,
+            default_container_home=image_cli.DEFAULT_CONTAINER_HOME,
+            snapshot_source_project_path=image_cli.SNAPSHOT_SOURCE_PROJECT_PATH,
+            snapshot_setup_runtime_image_for_snapshot=lambda _tag: "setup-runtime:test",
+            snapshot_runtime_image_for_provider=lambda _tag, _provider: "provider-runtime:test",
+            ensure_runtime_image_built_if_missing=lambda **_kwargs: None,
+            build_runtime_image=lambda **_kwargs: None,
+            build_snapshot_setup_shell_script=lambda *_args, **_kwargs: "echo setup",
+            sanitize_tag_component=lambda value: value,
+            short_hash=lambda _value: "abc123",
+            docker_rm_force=lambda _name: None,
+            run_command=lambda _cmd, _cwd: None,
+            click_echo=lambda *_args, **_kwargs: None,
+        )
+
+        with self.assertRaises(ClickException) as exc:
+            service.resolve_runtime_image(
+                default_runtime_image="runtime:test",
+                selected_agent_provider=image_cli.AGENT_PROVIDER_CODEX,
+                snapshot_tag="snapshot:test",
+                prepare_snapshot_only=True,
+                cached_snapshot_exists=False,
+                use_project_bind_mount=False,
+                setup_script="echo hello",
+                run_args=["--init", "--workdir", "/workspace/project"],
+                daemon_project_path=Path("/workspace/project"),
+                container_project_path="/workspace/project",
+                project_path=Path("/workspace/project"),
+                uid=1000,
+                gid=1000,
+                ensure_selected_base_image=lambda: "base:test",
+            )
+
+        self.assertIn("include --user", str(exc.exception))
 
     def test_prepare_daemon_visible_file_mount_source_fails_when_daemon_resolves_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -8179,6 +8396,83 @@ class CliEnvVarTests(unittest.TestCase):
                     label="--config-file",
                 )
             self.assertEqual(resolved, source.resolve())
+
+    def test_prepare_daemon_visible_file_mount_source_validates_translated_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "config.toml"
+            source.write_text("model='test'\n", encoding="utf-8")
+            translated = Path("/tmp/translated-config.toml")
+            with patch("agent_cli.cli._is_running_inside_container", return_value=True), patch(
+                "agent_cli.cli._daemon_visible_mount_source",
+                return_value=translated,
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind",
+                return_value="file",
+            ), patch("agent_cli.cli._validate_daemon_visible_mount_source") as validate_mount:
+                image_cli._prepare_daemon_visible_file_mount_source(
+                    source,
+                    label="--config-file",
+                )
+
+            self.assertEqual(validate_mount.call_count, 2)
+            self.assertEqual(validate_mount.call_args_list[0].kwargs["label"], "--config-file")
+            self.assertEqual(validate_mount.call_args_list[1].kwargs["label"], "--config-file (mapped)")
+            self.assertEqual(validate_mount.call_args_list[1].args[0], translated)
+
+    def test_agent_cli_fails_when_mapped_ro_mount_source_validation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n",
+                encoding="utf-8",
+            )
+            ro_mount = tmp_path / "ro-mount"
+            ro_mount.mkdir(parents=True, exist_ok=True)
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            def fake_validate(path: Path, *, label: str) -> None:
+                if label == "--ro-mount (mapped)" and Path(path) == Path("/tmp/mapped-ro-mount"):
+                    raise ClickException("mapped mount source is not daemon-visible")
+
+            def fake_mapped_source(path: Path) -> Path:
+                if path.resolve() == ro_mount.resolve():
+                    return Path("/tmp/mapped-ro-mount")
+                return path.resolve()
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", side_effect=fake_validate
+            ), patch(
+                "agent_cli.cli._daemon_visible_mount_source", side_effect=fake_mapped_source
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--ro-mount",
+                        f"{ro_mount}:/workspace/external",
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("mapped mount source is not daemon-visible", result.output)
+            self.assertEqual(commands, [])
 
     def test_snapshot_commit_resets_entrypoint_and_cmd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -8443,6 +8737,8 @@ class CliEnvVarTests(unittest.TestCase):
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
+                "agent_cli.cli._validate_rw_mount", return_value=None
+            ) as validate_rw_mount, patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
             ), patch(
                 "agent_cli.cli._run", side_effect=fake_run
@@ -8461,6 +8757,18 @@ class CliEnvVarTests(unittest.TestCase):
 
             self.assertEqual(result.exit_code, 0, msg=result.output)
             self.assertIn("Running RW mount preflight checks", result.output)
+            validate_rw_mount.assert_any_call(
+                rw_mount,
+                "/workspace/.cache",
+                runtime_uid=os.getuid(),
+                runtime_gid=os.getgid(),
+            )
+            validate_rw_mount.assert_any_call(
+                project,
+                "/workspace/project",
+                runtime_uid=os.getuid(),
+                runtime_gid=os.getgid(),
+            )
             docker_run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
             self.assertIsNotNone(docker_run_cmd)
 
@@ -9311,7 +9619,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("--no-sandbox", gemini_args)
             self.assertNotIn("yolo", gemini_args)
 
-    def test_shared_prompt_context_from_config_uses_toml_runtime_config_file(self) -> None:
+    def test_shared_prompt_context_from_runtime_config_uses_toml_runtime_config_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             config = tmp_path / "runtime-config.toml"
@@ -9319,9 +9627,10 @@ class CliEnvVarTests(unittest.TestCase):
                 "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\nproject_doc_auto_load = true\nproject_doc_fallback_filenames = ['AGENTS.md', 'README.md']\nproject_doc_auto_load_extra_filenames = ['docs/agent-setup.md']\nproject_doc_max_bytes = 4096\n",
                 encoding="utf-8",
             )
+            runtime_config = image_cli.load_agent_runtime_config(config)
 
-            shared_prompt = image_cli._shared_prompt_context_from_config(
-                config,
+            shared_prompt = image_cli._shared_prompt_context_from_runtime_config(
+                runtime_config,
                 core_system_prompt="Shared instruction for this run.",
             )
 
@@ -9390,8 +9699,8 @@ class CliEnvVarTests(unittest.TestCase):
 
             self.assertEqual(result.exit_code, 0, msg=result.output)
             updated_context = gemini_context_file.read_text(encoding="utf-8")
-            expected_context = image_cli._shared_prompt_context_from_config(
-                config,
+            expected_context = image_cli._shared_prompt_context_from_runtime_config(
+                image_cli.load_agent_runtime_config(config),
                 core_system_prompt=system_prompt.read_text(encoding="utf-8").strip(),
             )
             self.assertEqual(updated_context, f"{expected_context}\n")
@@ -10127,7 +10436,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn(claude_config_mount, run_cmd)
             self.assertIn(gemini_mount, run_cmd)
 
-    def test_cli_ignores_custom_git_credential_flags(self) -> None:
+    def test_cli_rejects_custom_git_credential_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
@@ -10140,12 +10449,6 @@ class CliEnvVarTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            commands: list[list[str]] = []
-
-            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
-                del cwd
-                commands.append(list(cmd))
-
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
                 "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
@@ -10153,8 +10456,6 @@ class CliEnvVarTests(unittest.TestCase):
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
-            ), patch(
-                "agent_cli.cli._run", side_effect=fake_run
             ):
                 result = runner.invoke(
                     image_cli.main,
@@ -10170,24 +10471,10 @@ class CliEnvVarTests(unittest.TestCase):
                     ],
                 )
 
-            self.assertEqual(result.exit_code, 0, msg=result.output)
-            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
-            self.assertIsNotNone(run_cmd)
-            assert run_cmd is not None
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("The --git-credential-* flags are no longer supported.", result.output)
 
-            env_values = [
-                run_cmd[index + 1]
-                for index, part in enumerate(run_cmd[:-1])
-                if part == "--env"
-            ]
-            self.assertNotIn("GIT_TERMINAL_PROMPT=0", env_values)
-            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIALS_") for value in env_values))
-            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIAL_HOST=") for value in env_values))
-            self.assertFalse(any(value.startswith("GIT_CONFIG_KEY_") for value in env_values))
-            self.assertFalse(any(value.startswith("GIT_CONFIG_VALUE_") for value in env_values))
-            self.assertIn("Ignoring --git-credential-* flags.", result.output)
-
-    def test_cli_ignores_custom_git_credential_flags_with_host_port_and_scheme(self) -> None:
+    def test_cli_rejects_custom_git_credential_flags_with_host_port_and_scheme(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
@@ -10200,12 +10487,6 @@ class CliEnvVarTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            commands: list[list[str]] = []
-
-            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
-                del cwd
-                commands.append(list(cmd))
-
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
                 "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
@@ -10213,8 +10494,6 @@ class CliEnvVarTests(unittest.TestCase):
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
-            ), patch(
-                "agent_cli.cli._run", side_effect=fake_run
             ):
                 result = runner.invoke(
                     image_cli.main,
@@ -10232,21 +10511,8 @@ class CliEnvVarTests(unittest.TestCase):
                     ],
                 )
 
-            self.assertEqual(result.exit_code, 0, msg=result.output)
-            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
-            self.assertIsNotNone(run_cmd)
-            assert run_cmd is not None
-
-            env_values = [
-                run_cmd[index + 1]
-                for index, part in enumerate(run_cmd[:-1])
-                if part == "--env"
-            ]
-            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIAL_HOST=") for value in env_values))
-            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIAL_SCHEME=") for value in env_values))
-            self.assertFalse(any(value.startswith("GIT_CONFIG_KEY_") for value in env_values))
-            self.assertFalse(any(value.startswith("GIT_CONFIG_VALUE_") for value in env_values))
-            self.assertIn("Ignoring --git-credential-* flags.", result.output)
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("The --git-credential-* flags are no longer supported.", result.output)
 
     def test_cli_does_not_auto_discover_agent_hub_git_credentials_when_flags_not_provided(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -10690,6 +10956,8 @@ class CliEnvVarTests(unittest.TestCase):
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
+                "agent_cli.cli._validate_rw_mount", return_value=None
+            ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
             ), patch(
                 "agent_cli.cli._docker_socket_gid", return_value=4444
@@ -10745,6 +11013,8 @@ class CliEnvVarTests(unittest.TestCase):
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._validate_rw_mount", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
             ), patch(
@@ -11053,6 +11323,34 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, msg=result.output)
             kwargs = uvicorn_run.call_args.kwargs
             self.assertEqual(kwargs.get("log_level"), "warning")
+
+    def test_agent_hub_main_rejects_invalid_config_log_level(self) -> None:
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = tmp_path / "hub"
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\nlevel = 'invalid-level'\n\n[runtime]\n",
+                encoding="utf-8",
+            )
+
+            with patch("agent_hub.server.uvicorn.run", return_value=None) as uvicorn_run:
+                result = runner.invoke(
+                    hub_server.main,
+                    [
+                        "--data-dir",
+                        str(data_dir),
+                        "--config-file",
+                        str(config),
+                        "--no-frontend-build",
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIsNotNone(result.exception)
+            self.assertIn("Invalid logging.level", str(result.exception))
+            uvicorn_run.assert_not_called()
 
     def test_agent_hub_main_caps_uvicorn_log_level_at_info_for_debug(self) -> None:
         runner = CliRunner()
@@ -11972,6 +12270,24 @@ class HubApiAsyncRouteTests(unittest.TestCase):
                 response = client.post("/api/chats/chat-1/start")
         self.assertEqual(response.status_code, 400, msg=response.text)
         self.assertEqual(response.json()["error_code"], "IDENTITY_ERROR")
+
+    def test_chat_start_route_surfaces_runtime_command_error_code(self) -> None:
+        app = self._build_app()
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ), patch.object(
+            hub_server.ChatService,
+            "start_chat",
+            side_effect=RuntimeCommandError(command=["uv", "run", "agent_hub"], exit_code=3),
+        ):
+            with TestClient(app) as client:
+                response = client.post("/api/chats/chat-1/start")
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["error_code"], "RUNTIME_COMMAND_ERROR")
+        self.assertEqual(response.json()["failure_class"], "runtime_command")
+        self.assertEqual(response.json()["user_message"], "Runtime command execution failed.")
+        self.assertIn("uv run agent_hub", response.json()["detail"])
 
     def test_terminal_websocket_disconnect_during_backlog_send_detaches_listener(self) -> None:
         app = self._build_app()

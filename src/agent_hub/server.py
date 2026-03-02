@@ -37,7 +37,6 @@ from threading import Lock, Thread, current_thread
 from typing import Any, Callable
 
 import click
-from agent_cli import cli as agent_cli_image
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, UploadFile, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -52,7 +51,7 @@ from agent_core import (
     NetworkReachabilityError,
     load_agent_runtime_config,
 )
-from agent_core.errors import TypedAgentError, typed_error_payload
+from agent_core.errors import RuntimeCommandError, TypedAgentError, typed_error_http_status, typed_error_payload
 from agent_core import identity as core_identity
 from agent_core import launch as core_launch
 from agent_core import logging as core_logging
@@ -61,10 +60,7 @@ from agent_core import shared as core_shared
 from agent_hub.api import register_hub_routes
 from agent_hub.domains import (
     AuthDomain,
-    AutoConfigDomain,
-    ChatRuntimeDomain,
     CredentialsDomain,
-    ProjectDomain,
     RuntimeDomain,
 )
 from agent_hub.services.artifacts_service import ArtifactsService
@@ -75,6 +71,7 @@ from agent_hub.services.chat_service import ChatService
 from agent_hub.services.credentials_service import CredentialsService
 from agent_hub.services.event_service import EventService
 from agent_hub.services.lifecycle_service import LifecycleService
+from agent_hub.services.openai_account_service import OpenAIAccountService
 from agent_hub.services.project_service import ProjectService
 from agent_hub.services.runtime_service import RuntimeService
 from agent_hub.services.settings_service import SettingsService
@@ -174,6 +171,11 @@ OPENAI_ACCOUNT_CALLBACK_SENSITIVE_QUERY_KEYS = frozenset(
     }
 )
 DEFAULT_AGENT_IMAGE = "agent-ubuntu2204-codex:latest"
+AGENT_CLI_BASE_IMAGE = "agent-cli-base"
+CLAUDE_RUNTIME_IMAGE = "agent-ubuntu2204-claude:latest"
+GEMINI_RUNTIME_IMAGE = "agent-ubuntu2204-gemini:latest"
+AGENT_CLI_DOCKERFILE = "docker/agent_cli/Dockerfile"
+AGENT_CLI_BASE_DOCKERFILE = "docker/agent_cli/Dockerfile.base"
 AGENT_TYPE_CODEX = "codex"
 AGENT_TYPE_CLAUDE = "claude"
 AGENT_TYPE_GEMINI = "gemini"
@@ -674,10 +676,13 @@ def _frontend_index_file() -> Path:
     return _frontend_dist_dir() / "index.html"
 
 
-def _normalize_log_level(value: Any) -> str:
+def _normalize_log_level(value: Any, *, strict: bool = False, source_name: str = "logging.level") -> str:
     normalized = str(value or "").strip().lower()
     if normalized in HUB_LOG_LEVEL_CHOICES:
         return normalized
+    if strict:
+        supported = ", ".join(sorted(HUB_LOG_LEVEL_CHOICES))
+        raise ConfigError(f"Invalid {source_name}: {value!r}. Supported values: {supported}.")
     return "info"
 
 
@@ -872,20 +877,20 @@ class _StructuredLogDefaultsFilter(logging.Filter):
 
 
 def _configure_hub_logging(level: str) -> None:
-    normalized = _normalize_log_level(level)
+    normalized = _normalize_log_level(level, strict=True, source_name="hub log level")
     core_logging.configure_structured_logger(LOGGER, level=normalized)
 
 
 def _resolve_hub_log_level(log_level: str | None, runtime_config: AgentRuntimeConfig | None) -> str:
     cli_value = str(log_level or "").strip()
     if cli_value:
-        return _normalize_log_level(cli_value)
+        return _normalize_log_level(cli_value, strict=True, source_name="--log-level")
 
     config_value = ""
     if runtime_config is not None and isinstance(runtime_config.logging.values, dict):
         config_value = str(runtime_config.logging.values.get("level") or "").strip()
     if config_value:
-        return _normalize_log_level(config_value)
+        return _normalize_log_level(config_value, strict=True, source_name="logging.level")
     return _normalize_log_level("info")
 
 
@@ -895,21 +900,14 @@ def _configure_domain_log_levels(runtime_config: AgentRuntimeConfig | None) -> N
     core_logging.configure_domain_log_levels(
         domains=runtime_config.logging.values.get("domains"),
         logger_prefix="agent_hub",
-        normalize_level=_normalize_log_level,
+        normalize_level=lambda value: _normalize_log_level(value, strict=True, source_name="logging.domains.*"),
     )
 
 
 def _core_error_payload(exc: BaseException) -> tuple[int, dict[str, Any]]:
     typed_payload = typed_error_payload(exc)
     if typed_payload is not None:
-        status_by_code = {
-            "CONFIG_ERROR": 400,
-            "IDENTITY_ERROR": 400,
-            "MOUNT_VISIBILITY_ERROR": 409,
-            "NETWORK_REACHABILITY_ERROR": 502,
-            "CREDENTIAL_RESOLUTION_ERROR": 401,
-        }
-        status = status_by_code.get(str(typed_payload.get("error_code") or ""), 500)
+        status = typed_error_http_status(exc) or 500
         return status, typed_payload
     return 500, {"error_code": "INTERNAL_ERROR", "detail": str(exc)}
 
@@ -1227,7 +1225,11 @@ def _run_logged(
             completed.returncode,
             elapsed_ms,
         )
-        raise HTTPException(status_code=400, detail=f"Command failed ({cmd[0]}) with exit code {completed.returncode}")
+        raise RuntimeCommandError(
+            command=cmd,
+            exit_code=completed.returncode,
+            output=f"See log at {log_path}",
+        )
     LOGGER.debug(
         "Command completed (snapshot task): command=%s exit_code=%s elapsed_ms=%s",
         command_line.split(" ", 1)[0] if command_line else "<unknown>",
@@ -1290,6 +1292,10 @@ def _normalize_project_credential_binding(raw_binding: Any, *, strict: bool = Fa
         "source": source,
         "updated_at": updated_at,
     }
+
+
+def normalize_project_credential_binding(raw_binding: Any, *, strict: bool = False) -> dict[str, Any]:
+    return _normalize_project_credential_binding(raw_binding, strict=strict)
 
 
 def _ordered_supported_agent_types() -> tuple[str, ...]:
@@ -1874,17 +1880,88 @@ def _agent_capability_provider_for_command(command: str) -> str:
     return ""
 
 
+def _short_hash(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _default_runtime_image_for_provider(agent_provider: str) -> str:
+    normalized_provider = _normalize_chat_agent_type(agent_provider, strict=True)
+    if normalized_provider == AGENT_TYPE_CLAUDE:
+        return CLAUDE_RUNTIME_IMAGE
+    if normalized_provider == AGENT_TYPE_GEMINI:
+        return GEMINI_RUNTIME_IMAGE
+    return DEFAULT_AGENT_IMAGE
+
+
+def _snapshot_setup_runtime_image_for_snapshot(snapshot_tag: str) -> str:
+    normalized_snapshot_tag = str(snapshot_tag or "").strip()
+    if not normalized_snapshot_tag:
+        raise ConfigError("Snapshot tag is required to resolve setup runtime image.")
+    return f"agent-runtime-setup-{_short_hash(normalized_snapshot_tag)}"
+
+
+def _build_runtime_image(*, base_image: str, target_image: str, agent_provider: str) -> None:
+    _run(
+        [
+            "docker",
+            "build",
+            "-f",
+            str(_repo_root() / AGENT_CLI_DOCKERFILE),
+            "--build-arg",
+            f"BASE_IMAGE={base_image}",
+            "--build-arg",
+            f"AGENT_PROVIDER={agent_provider}",
+            "-t",
+            target_image,
+            str(_repo_root()),
+        ],
+        cwd=_repo_root(),
+    )
+
+
+def _ensure_agent_cli_base_image_built() -> None:
+    _run(
+        [
+            "docker",
+            "build",
+            "-f",
+            str(_repo_root() / AGENT_CLI_BASE_DOCKERFILE),
+            "-t",
+            AGENT_CLI_BASE_IMAGE,
+            str(_repo_root()),
+        ],
+        cwd=_repo_root(),
+    )
+
+
+def _ensure_runtime_image_built_if_missing(
+    *,
+    base_image: str,
+    target_image: str,
+    agent_provider: str,
+) -> None:
+    if base_image == AGENT_CLI_BASE_IMAGE:
+        _ensure_agent_cli_base_image_built()
+    if _docker_image_exists(target_image):
+        return
+    _build_runtime_image(
+        base_image=base_image,
+        target_image=target_image,
+        agent_provider=agent_provider,
+    )
+
+
 def _ensure_agent_capability_runtime_image(agent_provider: str) -> str:
     normalized_provider = _normalize_chat_agent_type(agent_provider, strict=True)
-    base_image = agent_cli_image.DEFAULT_BASE_IMAGE
-    runtime_image = agent_cli_image._default_runtime_image_for_provider(normalized_provider)
+    base_image = AGENT_CLI_BASE_IMAGE
+    runtime_image = _default_runtime_image_for_provider(normalized_provider)
     try:
-        agent_cli_image._ensure_runtime_image_built_if_missing(
+        _ensure_runtime_image_built_if_missing(
             base_image=base_image,
             target_image=runtime_image,
             agent_provider=normalized_provider,
         )
-    except click.ClickException as exc:
+    except RuntimeCommandError as exc:
         raise RuntimeError(
             "Capability discovery runtime image build failed "
             f"(base_image={base_image}, provider={normalized_provider}, target_image={runtime_image}): {exc}"
@@ -2291,6 +2368,10 @@ def _git_repo_host(repo_url: str) -> str:
     return ""
 
 
+def git_repo_host(repo_url: str) -> str:
+    return _git_repo_host(repo_url)
+
+
 def _git_repo_scheme(repo_url: str) -> str:
     candidate = str(repo_url or "").strip()
     if not candidate:
@@ -2352,6 +2433,10 @@ def _git_repo_owner(repo_url: str) -> str:
     if not owner:
         return ""
     return owner
+
+
+def git_repo_owner(repo_url: str) -> str:
+    return _git_repo_owner(repo_url)
 
 
 def _openai_error_message(body_text: str) -> str:
@@ -2456,6 +2541,10 @@ def _agent_tools_mcp_source_path() -> Path:
     return Path(__file__).resolve().with_name(AGENT_TOOLS_MCP_RUNTIME_FILE_NAME)
 
 
+def agent_tools_mcp_source_path() -> Path:
+    return _agent_tools_mcp_source_path()
+
+
 def _empty_list(v: Any) -> list[str]:
     if v is None:
         return []
@@ -2553,13 +2642,17 @@ def _normalize_base_image_value(mode: Any, value: Any) -> str:
     normalized_mode = _normalize_base_image_mode(mode)
     normalized_value = str(value or "").strip()
     if normalized_mode == "tag":
-        return normalized_value or str(agent_cli_image.DEFAULT_BASE_IMAGE)
+        return normalized_value or str(AGENT_CLI_BASE_IMAGE)
     return normalized_value
 
 
 def _extract_repo_name(repo_url: str) -> str:
     name = repo_url.rstrip("/").split(":")[-1].rsplit("/", 1)[-1]
     return name[:-4] if name.endswith(".git") else name
+
+
+def extract_repo_name(repo_url: str) -> str:
+    return _extract_repo_name(repo_url)
 
 
 def _sanitize_workspace_component(value: str) -> str:
@@ -2751,8 +2844,11 @@ def _new_ready_ack_guid() -> str:
 
 def _normalize_ready_ack_stage(value: Any) -> str:
     candidate = _compact_whitespace(str(value or "")).strip().lower()
-    if candidate not in SUPPORTED_AGENT_READY_ACK_STAGES:
+    if not candidate:
         return AGENT_READY_ACK_STAGE_CONTAINER_BOOTSTRAPPED
+    if candidate not in SUPPORTED_AGENT_READY_ACK_STAGES:
+        supported = ", ".join(sorted(SUPPORTED_AGENT_READY_ACK_STAGES))
+        raise ValueError(f"Invalid ready ack stage: {value!r}. Supported stages: {supported}.")
     return candidate
 
 
@@ -3910,8 +4006,7 @@ def _chat_subtitle_from_log(log_path: Path) -> str:
 
 
 def _default_supplementary_gids() -> str:
-    gids = sorted({gid for gid in os.getgroups() if gid != os.getgid()})
-    return ",".join(str(gid) for gid in gids)
+    return core_identity.default_supplementary_gids()
 
 
 def _normalize_csv(value: str | None) -> str:
@@ -3941,48 +4036,40 @@ def _resolve_hub_runtime_identity(
     runtime_config: AgentRuntimeConfig | None = None,
     env_overrides: RuntimeIdentityEnvOverrides | None = None,
 ) -> tuple[int, int, str]:
-    identity_config = core_identity.parse_runtime_identity_config(runtime_config)
     host_supp_gids = env_overrides.supplementary_gids if env_overrides is not None else ""
     default_supplementary = _default_supplementary_gids() if not host_supp_gids else host_supp_gids
-    if identity_config.uid_raw or identity_config.gid_raw:
-        uid, gid = core_identity.parse_configured_uid_gid(
-            identity_config,
-            error_factory=lambda message: IdentityError(message),
-        )
-        resolved_supplementary = identity_config.supplementary_gids or default_supplementary
-        assert uid is not None and gid is not None
-        return uid, gid, resolved_supplementary
-
-    host_uid_raw = env_overrides.uid_raw if env_overrides is not None else ""
-    host_gid_raw = env_overrides.gid_raw if env_overrides is not None else ""
-    if host_uid_raw or host_gid_raw:
-        if not host_uid_raw or not host_gid_raw:
-            raise IdentityError(
+    resolved = core_identity.resolve_runtime_identity(
+        core_identity.RuntimeIdentityResolutionContract(
+            runtime_config=runtime_config,
+            override_uid_raw=env_overrides.uid_raw if env_overrides is not None else "",
+            override_gid_raw=env_overrides.gid_raw if env_overrides is not None else "",
+            override_username=env_overrides.username if env_overrides is not None else "",
+            override_supplementary_gids=host_supp_gids,
+            override_uid_source_name=AGENT_HUB_HOST_UID_ENV,
+            override_gid_source_name=AGENT_HUB_HOST_GID_ENV,
+            override_uid_gid_pair_message=(
                 f"{AGENT_HUB_HOST_UID_ENV} and {AGENT_HUB_HOST_GID_ENV} must be set together."
+            ),
+            shared_root_candidates=(
+                env_overrides.shared_root if env_overrides is not None else "",
+            ),
+            default_uid=os.getuid(),
+            default_gid=os.getgid(),
+            default_supplementary_gids=default_supplementary,
+        ),
+        resolve_username=False,
+        missing_username_message_factory=(
+            lambda lookup_uid: (
+                "Host username resolution failed for runtime identity "
+                f"(uid={lookup_uid}). Set {AGENT_HUB_HOST_USER_ENV}."
             )
-        uid = core_identity.parse_non_negative_int_value(
-            host_uid_raw,
-            source_name=AGENT_HUB_HOST_UID_ENV,
-            error_factory=lambda message: IdentityError(message),
-        )
-        gid = core_identity.parse_non_negative_int_value(
-            host_gid_raw,
-            source_name=AGENT_HUB_HOST_GID_ENV,
-            error_factory=lambda message: IdentityError(message),
-        )
-        return uid, gid, host_supp_gids
-
-    shared_root_raw = identity_config.shared_root or (env_overrides.shared_root if env_overrides is not None else "")
-    if shared_root_raw:
-        try:
-            metadata = Path(shared_root_raw).stat()
-        except OSError as exc:
-            raise IdentityError(
-                f"Failed to stat {AGENT_HUB_SHARED_ROOT_ENV}={shared_root_raw!r}: {exc}"
-            ) from exc
-        return int(metadata.st_uid), int(metadata.st_gid), host_supp_gids
-
-    return os.getuid(), os.getgid(), default_supplementary
+        ),
+        stat_error_message_factory=(
+            lambda shared_root, exc: f"Failed to stat {AGENT_HUB_SHARED_ROOT_ENV}={shared_root!r}: {exc}"
+        ),
+        error_factory=lambda message: IdentityError(message),
+    )
+    return int(resolved.uid), int(resolved.gid), resolved.supplementary_gids
 
 
 def _resolve_hub_effective_run_mode(runtime_config: AgentRuntimeConfig | None) -> tuple[str, str]:
@@ -4316,27 +4403,51 @@ def _resolve_hub_runtime_username(
     runtime_config: AgentRuntimeConfig | None = None,
     env_overrides: RuntimeIdentityEnvOverrides | None = None,
 ) -> str:
+    configured_identity_user = ""
     if runtime_config is not None:
         configured_identity_user = core_identity.parse_runtime_identity_config(runtime_config).username
-        if configured_identity_user:
-            return configured_identity_user
-    configured = env_overrides.username if env_overrides is not None else ""
-    if configured:
-        return configured
-    try:
-        return pwd.getpwuid(int(uid)).pw_name
-    except (KeyError, ValueError) as exc:
-        raise IdentityError(
-            "Host username resolution failed for runtime identity "
-            f"(uid={uid}). Set {AGENT_HUB_HOST_USER_ENV}."
-        ) from exc
+    resolved = core_identity.resolve_runtime_identity(
+        core_identity.RuntimeIdentityResolutionContract(
+            runtime_config=None,
+            explicit_uid=int(uid),
+            explicit_username=str(configured_identity_user or "").strip(),
+            override_username=env_overrides.username if env_overrides is not None else "",
+            default_uid=int(uid),
+            default_gid=os.getgid(),
+        ),
+        missing_username_message_factory=(
+            lambda lookup_uid: (
+                "Host username resolution failed for runtime identity "
+                f"(uid={lookup_uid}). Set {AGENT_HUB_HOST_USER_ENV}."
+            )
+        ),
+        error_factory=lambda message: IdentityError(message),
+    )
+    return resolved.username
 
 
 from agent_hub.server_hubstate_ops_mixin import HubStateOpsMixin
 from agent_hub.server_hubstate_runtime_mixin import HubStateRuntimeMixin
 
 
+def _sync_hubstate_mixin_globals() -> None:
+    """Keep mixin module globals aligned with patched server symbols."""
+    server_globals = globals()
+    runtime_mixin_module = sys.modules.get("agent_hub.server_hubstate_runtime_mixin")
+    if runtime_mixin_module is not None:
+        runtime_mixin_module.__dict__.update(server_globals)
+    ops_mixin_module = sys.modules.get("agent_hub.server_hubstate_ops_mixin")
+    if ops_mixin_module is not None:
+        ops_mixin_module.__dict__.update(server_globals)
+
+
 class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
+    def __getattribute__(self, name: str) -> Any:
+        value = super().__getattribute__(name)
+        if callable(value) and not name.startswith("__"):
+            _sync_hubstate_mixin_globals()
+        return value
+
     def __init__(
         self,
         data_dir: Path,
@@ -4350,23 +4461,55 @@ class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
         ui_lifecycle_debug: bool = False,
         reconcile_project_build_on_init: bool = True,
     ):
+        runtime_config_supplied = runtime_config is not None
+        if runtime_config is None:
+            runtime_config = load_agent_runtime_config(config_file)
         self.runtime_config = runtime_config
         if runtime_identity_overrides is not None:
             self.runtime_identity_overrides = runtime_identity_overrides
-        elif self.runtime_config is None:
+        elif not runtime_config_supplied:
             self.runtime_identity_overrides = _runtime_identity_env_overrides()
         else:
             self.runtime_identity_overrides = RuntimeIdentityEnvOverrides()
         _validate_hub_runtime_run_mode(self.runtime_config)
-        self.local_uid, self.local_gid, self.local_supp_gids = _resolve_hub_runtime_identity(
-            self.runtime_config,
-            self.runtime_identity_overrides,
+        resolved_identity = core_identity.resolve_runtime_identity(
+            core_identity.RuntimeIdentityResolutionContract(
+                runtime_config=self.runtime_config,
+                override_uid_raw=self.runtime_identity_overrides.uid_raw,
+                override_gid_raw=self.runtime_identity_overrides.gid_raw,
+                override_username=self.runtime_identity_overrides.username,
+                override_supplementary_gids=self.runtime_identity_overrides.supplementary_gids,
+                override_uid_source_name=AGENT_HUB_HOST_UID_ENV,
+                override_gid_source_name=AGENT_HUB_HOST_GID_ENV,
+                override_uid_gid_pair_message=(
+                    f"{AGENT_HUB_HOST_UID_ENV} and {AGENT_HUB_HOST_GID_ENV} must be set together."
+                ),
+                shared_root_candidates=(self.runtime_identity_overrides.shared_root,),
+                default_uid=os.getuid(),
+                default_gid=os.getgid(),
+                default_supplementary_gids=(
+                    _default_supplementary_gids()
+                    if not self.runtime_identity_overrides.supplementary_gids
+                    else self.runtime_identity_overrides.supplementary_gids
+                ),
+            ),
+            missing_username_message_factory=(
+                lambda lookup_uid: (
+                    "Host username resolution failed for runtime identity "
+                    f"(uid={lookup_uid}). Set {AGENT_HUB_HOST_USER_ENV}."
+                )
+            ),
+            stat_error_message_factory=(
+                lambda shared_root, exc: f"Failed to stat {AGENT_HUB_SHARED_ROOT_ENV}={shared_root!r}: {exc}"
+            ),
+            error_factory=lambda message: IdentityError(message),
         )
-        self.local_user = _resolve_hub_runtime_username(
-            self.local_uid,
-            self.runtime_config,
-            self.runtime_identity_overrides,
+        self.local_uid, self.local_gid, self.local_supp_gids = (
+            int(resolved_identity.uid),
+            int(resolved_identity.gid),
+            resolved_identity.supplementary_gids,
         )
+        self.local_user = resolved_identity.username
         self.local_umask = "0022"
         self.runtime_identity = core_identity.RuntimeIdentity(
             username=self.local_user,
@@ -4382,6 +4525,8 @@ class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
             normalize_chat_layout_engine=_normalize_chat_layout_engine,
         )
         self.data_dir = Path(data_dir).resolve()
+        self.secrets_dir = self.data_dir / SECRETS_DIR_NAME
+        self.openai_credentials_file = self.secrets_dir / OPENAI_CREDENTIALS_FILE_NAME
         self.host_agent_home = (self.data_dir / "agent-home" / self.local_user).resolve()
         self.host_codex_dir = self.host_agent_home / ".codex"
         self.agent_tools_mcp_runtime_script = (
@@ -4398,10 +4543,7 @@ class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
             self.hub_port,
         )
         self.auth_domain = AuthDomain(state=self)
-        self.auto_config_domain = AutoConfigDomain(state=self)
-        self.chat_runtime_domain = ChatRuntimeDomain(state=self)
         self.credentials_domain = CredentialsDomain(state=self)
-        self.project_domain = ProjectDomain(state=self)
         self.runtime_domain = RuntimeDomain(
             runtime_factory=ChatRuntime,
             is_process_running=lambda pid: _is_process_running(pid),
@@ -4426,8 +4568,8 @@ class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
             default_artifact_publish_host=DEFAULT_ARTIFACT_PUBLISH_HOST,
             callback_forward_timeout_seconds=OPENAI_ACCOUNT_CALLBACK_FORWARD_TIMEOUT_SECONDS,
         )
-        self.project_service = ProjectService(domain=self.project_domain)
-        self.chat_service = ChatService(domain=self.chat_runtime_domain)
+        self.project_service = ProjectService(state=self)
+        self.chat_service = ChatService(state=self)
         self.runtime_service = RuntimeService(state=self)
         self.credentials_service = CredentialsService(
             domain=self.credentials_domain,
@@ -4438,10 +4580,9 @@ class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
             agent_tools_token_header=AGENT_TOOLS_TOKEN_HEADER,
             artifact_token_header="x-agent-hub-artifact-token",
         )
-        self.auto_config_service = AutoConfigService(domain=self.auto_config_domain)
+        self.auto_config_service = AutoConfigService(state=self)
         self.app_state_service = AppStateService(state=self)
         self.event_service = EventService(state=self)
-        self.lifecycle_service = LifecycleService(state=self)
         self._lock = Lock()
         self._events_lock = Lock()
         self._project_build_lock = Lock()
@@ -4449,6 +4590,71 @@ class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
         self._event_listeners: set[queue.Queue[dict[str, Any] | None]] = set()
         self._openai_login_lock = Lock()
         self._openai_login_session: OpenAIAccountLoginSession | None = None
+        self._openai_login_session_type = OpenAIAccountLoginSession
+        self.openai_account_service = OpenAIAccountService(
+            openai_codex_auth_file=self.openai_codex_auth_file,
+            openai_credentials_file=self.openai_credentials_file,
+            host_agent_home=self.host_agent_home,
+            host_codex_dir=self.host_codex_dir,
+            config_file=self.config_file,
+            local_uid_getter=lambda: self.local_uid,
+            local_gid_getter=lambda: self.local_gid,
+            local_supp_gids_getter=lambda: self.local_supp_gids,
+            local_user_getter=lambda: self.local_user,
+            local_umask_getter=lambda: self.local_umask,
+            artifact_publish_base_url_getter=lambda: self.artifact_publish_base_url,
+            openai_login_lock=self._openai_login_lock,
+            get_openai_login_session=lambda: self._openai_login_session,
+            set_openai_login_session=lambda session: setattr(self, "_openai_login_session", session),
+            openai_login_session_type=self._openai_login_session_type,
+            emit_auth_changed=lambda **kwargs: self._emit_auth_changed(**kwargs),
+            emit_openai_account_session_changed=lambda **kwargs: self._emit_openai_account_session_changed(**kwargs),
+            auth_forward_openai_account_callback_fn=self.auth_service.forward_openai_account_callback,
+            logger=LOGGER,
+            default_agent_image=DEFAULT_AGENT_IMAGE,
+            openai_account_login_default_callback_port=OPENAI_ACCOUNT_LOGIN_DEFAULT_CALLBACK_PORT,
+            openai_account_login_log_max_chars=OPENAI_ACCOUNT_LOGIN_LOG_MAX_CHARS,
+            ansi_escape_re=ANSI_ESCAPE_RE,
+            tmp_dir_tmpfs_spec=TMP_DIR_TMPFS_SPEC,
+            default_container_home=DEFAULT_CONTAINER_HOME,
+            is_process_running=lambda pid: _is_process_running(pid),
+            stop_process=lambda pid: _stop_process(pid),
+            parse_gid_csv=lambda value: _parse_gid_csv(value),
+            iso_now=lambda: _iso_now(),
+            normalize_openai_account_login_method=lambda value: _normalize_openai_account_login_method(value),
+            docker_image_exists=lambda tag: _docker_image_exists(tag),
+            discover_bridge_hosts=lambda: _discover_openai_callback_bridge_hosts(),
+            normalize_callback_forward_host=lambda value: _normalize_callback_forward_host(value),
+            openai_callback_query_summary=lambda query: _openai_callback_query_summary(query),
+            redact_url_query_values=lambda url: _redact_url_query_values(url),
+            host_port_netloc=lambda host, port: _host_port_netloc(host, port),
+            classify_callback_error=lambda exc: _classify_openai_callback_forward_error(exc),
+            append_tail=lambda existing, addition, max_chars: _append_tail(existing, addition, max_chars),
+            short_summary=lambda text, max_words, max_chars: _short_summary(text, max_words=max_words, max_chars=max_chars),
+            first_url_in_text=lambda text, prefix: _first_url_in_text(text, prefix),
+            parse_local_callback=lambda value: _parse_local_callback(value),
+            openai_login_url_in_text=lambda text: _openai_login_url_in_text(text),
+            read_codex_auth=lambda path: _read_codex_auth(path),
+            read_openai_api_key=lambda path: _read_openai_api_key(path),
+            mask_secret=lambda value: _mask_secret(value),
+            iso_from_timestamp=lambda ts: _iso_from_timestamp(ts),
+            normalize_openai_api_key=lambda value: _normalize_openai_api_key(value),
+            verify_openai_api_key=lambda value: _verify_openai_api_key(value),
+            write_private_env_file=lambda path, content: _write_private_env_file(path, content),
+            openai_generate_chat_title=lambda **kwargs: _openai_generate_chat_title(**kwargs),
+            codex_generate_chat_title=lambda **kwargs: _codex_generate_chat_title(**kwargs),
+            chat_title_openai_model=CHAT_TITLE_OPENAI_MODEL,
+            chat_title_account_model=CHAT_TITLE_ACCOUNT_MODEL,
+            chat_title_auth_mode_account=CHAT_TITLE_AUTH_MODE_ACCOUNT,
+            chat_title_auth_mode_api_key=CHAT_TITLE_AUTH_MODE_API_KEY,
+            chat_title_auth_mode_none=CHAT_TITLE_AUTH_MODE_NONE,
+            chat_title_no_credentials_error=CHAT_TITLE_NO_CREDENTIALS_ERROR,
+            chat_title_max_chars=CHAT_TITLE_MAX_CHARS,
+        )
+        self.lifecycle_service = LifecycleService(
+            forward_openai_account_callback_fn=self.openai_account_service.forward_openai_account_callback,
+            shutdown_fn=self.shutdown,
+        )
         self._chat_input_lock = Lock()
         self._chat_input_buffers: dict[str, str] = {}
         self._chat_input_ansi_carry: dict[str, str] = {}
@@ -4487,9 +4693,7 @@ class HubState(HubStateRuntimeMixin, HubStateOpsMixin):
         self.artifacts_dir = self.data_dir / ARTIFACT_STORAGE_DIR_NAME
         self.chat_artifacts_dir = self.artifacts_dir / ARTIFACT_STORAGE_CHAT_DIR_NAME
         self.session_artifacts_dir = self.artifacts_dir / ARTIFACT_STORAGE_SESSION_DIR_NAME
-        self.secrets_dir = self.data_dir / SECRETS_DIR_NAME
         self.chat_runtime_configs_dir = self.data_dir / CHAT_RUNTIME_CONFIGS_DIR_NAME
-        self.openai_credentials_file = self.secrets_dir / OPENAI_CREDENTIALS_FILE_NAME
         self.github_app_settings_file = self.secrets_dir / GITHUB_APP_SETTINGS_FILE_NAME
         self.github_app_installation_file = self.secrets_dir / GITHUB_APP_INSTALLATION_FILE_NAME
         self.github_tokens_file = self.secrets_dir / GITHUB_TOKENS_FILE_NAME
@@ -4700,6 +4904,7 @@ def main(
         empty_list=_empty_list,
         parse_env_vars=_parse_env_vars,
         compact_whitespace=_compact_whitespace,
+        supported_agent_ready_ack_stages=SUPPORTED_AGENT_READY_ACK_STAGES,
         parse_artifact_request_payload=_parse_artifact_request_payload,
         cleanup_uploaded_artifact_paths=_cleanup_uploaded_artifact_paths,
     )

@@ -13,7 +13,7 @@ class CredentialsDomain:
         chat = self._state.chat(chat_id)
         if chat is None:
             raise HTTPException(status_code=404, detail="Chat not found.")
-        self._state._require_agent_tools_token(chat, token)
+        self._state.require_agent_tools_token(chat, token)
         return self._state.agent_tools_credentials_list_payload(chat_id)
 
     def resolve_chat_credentials(
@@ -27,7 +27,7 @@ class CredentialsDomain:
         chat = self._state.chat(chat_id)
         if chat is None:
             raise HTTPException(status_code=404, detail="Chat not found.")
-        self._state._require_agent_tools_token(chat, token)
+        self._state.require_agent_tools_token(chat, token)
         return self._state.resolve_agent_tools_credentials(
             chat_id=chat_id,
             mode=mode,
@@ -45,7 +45,7 @@ class CredentialsDomain:
         chat = self._state.chat(chat_id)
         if chat is None:
             raise HTTPException(status_code=404, detail="Chat not found.")
-        self._state._require_agent_tools_token(chat, token)
+        self._state.require_agent_tools_token(chat, token)
         return self._state.attach_agent_tools_project_credentials(
             chat_id=chat_id,
             mode=mode,
@@ -119,4 +119,3 @@ class CredentialsDomain:
             stage=stage,
             meta=meta,
         )
-

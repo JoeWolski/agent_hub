@@ -109,24 +109,54 @@ class AuthService:
         artifact_publish_base_url: str,
         discover_bridge_hosts: Callable[[], tuple[list[str], dict[str, Any]]],
         normalize_host: Callable[[Any], str],
-    ) -> tuple[list[str], dict[str, Any]]:
+    ) -> tuple[list[str], dict[str, Any], dict[str, Any]]:
         candidate_hosts: list[str] = []
-
-        def add_host(raw_value: Any) -> None:
-            normalized_host = normalize_host(raw_value)
-            if normalized_host and normalized_host not in candidate_hosts:
-                candidate_hosts.append(normalized_host)
-
-        configured_host = (
-            urllib.parse.urlsplit(str(artifact_publish_base_url or "")).hostname
-            or self.default_artifact_publish_host
-        )
-        add_host(configured_host)
+        normalized_base_url = str(artifact_publish_base_url or "").strip()
+        artifact_publish_host = normalize_host(urllib.parse.urlsplit(normalized_base_url).hostname)
+        if normalized_base_url and not artifact_publish_host:
+            raise NetworkReachabilityError(
+                "Failed to forward OAuth callback to login container. "
+                "Reason: invalid_artifact_publish_base_url_host. "
+                "Configure artifact_publish_base_url with a valid container-reachable host."
+            )
+        default_publish_host = normalize_host(self.default_artifact_publish_host)
+        configured_host_source = "artifact_publish_base_url" if artifact_publish_host else "default_artifact_publish_host"
+        configured_host = artifact_publish_host or default_publish_host
+        if configured_host:
+            candidate_hosts.append(configured_host)
 
         bridge_hosts, bridge_diagnostics = discover_bridge_hosts()
-        if bridge_hosts:
-            add_host(bridge_hosts[0])
-        return candidate_hosts, bridge_diagnostics
+        normalized_bridge_hosts = sorted(
+            {
+                normalized_bridge_host
+                for normalized_bridge_host in (normalize_host(bridge_host) for bridge_host in bridge_hosts)
+                if normalized_bridge_host
+            }
+        )
+
+        fallback_bridge_host = ""
+        # Keep fallback behavior deterministic and narrowly scoped to the known DIND/default-host branch.
+        bridge_fallback_eligible = bool(default_publish_host) and configured_host == default_publish_host
+        if bridge_fallback_eligible:
+            for bridge_host in normalized_bridge_hosts:
+                if bridge_host != configured_host:
+                    fallback_bridge_host = bridge_host
+                    break
+        if fallback_bridge_host:
+            candidate_hosts.append(fallback_bridge_host)
+
+        resolution_policy = {
+            "configured_host": configured_host,
+            "configured_host_source": configured_host_source if configured_host else "none",
+            "artifact_publish_host": artifact_publish_host,
+            "default_artifact_publish_host": default_publish_host,
+            "bridge_hosts_discovered": normalized_bridge_hosts,
+            "bridge_fallback_eligible": bridge_fallback_eligible,
+            "bridge_fallback_host": fallback_bridge_host,
+            "bridge_fallback_added": bool(fallback_bridge_host),
+            "candidate_hosts": candidate_hosts,
+        }
+        return candidate_hosts, bridge_diagnostics, resolution_policy
 
     def forward_openai_account_callback(
         self,
@@ -164,7 +194,7 @@ class AuthService:
             "duration_ms": elapsed_ms(),
             "error_class": "none",
         }
-        candidate_hosts, bridge_diagnostics = self._candidate_hosts(
+        candidate_hosts, bridge_diagnostics, resolution_policy = self._candidate_hosts(
             artifact_publish_base_url=artifact_publish_base_url,
             discover_bridge_hosts=discover_bridge_hosts,
             normalize_host=normalize_host,
@@ -174,7 +204,7 @@ class AuthService:
             (
                 "OpenAI callback forward resolution "
                 "session_id=%s container=%s callback_path=%s callback_port=%s "
-                "callback_query=%s request_context=%s bridge_routing=%s candidate_hosts=%s"
+                "callback_query=%s request_context=%s bridge_routing=%s resolution_policy=%s candidate_hosts=%s"
             ),
             session.id,
             session.container_name,
@@ -196,9 +226,34 @@ class AuthService:
                 sort_keys=True,
             ),
             json.dumps(bridge_diagnostics, sort_keys=True),
+            json.dumps(resolution_policy, sort_keys=True),
             ", ".join(candidate_hosts),
             extra=log_extra_base,
         )
+        if not candidate_hosts:
+            error_class = "no_callback_hosts_configured"
+            logger.error(
+                (
+                    "OpenAI callback forward failed session_id=%s failure_reason=%s "
+                    "artifact_publish_base_url=%s bridge_routing=%s resolution_policy=%s"
+                ),
+                session.id,
+                error_class,
+                str(artifact_publish_base_url or ""),
+                json.dumps(bridge_diagnostics, sort_keys=True),
+                json.dumps(resolution_policy, sort_keys=True),
+                extra={
+                    **log_extra_base,
+                    "result": "failed",
+                    "duration_ms": elapsed_ms(),
+                    "error_class": error_class,
+                },
+            )
+            raise NetworkReachabilityError(
+                "Failed to forward OAuth callback to login container. "
+                "Reason: no_callback_hosts_configured. "
+                "Configure artifact_publish_base_url with a container-reachable host."
+            )
 
         status_code = 0
         response_body = ""
@@ -288,13 +343,14 @@ class AuthService:
             logger.error(
                 (
                     "OpenAI callback forward failed session_id=%s failure_reason=%s "
-                    "attempted_origins=%s callback_path=%s callback_query=%s"
+                    "attempted_origins=%s callback_path=%s callback_query=%s resolution_policy=%s"
                 ),
                 session.id,
                 failure_reason,
                 attempted,
                 callback_path,
                 json.dumps(callback_query, sort_keys=True),
+                json.dumps(resolution_policy, sort_keys=True),
                 extra={
                     **log_extra_base,
                     "result": "failed",
@@ -304,7 +360,8 @@ class AuthService:
             )
             raise NetworkReachabilityError(
                 "Failed to forward OAuth callback to login container. "
-                f"Reason: {failure_reason}. Attempted: {attempted}"
+                f"Reason: {failure_reason}. Attempted: {attempted}. "
+                "Verify artifact_publish_base_url points to a host reachable from the login container."
             ) from last_exc
 
         return AuthCallbackForwardResult(

@@ -51,23 +51,41 @@ class AuthServiceTests(unittest.TestCase):
 
     def test_candidate_hosts_prefers_configured_url_with_single_bridge_fallback(self) -> None:
         service = self._service()
-        hosts, diagnostics = service._candidate_hosts(
+        hosts, diagnostics, policy = service._candidate_hosts(
             artifact_publish_base_url="http://bridge.example:8876",
             discover_bridge_hosts=lambda: (["bridge.example", "10.0.0.8", "10.0.0.8"], {"source": "bridge"}),
             normalize_host=lambda value: str(value or "").strip().lower(),
         )
         self.assertEqual(hosts, ["bridge.example"])
         self.assertEqual(diagnostics, {"source": "bridge"})
+        self.assertEqual(policy["configured_host"], "bridge.example")
+        self.assertEqual(policy["configured_host_source"], "artifact_publish_base_url")
+        self.assertFalse(policy["bridge_fallback_eligible"])
+        self.assertEqual(policy["bridge_fallback_host"], "")
+        self.assertFalse(policy["bridge_fallback_added"])
 
     def test_candidate_hosts_uses_first_bridge_when_configured_host_missing(self) -> None:
         service = self._service()
-        hosts, diagnostics = service._candidate_hosts(
+        hosts, diagnostics, policy = service._candidate_hosts(
             artifact_publish_base_url="",
             discover_bridge_hosts=lambda: (["10.0.0.8", "10.0.0.9"], {"source": "bridge"}),
             normalize_host=lambda value: str(value or "").strip().lower(),
         )
         self.assertEqual(hosts, ["localhost", "10.0.0.8"])
         self.assertEqual(diagnostics, {"source": "bridge"})
+        self.assertEqual(policy["configured_host_source"], "default_artifact_publish_host")
+        self.assertTrue(policy["bridge_fallback_eligible"])
+        self.assertEqual(policy["bridge_fallback_host"], "10.0.0.8")
+
+    def test_candidate_hosts_rejects_invalid_artifact_publish_base_url_host(self) -> None:
+        service = self._service()
+        with self.assertRaises(NetworkReachabilityError) as raised:
+            service._candidate_hosts(
+                artifact_publish_base_url="http:///missing-host",
+                discover_bridge_hosts=lambda: (["10.0.0.8"], {"source": "bridge"}),
+                normalize_host=lambda value: str(value or "").strip().lower(),
+            )
+        self.assertIn("invalid_artifact_publish_base_url_host", str(raised.exception))
 
     def test_forward_openai_account_callback_returns_response_payload(self) -> None:
         logger = Mock()
@@ -132,7 +150,7 @@ class AuthServiceTests(unittest.TestCase):
         detail = str(raised.exception)
         self.assertIn("Reason: connection_refused", detail)
         self.assertIn("http://host-a:8877", detail)
-        self.assertIn("http://host-b:8877", detail)
+        self.assertNotIn("http://host-b:8877", detail)
 
     def test_forward_openai_account_callback_raises_network_reachability_error_when_all_hosts_fail_with_urlerror(
         self,
@@ -165,7 +183,7 @@ class AuthServiceTests(unittest.TestCase):
         detail = str(raised.exception)
         self.assertIn("Reason: dns_error", detail)
         self.assertIn("http://host-a:8877", detail)
-        self.assertIn("http://host-b:8877", detail)
+        self.assertNotIn("http://host-b:8877", detail)
 
     def test_forward_openai_account_callback_raises_network_reachability_error_when_all_hosts_fail_with_timeout(
         self,
@@ -195,7 +213,36 @@ class AuthServiceTests(unittest.TestCase):
         detail = str(raised.exception)
         self.assertIn("Reason: timeout", detail)
         self.assertIn("http://host-a:8877", detail)
-        self.assertIn("http://host-b:8877", detail)
+        self.assertNotIn("http://host-b:8877", detail)
+
+    def test_forward_openai_account_callback_fails_fast_when_resolution_policy_has_no_viable_host(self) -> None:
+        logger = Mock()
+        service = AuthService(
+            domain=SimpleNamespace(),
+            default_artifact_publish_host="",
+            callback_forward_timeout_seconds=0.2,
+        )
+        session = SimpleNamespace(id="s-1", container_name="c-1")
+
+        with self.assertRaises(NetworkReachabilityError) as raised:
+            service.forward_openai_account_callback(
+                session=session,
+                callback_port=8877,
+                callback_path="/oauth/callback",
+                query="code=abc",
+                artifact_publish_base_url="",
+                request_host="127.0.0.1",
+                request_context={},
+                discover_bridge_hosts=lambda: ([], {}),
+                normalize_host=lambda value: str(value or "").strip(),
+                callback_query_summary=lambda query: {"raw": query},
+                redact_url_query_values=lambda url: url,
+                host_port_netloc=lambda host, port: f"{host}:{port}",
+                classify_callback_error=lambda exc: type(exc).__name__,
+                logger=logger,
+            )
+
+        self.assertIn("Reason: no_callback_hosts_configured", str(raised.exception))
 
 
 if __name__ == "__main__":

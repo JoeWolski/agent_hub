@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from agent_core.errors import ConfigError
 from fastapi import HTTPException
 
 
@@ -14,12 +15,12 @@ def _normalize_git_identity_setting(raw_value: Any, *, field_name: str, strict: 
     if any(char in raw_text for char in ("\r", "\n", "\x00")):
         if strict:
             raise HTTPException(status_code=400, detail=f"{field_name} must not contain control characters.")
-        raw_text = raw_text.replace("\r", " ").replace("\n", " ").replace("\x00", "")
+        raise ConfigError(f"Invalid persisted settings: {field_name} must not contain control characters.")
     value = _compact_whitespace(raw_text)
     if len(value) > 256:
         if strict:
             raise HTTPException(status_code=400, detail=f"{field_name} must be 256 characters or fewer.")
-        value = value[:256].strip()
+        raise ConfigError(f"Invalid persisted settings: {field_name} must be 256 characters or fewer.")
     return value
 
 
@@ -65,8 +66,9 @@ class SettingsService:
             ),
         }
         if bool(normalized["git_user_name"]) != bool(normalized["git_user_email"]):
-            normalized["git_user_name"] = ""
-            normalized["git_user_email"] = ""
+            raise ConfigError(
+                "Invalid persisted settings: git_user_name and git_user_email must both be set or both be empty."
+            )
         return normalized
 
     def settings_payload(self, state: dict[str, Any]) -> dict[str, Any]:

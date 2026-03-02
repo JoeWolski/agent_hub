@@ -1359,37 +1359,10 @@ class HubStateOpsMixin:
         ]
 
     def _openai_account_payload(self) -> dict[str, Any]:
-        account_connected, auth_mode = _read_codex_auth(self.openai_codex_auth_file)
-        updated_at = ""
-        if self.openai_codex_auth_file.exists():
-            try:
-                updated_at = _iso_from_timestamp(self.openai_codex_auth_file.stat().st_mtime)
-            except OSError:
-                updated_at = ""
-        return {
-            "account_connected": account_connected,
-            "account_auth_mode": auth_mode,
-            "account_updated_at": updated_at,
-        }
+        return self.openai_account_service.openai_account_payload()
 
     def openai_auth_status(self) -> dict[str, Any]:
-        api_key = _read_openai_api_key(self.openai_credentials_file)
-        updated_at = ""
-        if self.openai_credentials_file.exists():
-            try:
-                updated_at = _iso_from_timestamp(self.openai_credentials_file.stat().st_mtime)
-            except OSError:
-                updated_at = ""
-        account_payload = self._openai_account_payload()
-        return {
-            "provider": "openai",
-            "connected": bool(api_key),
-            "key_hint": _mask_secret(api_key) if api_key else "",
-            "updated_at": updated_at,
-            "account_connected": account_payload["account_connected"],
-            "account_auth_mode": account_payload["account_auth_mode"],
-            "account_updated_at": account_payload["account_updated_at"],
-        }
+        return self.openai_account_service.openai_auth_status()
 
     def github_app_auth_status(self) -> dict[str, Any]:
         installation = self._github_connected_installation()
@@ -1479,13 +1452,7 @@ class HubStateOpsMixin:
         return self._personal_access_tokens_status(GIT_PROVIDER_GITLAB)
 
     def _chat_title_generation_auth(self) -> tuple[str, str]:
-        account_connected, _ = _read_codex_auth(self.openai_codex_auth_file)
-        if account_connected:
-            return CHAT_TITLE_AUTH_MODE_ACCOUNT, ""
-        api_key = _read_openai_api_key(self.openai_credentials_file) or ""
-        if api_key:
-            return CHAT_TITLE_AUTH_MODE_API_KEY, api_key
-        return CHAT_TITLE_AUTH_MODE_NONE, ""
+        return self.openai_account_service.chat_title_generation_auth()
 
     def _generate_chat_title_with_resolved_auth(
         self,
@@ -1493,22 +1460,11 @@ class HubStateOpsMixin:
         api_key: str,
         user_prompts: list[str],
     ) -> tuple[str, str]:
-        if auth_mode == CHAT_TITLE_AUTH_MODE_ACCOUNT:
-            title = _codex_generate_chat_title(
-                host_agent_home=self.host_agent_home,
-                host_codex_dir=self.host_codex_dir,
-                user_prompts=user_prompts,
-                max_chars=CHAT_TITLE_MAX_CHARS,
-            )
-            return title, CHAT_TITLE_ACCOUNT_MODEL
-        if auth_mode == CHAT_TITLE_AUTH_MODE_API_KEY:
-            title = _openai_generate_chat_title(
-                api_key=api_key,
-                user_prompts=user_prompts,
-                max_chars=CHAT_TITLE_MAX_CHARS,
-            )
-            return title, CHAT_TITLE_OPENAI_MODEL
-        raise RuntimeError(CHAT_TITLE_NO_CREDENTIALS_ERROR)
+        return self.openai_account_service.generate_chat_title_with_resolved_auth(
+            auth_mode=auth_mode,
+            api_key=api_key,
+            user_prompts=user_prompts,
+        )
 
     def _credential_catalog(self) -> list[dict[str, Any]]:
         credentials: list[dict[str, Any]] = []
@@ -1580,72 +1536,7 @@ class HubStateOpsMixin:
         }
 
     def test_openai_chat_title_generation(self, prompt: Any) -> dict[str, Any]:
-        submitted = _compact_whitespace(str(prompt or "")).strip()
-        if not submitted:
-            raise HTTPException(status_code=400, detail="prompt is required.")
-
-        auth_status = self.openai_auth_status()
-        auth_mode, api_key = self._chat_title_generation_auth()
-        connectivity = {
-            "api_key_connected": bool(auth_status.get("connected")),
-            "api_key_hint": str(auth_status.get("key_hint") or ""),
-            "api_key_updated_at": str(auth_status.get("updated_at") or ""),
-            "account_connected": bool(auth_status.get("account_connected")),
-            "account_auth_mode": str(auth_status.get("account_auth_mode") or ""),
-            "account_updated_at": str(auth_status.get("account_updated_at") or ""),
-            "title_generation_auth_mode": auth_mode,
-        }
-
-        issues: list[str] = []
-        model = (
-            CHAT_TITLE_OPENAI_MODEL
-            if auth_mode == CHAT_TITLE_AUTH_MODE_API_KEY
-            else CHAT_TITLE_ACCOUNT_MODEL
-            if auth_mode == CHAT_TITLE_AUTH_MODE_ACCOUNT
-            else ""
-        )
-        if auth_mode == CHAT_TITLE_AUTH_MODE_NONE:
-            error = CHAT_TITLE_NO_CREDENTIALS_ERROR
-            issues.append(error)
-            return {
-                "ok": False,
-                "title": "",
-                "model": model,
-                "prompt": submitted,
-                "error": error,
-                "issues": issues,
-                "connectivity": connectivity,
-            }
-
-        try:
-            resolved_title, model = self._generate_chat_title_with_resolved_auth(
-                auth_mode=auth_mode,
-                api_key=api_key,
-                user_prompts=[submitted],
-            )
-        except Exception as exc:
-            error = str(exc)
-            if error:
-                issues.append(error)
-            return {
-                "ok": False,
-                "title": "",
-                "model": model,
-                "prompt": submitted,
-                "error": error,
-                "issues": issues,
-                "connectivity": connectivity,
-            }
-
-        return {
-            "ok": True,
-            "title": resolved_title,
-            "model": model,
-            "prompt": submitted,
-            "error": "",
-            "issues": issues,
-            "connectivity": connectivity,
-        }
+        return self.openai_account_service.test_openai_chat_title_generation(prompt)
 
     @staticmethod
     def _dedupe_entries(entries: list[str]) -> list[str]:
@@ -2382,7 +2273,7 @@ class HubStateOpsMixin:
         if snapshot_tag:
             runtime_image = str(snapshot_tag)
             if prepare_snapshot_only:
-                runtime_image = str(agent_cli_image._snapshot_setup_runtime_image_for_snapshot(snapshot_tag))
+                runtime_image = str(_snapshot_setup_runtime_image_for_snapshot(snapshot_tag))
         parsed = core_launch.parse_compiled_agent_cli_command(command)
 
         return {
@@ -2884,28 +2775,10 @@ class HubStateOpsMixin:
         return recommendation
 
     def connect_openai(self, api_key: Any, verify: bool = True) -> dict[str, Any]:
-        normalized = _normalize_openai_api_key(api_key)
-        if verify:
-            _verify_openai_api_key(normalized)
-        _write_private_env_file(
-            self.openai_credentials_file,
-            f"OPENAI_API_KEY={json.dumps(normalized)}\n",
-        )
-        status = self.openai_auth_status()
-        self._emit_auth_changed(reason="openai_api_key_connected")
-        LOGGER.debug("OpenAI API key connected.")
-        return status
+        return self.openai_account_service.connect_openai(api_key, verify=verify)
 
     def disconnect_openai(self) -> dict[str, Any]:
-        if self.openai_credentials_file.exists():
-            try:
-                self.openai_credentials_file.unlink()
-            except OSError as exc:
-                raise HTTPException(status_code=500, detail="Failed to remove stored OpenAI credentials.") from exc
-        status = self.openai_auth_status()
-        self._emit_auth_changed(reason="openai_api_key_disconnected")
-        LOGGER.debug("OpenAI API key disconnected.")
-        return status
+        return self.openai_account_service.disconnect_openai()
 
     def list_github_app_installations(self) -> dict[str, Any]:
         status = self.github_app_auth_status()
@@ -3184,286 +3057,16 @@ class HubStateOpsMixin:
         return status
 
     def disconnect_openai_account(self) -> dict[str, Any]:
-        self.cancel_openai_account_login()
-        if self.openai_codex_auth_file.exists():
-            try:
-                self.openai_codex_auth_file.unlink()
-            except OSError as exc:
-                raise HTTPException(status_code=500, detail="Failed to remove stored OpenAI account credentials.") from exc
-        status = self.openai_auth_status()
-        self._emit_auth_changed(reason="openai_account_disconnected")
-        self._emit_openai_account_session_changed(reason="openai_account_disconnected")
-        LOGGER.debug("OpenAI account disconnected.")
-        return status
-
-    def _openai_login_session_payload(self, session: OpenAIAccountLoginSession | None) -> dict[str, Any] | None:
-        if session is None:
-            return None
-        running = _is_process_running(session.process.pid) and session.exit_code is None
-        return {
-            "id": session.id,
-            "method": session.method,
-            "status": session.status,
-            "started_at": session.started_at,
-            "completed_at": session.completed_at,
-            "exit_code": session.exit_code,
-            "error": session.error,
-            "running": running,
-            "login_url": session.login_url,
-            "device_code": session.device_code,
-            "local_callback_url": session.local_callback_url,
-            "callback_port": session.callback_port,
-            "callback_path": session.callback_path,
-            "log_tail": session.log_tail,
-        }
+        return self.openai_account_service.disconnect_openai_account()
 
     def openai_account_session_payload(self) -> dict[str, Any]:
-        with self._openai_login_lock:
-            session_payload = self._openai_login_session_payload(self._openai_login_session)
-        account_payload = self._openai_account_payload()
-        return {
-            "session": session_payload,
-            "account_connected": account_payload["account_connected"],
-            "account_auth_mode": account_payload["account_auth_mode"],
-            "account_updated_at": account_payload["account_updated_at"],
-        }
-
-    def _openai_login_container_cmd(self, container_name: str, method: str) -> list[str]:
-        container_home = DEFAULT_CONTAINER_HOME
-        cmd = [
-            "docker",
-            "run",
-            "--rm",
-            "--name",
-            container_name,
-            "--init",
-            "--user",
-            f"{self.local_uid}:{self.local_gid}",
-            "--network",
-            "host",
-            "--workdir",
-            container_home,
-            "--tmpfs",
-            TMP_DIR_TMPFS_SPEC,
-            "--volume",
-            f"{self.host_codex_dir}:{container_home}/.codex",
-            "--volume",
-            f"{self.config_file}:{container_home}/.codex/config.toml",
-            "--env",
-            f"LOCAL_UMASK={self.local_umask}",
-            "--env",
-            f"LOCAL_USER={self.local_user}",
-            "--env",
-            f"HOME={container_home}",
-            "--env",
-            f"CONTAINER_HOME={container_home}",
-            "--env",
-            f"PATH={container_home}/.codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        ]
-        cmd.extend(["--group-add", "agent"])
-        for supp_gid in _parse_gid_csv(self.local_supp_gids):
-            if supp_gid == self.local_gid:
-                continue
-            cmd.extend(["--group-add", str(supp_gid)])
-        cmd.extend(
-            [
-                DEFAULT_AGENT_IMAGE,
-                "codex",
-                "login",
-            ]
-        )
-        if method == "device_auth":
-            cmd.append("--device-auth")
-        return cmd
-
-    def _start_openai_login_reader(self, session_id: str) -> None:
-        thread = Thread(target=self._openai_login_reader_loop, args=(session_id,), daemon=True)
-        thread.start()
-
-    def _openai_login_reader_loop(self, session_id: str) -> None:
-        with self._openai_login_lock:
-            session = self._openai_login_session
-            if session is None or session.id != session_id:
-                return
-            process = session.process
-
-        stdout = process.stdout
-        if stdout is not None:
-            for raw_line in iter(stdout.readline, ""):
-                if raw_line == "":
-                    break
-                clean_line = ANSI_ESCAPE_RE.sub("", raw_line).replace("\r", "")
-                should_emit_session = False
-                with self._openai_login_lock:
-                    current = self._openai_login_session
-                    if current is None or current.id != session_id:
-                        break
-                    current.log_tail = _append_tail(
-                        current.log_tail,
-                        clean_line,
-                        OPENAI_ACCOUNT_LOGIN_LOG_MAX_CHARS,
-                    )
-
-                    callback_candidate = _first_url_in_text(clean_line, "http://localhost")
-                    if callback_candidate:
-                        local_url, callback_port, callback_path = _parse_local_callback(callback_candidate)
-                        if local_url:
-                            current.local_callback_url = local_url
-                            current.callback_port = callback_port
-                            current.callback_path = callback_path
-
-                    login_url = _openai_login_url_in_text(clean_line)
-                    if login_url:
-                        current.login_url = login_url
-                        if current.method == "browser_callback" and current.status in {"starting", "running"}:
-                            current.status = "waiting_for_browser"
-                        parsed_login = urllib.parse.urlparse(login_url)
-                        query = urllib.parse.parse_qs(parsed_login.query)
-                        redirect_values = query.get("redirect_uri") or []
-                        if redirect_values:
-                            local_url, callback_port, callback_path = _parse_local_callback(redirect_values[0])
-                            if local_url:
-                                current.local_callback_url = local_url
-                                current.callback_port = callback_port
-                                current.callback_path = callback_path
-
-                    device_code_match = re.search(r"\b[A-Z0-9]{4}-[A-Z0-9]{5}\b", clean_line)
-                    if device_code_match:
-                        current.device_code = device_code_match.group(0)
-                        if current.method == "device_auth" and current.status in {"starting", "running", "waiting_for_browser"}:
-                            current.status = "waiting_for_device_code"
-                    should_emit_session = True
-                if should_emit_session:
-                    self._emit_openai_account_session_changed(reason="login_output")
-
-        exit_code = process.wait()
-        should_emit_auth = False
-        with self._openai_login_lock:
-            current = self._openai_login_session
-            if current is None or current.id != session_id:
-                return
-            current.exit_code = exit_code
-            if not current.completed_at:
-                current.completed_at = _iso_now()
-            if current.status == "cancelled":
-                return
-
-            account_connected, _ = _read_codex_auth(self.openai_codex_auth_file)
-            if exit_code == 0 and account_connected:
-                current.status = "connected"
-                current.error = ""
-                should_emit_auth = True
-            else:
-                current.status = "failed"
-                if not current.error:
-                    if exit_code == 0:
-                        current.error = "Login exited without saving ChatGPT account credentials."
-                    else:
-                        current.error = f"Login process exited with code {exit_code}."
-        self._emit_openai_account_session_changed(reason="login_process_exit")
-        if should_emit_auth:
-            self._emit_auth_changed(reason="openai_account_connected")
-
-    def _stop_openai_login_process(self, session: OpenAIAccountLoginSession) -> None:
-        if _is_process_running(session.process.pid):
-            _stop_process(session.process.pid)
-        try:
-            subprocess.run(
-                ["docker", "rm", "-f", session.container_name],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError:
-            return
+        return self.openai_account_service.openai_account_session_payload()
 
     def start_openai_account_login(self, method: str = "browser_callback") -> dict[str, Any]:
-        normalized_method = _normalize_openai_account_login_method(method)
-        LOGGER.debug("Starting OpenAI account login flow method=%s.", normalized_method)
-        if shutil.which("docker") is None:
-            raise HTTPException(status_code=400, detail="docker command not found in PATH.")
-        if not _docker_image_exists(DEFAULT_AGENT_IMAGE):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Runtime image '{DEFAULT_AGENT_IMAGE}' is not available. "
-                    "Start a chat once to build it, then retry account login."
-                ),
-            )
-
-        with self._openai_login_lock:
-            existing = self._openai_login_session
-            existing_running = bool(existing and _is_process_running(existing.process.pid))
-            should_cancel_existing = bool(existing_running and existing and existing.method != normalized_method)
-        if should_cancel_existing:
-            self.cancel_openai_account_login()
-
-        existing_payload: dict[str, Any] | None = None
-        with self._openai_login_lock:
-            existing = self._openai_login_session
-            if existing is not None and _is_process_running(existing.process.pid):
-                existing_payload = self._openai_login_session_payload(existing)
-            else:
-                container_name = f"agent-hub-openai-login-{uuid.uuid4().hex[:12]}"
-                cmd = self._openai_login_container_cmd(container_name, normalized_method)
-                try:
-                    process = subprocess.Popen(
-                        cmd,
-                        text=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        bufsize=1,
-                        start_new_session=True,
-                    )
-                except OSError as exc:
-                    raise HTTPException(status_code=500, detail=f"Failed to start account login container: {exc}") from exc
-
-                session = OpenAIAccountLoginSession(
-                    id=uuid.uuid4().hex,
-                    process=process,
-                    container_name=container_name,
-                    started_at=_iso_now(),
-                    method=normalized_method,
-                    status="running",
-                )
-                self._openai_login_session = session
-
-        if existing_payload is not None:
-            self._emit_openai_account_session_changed(reason="login_already_running")
-            return {"session": existing_payload}
-
-        self._start_openai_login_reader(session.id)
-        self._emit_openai_account_session_changed(reason="login_started")
-        return {"session": self._openai_login_session_payload(session)}
+        return self.openai_account_service.start_openai_account_login(method=method)
 
     def cancel_openai_account_login(self) -> dict[str, Any]:
-        not_running_payload: dict[str, Any] | None = None
-        with self._openai_login_lock:
-            session = self._openai_login_session
-            if session is None:
-                return {"session": None}
-            if not _is_process_running(session.process.pid):
-                not_running_payload = self._openai_login_session_payload(session)
-            else:
-                session.status = "cancelled"
-                session.error = "Cancelled by user."
-                session.completed_at = _iso_now()
-        if not_running_payload is not None:
-            self._emit_openai_account_session_changed(reason="login_not_running")
-            return {"session": not_running_payload}
-
-        self._stop_openai_login_process(session)
-
-        cancelled_payload: dict[str, Any] | None = None
-        with self._openai_login_lock:
-            current = self._openai_login_session
-            if current is not None and current.id == session.id:
-                current.exit_code = current.process.poll()
-                cancelled_payload = self._openai_login_session_payload(current)
-        if cancelled_payload is not None:
-            self._emit_openai_account_session_changed(reason="login_cancelled")
-            return {"session": cancelled_payload}
-        return {"session": None}
+        return self.openai_account_service.cancel_openai_account_login()
 
     def forward_openai_account_callback(
         self,
@@ -3472,109 +3075,9 @@ class HubStateOpsMixin:
         request_host: str = "",
         request_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        started_at = time.monotonic()
-
-        with self._openai_login_lock:
-            session = self._openai_login_session
-            if session is None:
-                raise HTTPException(status_code=409, detail="No active OpenAI account login session.")
-            if session.method != "browser_callback":
-                raise HTTPException(status_code=409, detail="Callback forwarding is only available for browser callback login.")
-            callback_port = int(session.callback_port or OPENAI_ACCOUNT_LOGIN_DEFAULT_CALLBACK_PORT)
-            callback_path = str(path or session.callback_path or "/auth/callback").strip() or "/auth/callback"
-            if not callback_path.startswith("/"):
-                callback_path = f"/{callback_path}"
-
-        if not query:
-            raise HTTPException(status_code=400, detail="Missing callback query parameters.")
-        callback_result = self.auth_service.forward_openai_account_callback(
-            session=session,
-            callback_port=callback_port,
-            callback_path=callback_path,
-            query=query,
-            artifact_publish_base_url=self.artifact_publish_base_url,
+        return self.openai_account_service.forward_openai_account_callback(
+            query,
+            path=path,
             request_host=request_host,
             request_context=request_context,
-            discover_bridge_hosts=_discover_openai_callback_bridge_hosts,
-            normalize_host=_normalize_callback_forward_host,
-            callback_query_summary=_openai_callback_query_summary,
-            redact_url_query_values=_redact_url_query_values,
-            host_port_netloc=_host_port_netloc,
-            classify_callback_error=_classify_openai_callback_forward_error,
-            logger=LOGGER,
         )
-
-        with self._openai_login_lock:
-            current = self._openai_login_session
-            if current is not None and current.id == session.id:
-                current.log_tail = _append_tail(
-                    current.log_tail,
-                    "\n[hub] OAuth callback forwarded to local login server.\n",
-                    OPENAI_ACCOUNT_LOGIN_LOG_MAX_CHARS,
-                )
-                if current.status in {"running", "waiting_for_browser"}:
-                    current.status = "callback_received"
-        self._emit_openai_account_session_changed(reason="oauth_callback_forwarded")
-        LOGGER.info(
-            (
-                "OpenAI callback forward completed session_id=%s target_origin=%s target_path=%s "
-                "status=%s response_summary_present=%s"
-            ),
-            session.id,
-            callback_result.target_origin,
-            callback_path,
-            callback_result.status_code,
-            bool(callback_result.response_body),
-            extra={
-                "component": "auth",
-                "operation": "openai_callback_forward",
-                "result": "completed",
-                "request_id": "",
-                "project_id": "",
-                "chat_id": "",
-                "duration_ms": max(0, int((time.monotonic() - started_at) * 1000)),
-                "error_class": "none",
-            },
-        )
-
-        return {
-            "forwarded": True,
-            "status_code": callback_result.status_code,
-            "target_origin": callback_result.target_origin,
-            "target_path": callback_path,
-            "response_summary": _short_summary(
-                ANSI_ESCAPE_RE.sub("", callback_result.response_body),
-                max_words=28,
-                max_chars=220,
-            ),
-        }
-
-
-def _sync_server_globals() -> None:
-    globals().update(_hub_server.__dict__)
-
-
-def _wrap_sync(fn):
-    def _wrapped(*args, **kwargs):
-        _sync_server_globals()
-        return fn(*args, **kwargs)
-
-    _wrapped.__name__ = getattr(fn, "__name__", "_wrapped")
-    _wrapped.__qualname__ = getattr(fn, "__qualname__", _wrapped.__name__)
-    _wrapped.__doc__ = getattr(fn, "__doc__", None)
-    return _wrapped
-
-
-for _name, _member in list(HubStateOpsMixin.__dict__.items()):
-    if _name.startswith("__"):
-        continue
-    if isinstance(_member, staticmethod):
-        _fn = _member.__func__
-        setattr(HubStateOpsMixin, _name, staticmethod(_wrap_sync(_fn)))
-        continue
-    if isinstance(_member, classmethod):
-        _fn = _member.__func__
-        setattr(HubStateOpsMixin, _name, classmethod(_wrap_sync(_fn)))
-        continue
-    if callable(_member):
-        setattr(HubStateOpsMixin, _name, _wrap_sync(_member))

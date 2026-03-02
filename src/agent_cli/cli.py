@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
-import inspect
 import json
 import os
 import pwd
@@ -24,14 +23,14 @@ from threading import Thread
 from typing import Any, Iterable, Iterator, Tuple
 
 import click
-from click.core import ParameterSource
 
 from agent_cli import providers as agent_providers
-from agent_cli.services import BuildService, LaunchService, SnapshotService
+from agent_cli.services import BuildService, LaunchPipelineDeps, LaunchPipelineInput, execute_launch_pipeline
 from agent_core import (
     AgentRuntimeConfig,
     ConfigError,
     DEFAULT_RUNTIME_RUN_MODE,
+    IdentityError,
     RUNTIME_RUN_MODE_AUTO,
     RUNTIME_RUN_MODE_CHOICES,
     RUNTIME_RUN_MODE_DOCKER,
@@ -109,10 +108,6 @@ def _cli_arg_matches_option(arg: str, *, long_option: str, short_option: str | N
     return False
 
 
-def _has_cli_option(args: Iterable[str], *, long_option: str, short_option: str | None = None) -> bool:
-    return any(_cli_arg_matches_option(arg, long_option=long_option, short_option=short_option) for arg in args)
-
-
 def _has_codex_config_override(args: Iterable[str], *, key: str) -> bool:
     parsed_args = [str(arg) for arg in args]
     for index, arg in enumerate(parsed_args):
@@ -146,23 +141,11 @@ def _resolved_runtime_colorterm(env: dict[str, str] | None = None) -> str:
     return candidate
 
 
-def _resolve_local_username(explicit_user: str | None, uid: int) -> str:
-    user = str(explicit_user or "").strip()
-    if user:
-        return user
-    try:
-        return pwd.getpwuid(int(uid)).pw_name
-    except (KeyError, ValueError) as exc:
-        raise click.ClickException(
-            f"Unable to resolve host username for uid={uid}. Pass --local-user explicitly."
-        ) from exc
-
-
 def _runtime_identity_from_config(runtime_config: AgentRuntimeConfig) -> tuple[int | None, int | None, str, str]:
     identity_config = core_identity.parse_runtime_identity_config(runtime_config)
     configured_uid, configured_gid = core_identity.parse_configured_uid_gid(
         identity_config,
-        error_factory=lambda message: click.ClickException(message),
+        error_factory=lambda message: IdentityError(message),
     )
     return configured_uid, configured_gid, identity_config.username, identity_config.supplementary_gids
 
@@ -202,8 +185,6 @@ def _shared_prompt_context_from_runtime_config(
     parsed: dict[str, Any] = {}
     if isinstance(runtime_config.runtime.values, dict):
         parsed.update(runtime_config.runtime.values)
-    if isinstance(runtime_config.extras, dict):
-        parsed.update(runtime_config.extras)
 
     project_doc_auto_load = parsed.get("project_doc_auto_load") is True
     doc_fallback_files = _normalize_string_list(parsed.get("project_doc_fallback_filenames"))
@@ -222,12 +203,6 @@ def _shared_prompt_context_from_runtime_config(
         sections.append(doc_section)
 
     return "\n\n".join(section for section in sections if section)
-
-
-def _shared_prompt_context_from_config(config_path: Path, *, core_system_prompt: str) -> str:
-    """Compatibility wrapper for existing tests/helpers."""
-    runtime_config = load_agent_runtime_config(config_path)
-    return _shared_prompt_context_from_runtime_config(runtime_config, core_system_prompt=core_system_prompt)
 
 
 def _sync_gemini_shared_context_file(*, host_gemini_dir: Path, shared_prompt_context: str) -> None:
@@ -444,20 +419,10 @@ class _AgentToolsRuntimeBridge:
         if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=2.0)
 
-        remove_session = (
-            getattr(self.state, "_remove_agent_tools_session", None) if self.state is not None else None
-        )
-        sessions_lock = getattr(self.state, "_agent_tools_sessions_lock", None) if self.state is not None else None
-        sessions = getattr(self.state, "_agent_tools_sessions", None) if self.state is not None else None
+        remove_session = getattr(self.state, "remove_agent_tools_session", None) if self.state is not None else None
         if self.session_id and callable(remove_session):
             try:
                 remove_session(self.session_id)
-            except Exception:
-                pass
-        elif self.session_id and sessions_lock is not None and isinstance(sessions, dict):
-            try:
-                with sessions_lock:
-                    sessions.pop(self.session_id, None)
             except Exception:
                 pass
         if self.cleanup_runtime_config:
@@ -472,18 +437,18 @@ def _resolve_existing_project_context(state: object, repo_url: str) -> tuple[str
 
     target_repo = str(repo_url or "").strip()
     if not target_repo:
-        return "", hub_server._normalize_project_credential_binding(None)
+        return "", hub_server.normalize_project_credential_binding(None)
 
-    target_host = hub_server._git_repo_host(target_repo)
-    target_owner = hub_server._git_repo_owner(target_repo)
-    target_name = hub_server._extract_repo_name(target_repo).lower().strip()
+    target_host = hub_server.git_repo_host(target_repo)
+    target_owner = hub_server.git_repo_owner(target_repo)
+    target_name = hub_server.extract_repo_name(target_repo).lower().strip()
     if not target_host or not target_name:
-        return "", hub_server._normalize_project_credential_binding(None)
+        return "", hub_server.normalize_project_credential_binding(None)
 
     state_payload = state.load()
     projects = state_payload.get("projects")
     if not isinstance(projects, dict):
-        return "", hub_server._normalize_project_credential_binding(None)
+        return "", hub_server.normalize_project_credential_binding(None)
 
     for project_id, project in projects.items():
         if not isinstance(project, dict):
@@ -491,14 +456,14 @@ def _resolve_existing_project_context(state: object, repo_url: str) -> tuple[str
         project_repo = str(project.get("repo_url") or "").strip()
         if not project_repo:
             continue
-        host = hub_server._git_repo_host(project_repo)
-        owner = hub_server._git_repo_owner(project_repo)
-        name = hub_server._extract_repo_name(project_repo).lower().strip()
+        host = hub_server.git_repo_host(project_repo)
+        owner = hub_server.git_repo_owner(project_repo)
+        name = hub_server.extract_repo_name(project_repo).lower().strip()
         if host == target_host and owner == target_owner and name == target_name:
-            binding = hub_server._normalize_project_credential_binding(project.get("credential_binding"))
+            binding = hub_server.normalize_project_credential_binding(project.get("credential_binding"))
             return str(project_id), binding
 
-    return "", hub_server._normalize_project_credential_binding(None)
+    return "", hub_server.normalize_project_credential_binding(None)
 
 
 def _build_agent_tools_runtime_config(
@@ -512,7 +477,7 @@ def _build_agent_tools_runtime_config(
 ) -> Path:
     from agent_hub import server as hub_server
 
-    source_script = hub_server._agent_tools_mcp_source_path()
+    source_script = hub_server.agent_tools_mcp_source_path()
     try:
         script_text = source_script.read_text(encoding="utf-8")
     except OSError as exc:
@@ -669,16 +634,8 @@ def _start_agent_tools_runtime_bridge(
         "runtime_config": bridge_runtime_config,
         "system_prompt_file": system_prompt_path,
         "artifact_publish_base_url": "http://127.0.0.1",
+        "reconcile_project_build_on_init": False,
     }
-    try:
-        hub_state_init_signature = inspect.signature(hub_server.HubState.__init__)
-    except (TypeError, ValueError):
-        hub_state_init_signature = None
-    if (
-        hub_state_init_signature is not None
-        and "reconcile_project_build_on_init" in hub_state_init_signature.parameters
-    ):
-        hub_state_kwargs["reconcile_project_build_on_init"] = False
 
     hub_state = hub_server.HubState(**hub_state_kwargs)
     repo_url = _git_origin_repo_url(project_path)
@@ -689,7 +646,7 @@ def _start_agent_tools_runtime_bridge(
     thread: Thread | None = None
     try:
         project_id, credential_binding = _resolve_existing_project_context(hub_state, repo_url)
-        session_id, session_token = hub_state._create_agent_tools_session(
+        session_id, session_token = hub_state.create_agent_tools_session(
             project_id=project_id,
             repo_url=repo_url,
             credential_binding=credential_binding,
@@ -851,18 +808,10 @@ def _start_agent_tools_runtime_bridge(
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
         if session_id:
-            sessions_lock = getattr(hub_state, "_agent_tools_sessions_lock", None)
-            sessions = getattr(hub_state, "_agent_tools_sessions", None)
-            remove_session = getattr(hub_state, "_remove_agent_tools_session", None)
+            remove_session = getattr(hub_state, "remove_agent_tools_session", None)
             if callable(remove_session):
                 try:
                     remove_session(session_id)
-                except Exception:
-                    pass
-            elif sessions_lock is not None and isinstance(sessions, dict):
-                try:
-                    with sessions_lock:
-                        sessions.pop(session_id, None)
                 except Exception:
                     pass
         if runtime_config_path is not None:
@@ -893,8 +842,7 @@ def _gid_for_group_name(group_name: str) -> int:
 
 
 def _default_supplementary_gids() -> str:
-    gids = sorted({gid for gid in os.getgroups() if gid != os.getgid()})
-    return ",".join(str(gid) for gid in gids)
+    return core_identity.default_supplementary_gids()
 
 
 def _default_supplementary_groups() -> str:
@@ -1060,18 +1008,13 @@ def _prepare_daemon_visible_file_mount_source(
     _validate_daemon_visible_mount_source(source_path, label=label)
     if not _is_running_inside_container():
         return source_path
-    candidates = [_daemon_visible_mount_source(source_path), source_path]
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate)
-        if key in seen:
-            continue
-        seen.add(key)
-        source_kind = _daemon_mount_source_kind(candidate)
-        if source_kind == "file":
-            return candidate
+    candidate = _daemon_visible_mount_source(source_path)
+    _validate_daemon_visible_mount_source(candidate, label=f"{label} (mapped)")
+    source_kind = _daemon_mount_source_kind(candidate)
+    if source_kind == "file":
+        return candidate
     raise MountVisibilityError(
-        f"{label} must be daemon-visible as a file but resolved as '{source_kind}': {source_path}. "
+        f"{label} must be daemon-visible as a file but resolved as '{source_kind}': {candidate}. "
         "Fix host/container path mapping before retrying."
     )
 
@@ -1649,6 +1592,36 @@ def _resolve_base_image(
     return tag, resolved_context, resolved_dockerfile
 
 
+def _validate_base_image_source_flags(
+    *,
+    base_docker_path: str | None,
+    base_docker_context: str | None,
+    base_dockerfile: str | None,
+    base_image: str,
+    base_image_tag: str | None,
+) -> None:
+    has_base_path = bool(str(base_docker_path or "").strip())
+    has_base_context = bool(str(base_docker_context or "").strip())
+    has_base_dockerfile = bool(str(base_dockerfile or "").strip())
+    has_docker_source = has_base_path or has_base_context or has_base_dockerfile
+    normalized_base_image = str(base_image or "").strip()
+
+    if has_base_path and (has_base_context or has_base_dockerfile):
+        raise click.ClickException(
+            "--base cannot be combined with --base-docker-context or --base-dockerfile."
+        )
+
+    if has_docker_source and normalized_base_image and normalized_base_image != DEFAULT_BASE_IMAGE:
+        raise click.ClickException(
+            "--base-image cannot be combined with --base/--base-docker-context/--base-dockerfile."
+        )
+
+    if base_image_tag and not has_docker_source:
+        raise click.ClickException(
+            "--base-image-tag requires --base, --base-docker-context, or --base-dockerfile."
+        )
+
+
 @click.command(help="Launch the containerized agent environment")
 @click.option("--project", default=".", show_default=True)
 @click.option(
@@ -1810,21 +1783,13 @@ def main(
     project_path = _to_absolute(project, cwd)
     if not project_path.is_dir():
         raise click.ClickException(f"Project path does not exist: {project_path}")
-
-    explicit_config_file = False
-    explicit_system_prompt_file = False
-    context = click.get_current_context(silent=True)
-    if context is not None:
-        explicit_config_file = (
-            context.get_parameter_source("config_file") == ParameterSource.COMMANDLINE
-        )
-        explicit_system_prompt_file = (
-            context.get_parameter_source("system_prompt_file") == ParameterSource.COMMANDLINE
-        )
-    else:
-        cli_args = [str(arg) for arg in sys.argv[1:]]
-        explicit_config_file = _has_cli_option(cli_args, long_option="--config-file")
-        explicit_system_prompt_file = _has_cli_option(cli_args, long_option="--system-prompt-file")
+    _validate_base_image_source_flags(
+        base_docker_path=base_docker_path,
+        base_docker_context=base_docker_context,
+        base_dockerfile=base_dockerfile,
+        base_image=base_image,
+        base_image_tag=base_image_tag,
+    )
 
     config_path = _to_absolute(config_file, cwd)
     if not config_path.is_file():
@@ -1882,45 +1847,49 @@ def main(
     core_system_prompt = _read_system_prompt(system_prompt_path)
 
     if git_credential_file or git_credential_host or git_credential_scheme:
-        click.echo(
-            (
-                "Ignoring --git-credential-* flags. "
-                "Provide standard provider tokens via --env-var "
-                "(for example GITHUB_TOKEN=... or GITLAB_TOKEN=...)."
-            ),
-            err=True,
+        raise click.ClickException(
+            "The --git-credential-* flags are no longer supported. "
+            "Provide provider tokens via --env-var instead "
+            "(for example GITHUB_TOKEN=... or GITLAB_TOKEN=...)."
         )
 
-    configured_uid, configured_gid, configured_user, configured_supplementary = _runtime_identity_from_config(
-        runtime_config
-    )
-
-    uid = local_uid if local_uid is not None else configured_uid if configured_uid is not None else os.getuid()
-    user = _resolve_local_username(local_user or configured_user, uid)
-    if local_gid is not None:
-        gid = local_gid
-    elif local_group:
-        gid = _gid_for_group_name(local_group)
-    elif configured_gid is not None:
-        gid = configured_gid
-    else:
-        gid = os.getgid()
-
+    explicit_supplementary_gids: str | None = None
     if local_supplementary_gids is not None:
-        supp_gids_csv = _normalize_csv(local_supplementary_gids)
+        explicit_supplementary_gids = local_supplementary_gids
     elif local_supplementary_groups is not None:
-        supp_gids_csv = _group_names_to_gid_csv(local_supplementary_groups)
-    elif configured_supplementary:
-        supp_gids_csv = configured_supplementary
-    else:
-        supp_gids_csv = _default_supplementary_gids()
-    runtime_identity = core_identity.RuntimeIdentity(
-        username=user,
-        uid=int(uid),
-        gid=int(gid),
-        supplementary_gids=supp_gids_csv,
-        umask=local_umask,
-    )
+        explicit_supplementary_gids = _group_names_to_gid_csv(local_supplementary_groups)
+    explicit_gid = local_gid
+    if explicit_gid is None and local_group:
+        explicit_gid = _gid_for_group_name(local_group)
+
+    try:
+        runtime_identity = core_identity.resolve_runtime_identity(
+            core_identity.RuntimeIdentityResolutionContract(
+                runtime_config=runtime_config,
+                explicit_uid=local_uid,
+                explicit_gid=explicit_gid,
+                explicit_username=str(local_user or "").strip(),
+                explicit_supplementary_gids=explicit_supplementary_gids,
+                default_uid=os.getuid(),
+                default_gid=os.getgid(),
+                default_supplementary_gids=_default_supplementary_gids(),
+                umask=local_umask,
+            ),
+            username_lookup=lambda lookup_uid: pwd.getpwuid(int(lookup_uid)).pw_name,
+            missing_username_message_factory=(
+                lambda lookup_uid: (
+                    f"Unable to resolve host username for uid={lookup_uid}. Pass --local-user explicitly."
+                )
+            ),
+            error_factory=lambda message: IdentityError(message),
+        )
+    except IdentityError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    uid = int(runtime_identity.uid)
+    gid = int(runtime_identity.gid)
+    user = runtime_identity.username
+    supp_gids_csv = runtime_identity.supplementary_gids
     supplemental_group_ids = [supp_gid for supp_gid in _parse_gid_csv(supp_gids_csv) if supp_gid != gid]
     docker_socket_gid = _docker_socket_gid()
     if (
@@ -1981,30 +1950,6 @@ def main(
         click_echo=click.echo,
     )
 
-    ro_mount_flags: list[str] = []
-    rw_mount_flags: list[str] = []
-    rw_mount_specs: list[tuple[Path, str]] = []
-
-    for mount in ro_mounts:
-        _reject_mount_inside_project_path(spec=mount, label="--ro-mount", container_project_path=container_project_root)
-        host, container = _parse_mount(mount, "--ro-mount")
-        host_path = Path(host)
-        _validate_daemon_visible_mount_source(host_path, label="--ro-mount")
-        ro_mount_flags.append(f"{_daemon_visible_mount_source(host_path)}:{container}:ro")
-
-    for mount in rw_mounts:
-        _reject_mount_inside_project_path(spec=mount, label="--rw-mount", container_project_path=container_project_root)
-        host, container = _parse_mount(mount, "--rw-mount")
-        host_path = Path(host)
-        _validate_daemon_visible_mount_source(host_path, label="--rw-mount")
-        rw_mount_flags.append(f"{_daemon_visible_mount_source(host_path)}:{container}")
-        rw_mount_specs.append((host_path, container))
-
-    parsed_env_vars: list[str] = []
-    for entry in env_vars:
-        parsed_env_vars.append(_parse_env_var(entry, "--env-var"))
-
-    explicit_container_args = [str(arg) for arg in container_args]
     shared_prompt_context = _shared_prompt_context_from_runtime_config(
         runtime_config,
         core_system_prompt=core_system_prompt,
@@ -2019,221 +1964,80 @@ def main(
         shared_prompt_context=shared_prompt_context,
     )
 
-    runtime_flags = agent_provider.default_runtime_flags(
-        explicit_args=explicit_container_args,
-        shared_prompt_context=shared_prompt_context,
-        no_alt_screen=no_alt_screen,
-        runtime_config=runtime_config,
-    )
-    codex_project_trust_key = f"projects.{json.dumps(container_project_path)}.trust_level"
-    if (
-        selected_agent_provider == AGENT_PROVIDER_CODEX
-        and not _has_codex_config_override(explicit_container_args, key=codex_project_trust_key)
-    ):
-        runtime_flags.extend(["--config", f'{codex_project_trust_key}="trusted"'])
-
-    resume_shell_command = ""
-    if resume and not explicit_container_args:
-        resume_shell_command = agent_provider.resume_shell_command(
+    execute_launch_pipeline(
+        data=LaunchPipelineInput(
+            ro_mounts=ro_mounts,
+            rw_mounts=rw_mounts,
+            env_vars=env_vars,
+            container_args=container_args,
+            selected_agent_provider=selected_agent_provider,
+            selected_agent_command=selected_agent_command,
             no_alt_screen=no_alt_screen,
-            runtime_flags=runtime_flags,
-        )
-    command_plan = core_launch.AgentProcessLaunchPlan(
-        agent_command=selected_agent_command,
-        runtime_flags=tuple(runtime_flags),
-        explicit_container_args=tuple(explicit_container_args),
-        resume=resume,
-        resume_shell_command=resume_shell_command,
-    )
-    command = core_launch.compile_agent_process_command(command_plan)
-
-    config_mount_target = f"{container_home_path}/.codex/config.toml"
-    mcp_config_mount_target = agent_provider.get_mcp_config_mount_target(container_home_path)
-    mcp_config_mount_mode = ""
-    mounted_config_path = _prepare_daemon_visible_file_mount_source(
-        config_path,
-        label="--config-file",
-    )
-    mounted_claude_json_path = _prepare_daemon_visible_file_mount_source(
-        host_claude_json_file,
-        label="Claude settings file",
-    )
-    mounted_gemini_settings_path = _prepare_daemon_visible_file_mount_source(
-        host_gemini_settings_file,
-        label="Gemini settings file",
-    )
-    mcp_mount_source = (
-        mounted_gemini_settings_path
-        if isinstance(agent_provider, agent_providers.GeminiProvider)
-        else None
-    )
-    mcp_config_mount_entry = (
-        f"{mcp_mount_source}:{mcp_config_mount_target}{mcp_config_mount_mode}"
-        if mcp_mount_source is not None
-        else None
-    )
-    config_mount_entry = f"{mounted_config_path}:{config_mount_target}"
-    daemon_host_codex_dir = _daemon_visible_mount_source(host_codex_dir)
-    daemon_host_claude_dir = _daemon_visible_mount_source(host_claude_dir)
-    daemon_host_claude_config_dir = _daemon_visible_mount_source(host_claude_config_dir)
-    daemon_host_gemini_dir = _daemon_visible_mount_source(host_gemini_dir)
-    project_mount_entry = f"{daemon_project_path}:{container_project_path}"
-    use_project_bind_mount = not (bool(snapshot_tag) and (prepare_snapshot_only or project_in_image))
-    run_args = [
-        "--init",
-        "--user",
-        ("0:0" if bootstrap_as_root else f"{runtime_identity.uid}:{runtime_identity.gid}"),
-        "--gpus",
-        "all",
-        "--workdir",
-        container_project_path,
-        "--volume",
-        f"{DOCKER_SOCKET_PATH}:{DOCKER_SOCKET_PATH}",
-        "--volume",
-        f"{daemon_host_codex_dir}:{container_home_path}/.codex",
-        "--volume",
-        f"{daemon_host_claude_dir}:{container_home_path}/.claude",
-        "--volume",
-        f"{mounted_claude_json_path}:{container_home_path}/.claude.json",
-        "--volume",
-        f"{daemon_host_claude_config_dir}:{container_home_path}/.config/claude",
-        "--volume",
-        f"{daemon_host_gemini_dir}:{container_home_path}/.gemini",
-        "--volume",
-        config_mount_entry,
-        *(
-            ["--volume", mcp_config_mount_entry]
-            if mcp_config_mount_entry is not None
-            else []
+            resume=resume,
+            snapshot_tag=snapshot_tag,
+            prepare_snapshot_only=prepare_snapshot_only,
+            project_in_image=project_in_image,
+            setup_script=setup_script,
+            cached_snapshot_exists=cached_snapshot_exists,
+            project_path=project_path,
+            daemon_project_path=daemon_project_path,
+            container_project_path=container_project_path,
+            container_project_root=container_project_root,
+            config_path=config_path,
+            system_prompt_path=system_prompt_path,
+            host_codex_dir=host_codex_dir,
+            host_claude_dir=host_claude_dir,
+            host_claude_json_file=host_claude_json_file,
+            host_claude_config_dir=host_claude_config_dir,
+            host_gemini_dir=host_gemini_dir,
+            host_gemini_settings_file=host_gemini_settings_file,
+            container_home_path=container_home_path,
+            runtime_identity=runtime_identity,
+            supplemental_group_ids=supplemental_group_ids,
+            bootstrap_as_root=bootstrap_as_root,
+            api_key=api_key,
+            runtime_config=runtime_config,
+            effective_run_mode=effective_run_mode,
+            allocate_tty=allocate_tty,
+            shared_prompt_context=shared_prompt_context,
         ),
-        "--env",
-        f"LOCAL_UMASK={runtime_identity.umask}",
-        "--env",
-        f"LOCAL_USER={runtime_identity.username}",
-        "--env",
-        f"HOME={container_home_path}",
-        "--env",
-        "NPM_CONFIG_CACHE=/tmp/.npm",
-        "--env",
-        f"CONTAINER_HOME={container_home_path}",
-        "--env",
-        f"PATH={container_home_path}/.codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "--env",
-        f"TERM={_resolved_runtime_term()}",
-        "--env",
-        f"COLORTERM={_resolved_runtime_colorterm()}",
-        "--env",
-        "NVIDIA_VISIBLE_DEVICES=all",
-        "--env",
-        "NVIDIA_DRIVER_CAPABILITIES=all",
-        "--env",
-        f"CONTAINER_PROJECT_PATH={container_project_path}",
-        "--env",
-        f"UV_PROJECT_ENVIRONMENT={container_project_path}/.venv",
-    ]
-    if bootstrap_as_root:
-        run_args.extend(["--env", f"LOCAL_UID={runtime_identity.uid}"])
-        run_args.extend(["--env", f"LOCAL_GID={runtime_identity.gid}"])
-        if runtime_identity.supplementary_gids:
-            run_args.extend(["--env", f"LOCAL_SUPPLEMENTARY_GIDS={runtime_identity.supplementary_gids}"])
-    if use_project_bind_mount:
-        run_args.extend(["--volume", project_mount_entry])
-
-    run_args.extend(["--group-add", "agent"])
-    for supplemental_gid in supplemental_group_ids:
-        run_args.extend(["--group-add", str(supplemental_gid)])
-
-    if sys.platform.startswith("linux"):
-        run_args.extend(["--add-host", "host.docker.internal:host-gateway"])
-
-    if api_key:
-        run_args.extend(["--env", f"OPENAI_API_KEY={api_key}"])
-
-    for env_entry in parsed_env_vars:
-        run_args.extend(["--env", env_entry])
-
-    for mount in ro_mount_flags + rw_mount_flags:
-        run_args.extend(["--volume", mount])
-
-    if rw_mount_specs:
-        click.echo("Running RW mount preflight checks", err=True)
-        for host_path, container_path in rw_mount_specs:
-            _validate_rw_mount(
-                host_path,
-                container_path,
-                runtime_uid=runtime_identity.uid,
-                runtime_gid=runtime_identity.gid,
-            )
-
-    snapshot_service = SnapshotService(
-        none_provider=AGENT_PROVIDER_NONE,
-        codex_provider=AGENT_PROVIDER_CODEX,
-        claude_provider=AGENT_PROVIDER_CLAUDE,
-        gemini_provider=AGENT_PROVIDER_GEMINI,
-        default_container_home=DEFAULT_CONTAINER_HOME,
-        snapshot_source_project_path=SNAPSHOT_SOURCE_PROJECT_PATH,
-        snapshot_setup_runtime_image_for_snapshot=_snapshot_setup_runtime_image_for_snapshot,
-        snapshot_runtime_image_for_provider=_snapshot_runtime_image_for_provider,
-        ensure_runtime_image_built_if_missing=_ensure_runtime_image_built_if_missing,
-        build_runtime_image=_build_runtime_image,
-        build_snapshot_setup_shell_script=_build_snapshot_setup_shell_script,
-        sanitize_tag_component=_sanitize_tag_component,
-        short_hash=_short_hash,
-        docker_rm_force=_docker_rm_force,
-        run_command=_run,
-        click_echo=click.echo,
-    )
-    runtime_image = snapshot_service.resolve_runtime_image(
-        default_runtime_image=_default_runtime_image_for_provider(selected_agent_provider),
-        selected_agent_provider=selected_agent_provider,
-        snapshot_tag=snapshot_tag,
-        prepare_snapshot_only=prepare_snapshot_only,
-        cached_snapshot_exists=cached_snapshot_exists,
-        use_project_bind_mount=use_project_bind_mount,
-        setup_script=setup_script,
-        run_args=run_args,
-        daemon_project_path=daemon_project_path,
-        container_project_path=container_project_path,
-        project_path=project_path,
-        uid=runtime_identity.uid,
-        gid=runtime_identity.gid,
-        ensure_selected_base_image=build_service.ensure_selected_base_image,
-    )
-
-    if prepare_snapshot_only:
-        return
-
-    launch_service = LaunchService(
-        start_agent_tools_runtime_bridge=_start_agent_tools_runtime_bridge,
-        prepare_daemon_visible_file_mount_source=_prepare_daemon_visible_file_mount_source,
-        run_command=_run,
-        compile_docker_run_command=core_launch.compile_docker_run_command,
-        docker_run_plan_factory=core_launch.DockerRunInvocationPlan,
-    )
-    launch_service.launch(
-        project_path=project_path,
-        host_codex_dir=host_codex_dir,
-        config_path=config_path,
-        system_prompt_path=system_prompt_path,
-        agent_tools_config_path=(
-            host_claude_json_file
-            if isinstance(agent_provider, agent_providers.ClaudeProvider)
-            else host_gemini_settings_file
-            if isinstance(agent_provider, agent_providers.GeminiProvider)
-            else None
+        deps=LaunchPipelineDeps(
+            click_echo=click.echo,
+            parse_mount=_parse_mount,
+            parse_env_var=_parse_env_var,
+            reject_mount_inside_project_path=_reject_mount_inside_project_path,
+            validate_daemon_visible_mount_source=_validate_daemon_visible_mount_source,
+            daemon_visible_mount_source=_daemon_visible_mount_source,
+            validate_rw_mount=_validate_rw_mount,
+            prepare_daemon_visible_file_mount_source=_prepare_daemon_visible_file_mount_source,
+            has_codex_config_override=_has_codex_config_override,
+            resolved_runtime_term=_resolved_runtime_term,
+            resolved_runtime_colorterm=_resolved_runtime_colorterm,
+            platform_startswith_linux=lambda: sys.platform.startswith("linux"),
+            default_runtime_image_for_provider=_default_runtime_image_for_provider,
+            snapshot_setup_runtime_image_for_snapshot=_snapshot_setup_runtime_image_for_snapshot,
+            snapshot_runtime_image_for_provider=_snapshot_runtime_image_for_provider,
+            ensure_runtime_image_built_if_missing=_ensure_runtime_image_built_if_missing,
+            build_runtime_image=_build_runtime_image,
+            build_snapshot_setup_shell_script=_build_snapshot_setup_shell_script,
+            sanitize_tag_component=_sanitize_tag_component,
+            short_hash=_short_hash,
+            docker_rm_force=_docker_rm_force,
+            run_command=_run,
+            start_agent_tools_runtime_bridge=_start_agent_tools_runtime_bridge,
+            compile_docker_run_command=core_launch.compile_docker_run_command,
+            docker_run_plan_factory=core_launch.DockerRunInvocationPlan,
+            snapshot_source_project_path=SNAPSHOT_SOURCE_PROJECT_PATH,
+            default_container_home=DEFAULT_CONTAINER_HOME,
+            agent_provider_none=AGENT_PROVIDER_NONE,
+            agent_provider_codex=AGENT_PROVIDER_CODEX,
+            agent_provider_claude=AGENT_PROVIDER_CLAUDE,
+            agent_provider_gemini=AGENT_PROVIDER_GEMINI,
+            docker_socket_path=DOCKER_SOCKET_PATH,
+            tmp_dir_tmpfs_spec=TMP_DIR_TMPFS_SPEC,
         ),
-        parsed_env_vars=parsed_env_vars,
+        build_service=build_service,
         agent_provider=agent_provider,
-        container_home_path=container_home_path,
-        runtime_config=runtime_config,
-        effective_run_mode=effective_run_mode,
-        run_args=run_args,
-        mcp_config_mount_target=mcp_config_mount_target,
-        mcp_config_mount_mode=mcp_config_mount_mode,
-        runtime_image=runtime_image,
-        command=command,
-        allocate_tty=allocate_tty,
-        tmpfs_spec=TMP_DIR_TMPFS_SPEC,
     )
 
 

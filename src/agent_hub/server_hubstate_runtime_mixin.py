@@ -7,6 +7,8 @@ globals().update(_hub_server.__dict__)
 
 
 class HubStateRuntimeMixin:
+    HUB_STATE_SCHEMA_VERSION = 1
+
     def _reconcile_project_build_state(self) -> None:
         state = self.load()
         rebuild_project_ids: list[str] = []
@@ -50,8 +52,22 @@ class HubStateRuntimeMixin:
             self._schedule_project_build(project_id)
 
     def load(self) -> dict[str, Any]:
-        state = self._state_store.load(normalizer=self._normalize_loaded_state)
+        state = self._state_store.load(
+            normalizer=self._normalize_loaded_state,
+            target_version=self.HUB_STATE_SCHEMA_VERSION,
+            migrations={
+                0: self._migrate_state_v0_to_v1,
+            },
+        )
         return state
+
+    @staticmethod
+    def _migrate_state_v0_to_v1(state: dict[str, Any]) -> dict[str, Any]:
+        migrated = dict(state)
+        migrated.setdefault("projects", {})
+        migrated.setdefault("chats", {})
+        migrated.setdefault("settings", {})
+        return migrated
 
     def _normalize_loaded_state(self, loaded: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         loaded_copy = copy.deepcopy(loaded)
@@ -150,6 +166,10 @@ class HubStateRuntimeMixin:
             listener.put_nowait(value)
         except queue.Full:
             return
+
+    @staticmethod
+    def event_queue_put(listener: queue.Queue[dict[str, Any] | None], value: dict[str, Any] | None) -> None:
+        HubStateRuntimeMixin._event_queue_put(listener, value)
 
     def _emit_event(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
         event = {"type": str(event_type), "payload": payload or {}, "sent_at": _iso_now()}
@@ -821,8 +841,10 @@ class HubStateRuntimeMixin:
         if self.agent_tools_mcp_runtime_script.exists():
             try:
                 existing_text = self.agent_tools_mcp_runtime_script.read_text(encoding="utf-8")
-            except OSError:
-                existing_text = ""
+            except OSError as exc:
+                raise ConfigError(
+                    f"Failed to read existing agent_tools MCP runtime script: {self.agent_tools_mcp_runtime_script}"
+                ) from exc
             if existing_text == script_text:
                 return
 
@@ -920,6 +942,10 @@ class HubStateRuntimeMixin:
             raise HTTPException(status_code=403, detail="Invalid artifact publish token.")
 
     @staticmethod
+    def require_artifact_publish_token(chat: dict[str, Any], token: Any) -> None:
+        HubStateRuntimeMixin._require_artifact_publish_token(chat, token)
+
+    @staticmethod
     def _require_session_artifact_publish_token(session: dict[str, Any], token: Any) -> None:
         expected_hash = str(session.get("artifact_publish_token_hash") or "")
         if not expected_hash:
@@ -933,6 +959,10 @@ class HubStateRuntimeMixin:
             raise HTTPException(status_code=403, detail="Invalid artifact publish token.")
 
     @staticmethod
+    def require_session_artifact_publish_token(session: dict[str, Any], token: Any) -> None:
+        HubStateRuntimeMixin._require_session_artifact_publish_token(session, token)
+
+    @staticmethod
     def _require_agent_tools_token(chat: dict[str, Any], token: Any) -> None:
         expected_hash = str(chat.get("agent_tools_token_hash") or "")
         if not expected_hash:
@@ -944,6 +974,10 @@ class HubStateRuntimeMixin:
         submitted_hash = _hash_agent_tools_token(submitted_token)
         if not submitted_hash or not hmac.compare_digest(submitted_hash, expected_hash):
             raise HTTPException(status_code=403, detail="Invalid agent_tools token.")
+
+    @staticmethod
+    def require_agent_tools_token(chat: dict[str, Any], token: Any) -> None:
+        HubStateRuntimeMixin._require_agent_tools_token(chat, token)
 
     @staticmethod
     def _validated_ready_ack_guid(*, expected: str, submitted: Any) -> str:
@@ -1219,6 +1253,21 @@ class HubStateRuntimeMixin:
             self._agent_tools_sessions[session_id] = payload
         return session_id, token
 
+    def create_agent_tools_session(
+        self,
+        *,
+        project_id: str = "",
+        repo_url: str = "",
+        credential_binding: dict[str, Any] | None = None,
+        workspace: Path | None = None,
+    ) -> tuple[str, str]:
+        return self._create_agent_tools_session(
+            project_id=project_id,
+            repo_url=repo_url,
+            credential_binding=credential_binding,
+            workspace=workspace,
+        )
+
     def issue_agent_tools_session_ready_ack_guid(self, session_id: str) -> str:
         normalized_session_id = str(session_id or "").strip()
         if not normalized_session_id:
@@ -1245,6 +1294,9 @@ class HubStateRuntimeMixin:
             raise HTTPException(status_code=404, detail="agent_tools session not found.")
         return dict(session)
 
+    def agent_tools_session(self, session_id: str) -> dict[str, Any]:
+        return self._agent_tools_session(session_id)
+
     def _remove_agent_tools_session(self, session_id: Any) -> None:
         normalized_session_id = str(session_id or "").strip()
         if not normalized_session_id:
@@ -1254,6 +1306,9 @@ class HubStateRuntimeMixin:
         session_artifact_root = self._session_artifact_storage_root(normalized_session_id)
         if session_artifact_root.exists():
             self._delete_path(session_artifact_root)
+
+    def remove_agent_tools_session(self, session_id: Any) -> None:
+        self._remove_agent_tools_session(session_id)
 
     def require_agent_tools_session_token(self, session_id: str, token: Any) -> dict[str, Any]:
         session = self._agent_tools_session(session_id)
@@ -2518,6 +2573,10 @@ class HubStateRuntimeMixin:
 
     @staticmethod
     def _queue_put(listener: queue.Queue[str | None], value: str | None) -> None:
+        RuntimeDomain.queue_put(listener, value)
+
+    @staticmethod
+    def queue_put(listener: queue.Queue[str | None], value: str | None) -> None:
         RuntimeDomain.queue_put(listener, value)
 
     def _pop_runtime(self, chat_id: str) -> ChatRuntime | None:
@@ -4564,33 +4623,3 @@ def _html_page() -> str:
 </body>
 </html>
     """
-
-
-def _sync_server_globals() -> None:
-    globals().update(_hub_server.__dict__)
-
-
-def _wrap_sync(fn):
-    def _wrapped(*args, **kwargs):
-        _sync_server_globals()
-        return fn(*args, **kwargs)
-
-    _wrapped.__name__ = getattr(fn, "__name__", "_wrapped")
-    _wrapped.__qualname__ = getattr(fn, "__qualname__", _wrapped.__name__)
-    _wrapped.__doc__ = getattr(fn, "__doc__", None)
-    return _wrapped
-
-
-for _name, _member in list(HubStateRuntimeMixin.__dict__.items()):
-    if _name.startswith("__"):
-        continue
-    if isinstance(_member, staticmethod):
-        _fn = _member.__func__
-        setattr(HubStateRuntimeMixin, _name, staticmethod(_wrap_sync(_fn)))
-        continue
-    if isinstance(_member, classmethod):
-        _fn = _member.__func__
-        setattr(HubStateRuntimeMixin, _name, classmethod(_wrap_sync(_fn)))
-        continue
-    if callable(_member):
-        setattr(HubStateRuntimeMixin, _name, _wrap_sync(_member))

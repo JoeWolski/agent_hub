@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 
 class LifecycleService:
-    def __init__(self, *, state: Any) -> None:
-        self._state = state
+    def __init__(
+        self,
+        *,
+        forward_openai_account_callback_fn: Callable[..., dict[str, Any]],
+        shutdown_fn: Callable[[], dict[str, int]],
+    ) -> None:
+        self._forward_openai_account_callback_fn = forward_openai_account_callback_fn
+        self._shutdown_fn = shutdown_fn
 
     def forward_openai_account_callback(
         self,
@@ -15,7 +22,7 @@ class LifecycleService:
         request_host: str = "",
         request_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._state.forward_openai_account_callback(
+        return self._forward_openai_account_callback_fn(
             query,
             path=path,
             request_host=request_host,
@@ -23,4 +30,4 @@ class LifecycleService:
         )
 
     def shutdown(self) -> dict[str, int]:
-        return self._state.shutdown()
+        return self._shutdown_fn()

@@ -15,7 +15,7 @@ class EventService:
         self._state.detach_events(listener)
 
     def queue_put(self, listener: queue.Queue[dict[str, Any] | None], value: dict[str, Any] | None) -> None:
-        self._state._event_queue_put(listener, value)
+        self._state.event_queue_put(listener, value)
 
     def events_snapshot(self) -> dict[str, Any]:
         return self._state.events_snapshot()

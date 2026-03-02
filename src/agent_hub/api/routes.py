@@ -13,6 +13,79 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 
+def _invalid_json_payload_error(*, cause: Exception | None = None) -> HTTPException:
+    error = HTTPException(status_code=400, detail="Invalid JSON payload.")
+    if cause is not None:
+        raise error from cause
+    raise error
+
+
+async def _request_json_object(
+    request: Request,
+    *,
+    catch_decode_error: bool = False,
+    none_as_empty_object: bool = False,
+) -> dict[str, Any]:
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as exc:
+        if catch_decode_error:
+            _invalid_json_payload_error(cause=exc)
+        raise
+    if payload is None and none_as_empty_object:
+        return {}
+    if not isinstance(payload, dict):
+        _invalid_json_payload_error()
+    return payload
+
+
+async def _request_optional_body_object(
+    request: Request,
+    *,
+    non_object_detail: str = "Invalid JSON payload.",
+    decode_errors: str = "strict",
+    null_as_empty_object: bool = False,
+) -> dict[str, Any]:
+    body = await request.body()
+    if not body:
+        return {}
+    try:
+        payload = json.loads(body.decode("utf-8", errors=decode_errors))
+    except json.JSONDecodeError as exc:
+        _invalid_json_payload_error(cause=exc)
+    if payload is None and null_as_empty_object:
+        return {}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail=non_object_detail)
+    return payload
+
+
+async def _artifact_route_response(
+    *,
+    request: Request,
+    parse_artifact_request_payload: Callable[..., Any],
+    cleanup_uploaded_artifact_paths: Callable[[list[Path]], None],
+    logger: logging.Logger,
+    context: str,
+    workspace: Path,
+    failure_log_message: str,
+    publish: Callable[[dict[str, Any]], Any],
+) -> dict[str, Any]:
+    payload, staged_paths = await parse_artifact_request_payload(
+        request,
+        context=context,
+        workspace=workspace,
+    )
+    try:
+        artifact = publish(payload)
+    except HTTPException as exc:
+        logger.warning(failure_log_message, exc.detail)
+        raise
+    finally:
+        cleanup_uploaded_artifact_paths(staged_paths)
+    return {"artifact": artifact}
+
+
 def register_hub_routes(
     app: FastAPI,
     *,
@@ -35,9 +108,28 @@ def register_hub_routes(
     empty_list: Callable[..., list[Any]],
     parse_env_vars: Callable[..., Any],
     compact_whitespace: Callable[[str], str],
+    supported_agent_ready_ack_stages: set[str],
     parse_artifact_request_payload: Callable[..., Any],
     cleanup_uploaded_artifact_paths: Callable[[list[Path]], None],
 ) -> None:
+    supported_ready_ack_stages = {str(stage).strip().lower() for stage in supported_agent_ready_ack_stages if str(stage).strip()}
+    supported_ready_ack_stages_message = ", ".join(sorted(supported_ready_ack_stages))
+
+    def validate_ready_ack_stage(payload: dict[str, Any], *, route_label: str) -> None:
+        if "stage" not in payload:
+            return
+        raw_stage = payload.get("stage")
+        normalized_stage = compact_whitespace(str(raw_stage or "")).strip().lower()
+        if normalized_stage in supported_ready_ack_stages:
+            return
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid {route_label} ack stage '{raw_stage}'. "
+                f"Supported stages: {supported_ready_ack_stages_message}."
+            ),
+        )
+
     @app.get("/", response_class=HTMLResponse)
     def index():
         if frontend_index.is_file():
@@ -120,9 +212,7 @@ def register_hub_routes(
 
     @app.patch("/api/settings")
     async def api_update_settings(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request)
         updated = state.app_state_service.update_settings(payload)
         return {"settings": updated}
 
@@ -140,9 +230,7 @@ def register_hub_routes(
 
     @app.post("/api/settings/auth/openai/connect")
     async def api_connect_openai(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request)
         verify = coerce_bool(payload.get("verify"), default=True, field_name="verify")
         return state.auth_service.connect_openai(payload.get("api_key"), verify=verify)
 
@@ -152,24 +240,19 @@ def register_hub_routes(
 
     @app.post("/api/settings/auth/github-app/connect")
     async def api_connect_github_app(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request)
         return state.auth_service.connect_github_app(payload.get("installation_id"))
 
     @app.post("/api/settings/auth/github-app/setup/start")
     async def api_start_github_app_setup(request: Request) -> dict[str, Any]:
         origin = f"{request.url.scheme}://{request.url.netloc}"
-        raw_body = await request.body()
-        if raw_body:
-            try:
-                payload = json.loads(raw_body.decode("utf-8", errors="ignore"))
-            except json.JSONDecodeError as exc:
-                raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-            if payload is not None and not isinstance(payload, dict):
-                raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-            if isinstance(payload, dict) and "origin" in payload:
-                origin = str(payload.get("origin") or "").strip()
+        payload = await _request_optional_body_object(
+            request,
+            decode_errors="ignore",
+            null_as_empty_object=True,
+        )
+        if "origin" in payload:
+            origin = str(payload.get("origin") or "").strip()
         return state.auth_service.start_github_app_setup(origin=origin)
 
     @app.get("/api/settings/auth/github-app/setup/session")
@@ -221,9 +304,7 @@ def register_hub_routes(
 
     @app.post("/api/settings/auth/github-tokens/connect")
     async def api_connect_github_token(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request)
         return state.auth_service.connect_github_personal_access_token(
             payload.get("personal_access_token"),
             host=payload.get("host"),
@@ -239,9 +320,7 @@ def register_hub_routes(
 
     @app.post("/api/settings/auth/gitlab-tokens/connect")
     async def api_connect_gitlab_token(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request)
         return state.auth_service.connect_gitlab_personal_access_token(
             payload.get("personal_access_token"),
             host=payload.get("host"),
@@ -257,9 +336,7 @@ def register_hub_routes(
 
     @app.post("/api/settings/auth/openai/title-test")
     async def api_test_openai_chat_title_generation(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request)
         return state.auth_service.test_openai_chat_title_generation(payload.get("prompt"))
 
     @app.post("/api/settings/auth/openai/account/disconnect")
@@ -273,16 +350,13 @@ def register_hub_routes(
     @app.post("/api/settings/auth/openai/account/start")
     async def api_start_openai_account_login(request: Request) -> dict[str, Any]:
         method = "browser_callback"
-        raw_body = await request.body()
-        if raw_body:
-            try:
-                payload = json.loads(raw_body.decode("utf-8", errors="ignore"))
-            except json.JSONDecodeError as exc:
-                raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-            if payload is not None and not isinstance(payload, dict):
-                raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-            if isinstance(payload, dict):
-                method = normalize_openai_account_login_method(payload.get("method"))
+        payload = await _request_optional_body_object(
+            request,
+            decode_errors="ignore",
+            null_as_empty_object=True,
+        )
+        if payload:
+            method = normalize_openai_account_login_method(payload.get("method"))
         return state.auth_service.start_openai_account_login(method=method)
 
     @app.post("/api/settings/auth/openai/account/cancel")
@@ -307,12 +381,7 @@ def register_hub_routes(
 
     @app.post("/api/projects/auto-configure")
     async def api_auto_configure_project(request: Request) -> dict[str, Any]:
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request, catch_decode_error=True)
         agent_args = payload.get("agent_args")
         if agent_args is None:
             agent_args = []
@@ -335,24 +404,14 @@ def register_hub_routes(
 
     @app.post("/api/projects/auto-configure/cancel")
     async def api_cancel_auto_configure_project(request: Request) -> dict[str, Any]:
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request, catch_decode_error=True)
         return state.auto_config_service.cancel_auto_configure_project(
             request_id=payload.get("request_id"),
         )
 
     @app.post("/api/projects")
     async def api_create_project(request: Request) -> dict[str, Any]:
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request, catch_decode_error=True)
         repo_url = str(payload.get("repo_url", "")).strip()
         name = payload.get("name")
         if name is not None:
@@ -388,12 +447,7 @@ def register_hub_routes(
 
     @app.patch("/api/projects/{project_id}")
     async def api_update_project(project_id: str, request: Request) -> dict[str, Any]:
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request, catch_decode_error=True)
         update: dict[str, Any] = {}
         if "setup_script" in payload:
             script = payload.get("setup_script")
@@ -434,12 +488,7 @@ def register_hub_routes(
 
     @app.post("/api/projects/{project_id}/credential-binding")
     async def api_project_credential_binding_update(project_id: str, request: Request) -> dict[str, Any]:
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request, catch_decode_error=True)
         return state.project_service.attach_project_credentials(
             project_id=project_id,
             mode=payload.get("mode"),
@@ -465,16 +514,10 @@ def register_hub_routes(
 
     @app.post("/api/projects/{project_id}/chats/start")
     async def api_start_new_chat_for_project(project_id: str, request: Request) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
-        body = await request.body()
-        if body:
-            try:
-                parsed_payload = json.loads(body.decode("utf-8"))
-            except json.JSONDecodeError as exc:
-                raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-            if not isinstance(parsed_payload, dict):
-                raise HTTPException(status_code=400, detail="Request body must be an object.")
-            payload = parsed_payload
+        payload = await _request_optional_body_object(
+            request,
+            non_object_detail="Request body must be an object.",
+        )
 
         if "codex_args" in payload:
             raise HTTPException(status_code=400, detail="codex_args is no longer supported; use agent_args.")
@@ -507,12 +550,7 @@ def register_hub_routes(
 
     @app.post("/api/chats")
     async def api_create_chat(request: Request) -> dict[str, Any]:
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request, catch_decode_error=True)
         project_id = str(payload.get("project_id", "")).strip()
         if not project_id:
             raise HTTPException(status_code=400, detail="project_id is required.")
@@ -568,12 +606,7 @@ def register_hub_routes(
 
     @app.patch("/api/chats/{chat_id}")
     async def api_patch_chat(chat_id: str, request: Request) -> dict[str, Any]:
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request, catch_decode_error=True)
         update: dict[str, Any] = {}
         if "profile" in payload:
             update["profile"] = str(payload.get("profile") or "").strip()
@@ -602,9 +635,7 @@ def register_hub_routes(
 
     @app.post("/api/chats/{chat_id}/title-prompt")
     async def api_chat_title_prompt(chat_id: str, request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request)
         return state.chat_service.record_chat_title_prompt(chat_id, payload.get("prompt"))
 
     @app.get("/api/chats/{chat_id}/artifacts")
@@ -615,28 +646,21 @@ def register_hub_routes(
     async def api_publish_chat_artifact(chat_id: str, request: Request) -> dict[str, Any]:
         token = state.artifacts_service.resolve_artifact_publish_token(request.headers)
         workspace = state.artifacts_service.require_chat_publish_workspace(chat_id=chat_id, token=token)
-        payload, staged_paths = await parse_artifact_request_payload(
-            request,
+        return await _artifact_route_response(
+            request=request,
+            parse_artifact_request_payload=parse_artifact_request_payload,
+            cleanup_uploaded_artifact_paths=cleanup_uploaded_artifact_paths,
+            logger=logger,
             context=f"/api/chats/{chat_id}/artifacts/publish",
             workspace=workspace,
-        )
-        try:
-            artifact = state.artifacts_service.publish_chat_artifact(
+            failure_log_message=f"artifacts publish failed for chat_id={chat_id}: %s",
+            publish=lambda payload: state.artifacts_service.publish_chat_artifact(
                 chat_id=chat_id,
                 token=token,
                 submitted_path=payload.get("path"),
                 name=payload.get("name"),
-            )
-        except HTTPException as exc:
-            logger.warning(
-                "artifacts publish failed for chat_id=%s: %s",
-                chat_id,
-                exc.detail,
-            )
-            raise
-        finally:
-            cleanup_uploaded_artifact_paths(staged_paths)
-        return {"artifact": artifact}
+            ),
+        )
 
     @app.get("/api/chats/{chat_id}/artifacts/{artifact_id}/download")
     def api_download_chat_artifact(chat_id: str, artifact_id: str) -> FileResponse:
@@ -656,11 +680,7 @@ def register_hub_routes(
     @app.post("/api/chats/{chat_id}/agent-tools/credentials/resolve")
     async def api_agent_tools_resolve_credentials(chat_id: str, request: Request) -> dict[str, Any]:
         token = state.credentials_service.resolve_token(request.headers)
-        payload = await request.json()
-        if payload is None:
-            payload = {}
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request, none_as_empty_object=True)
         return state.credentials_service.resolve_chat_credentials(
             chat_id=chat_id,
             token=token,
@@ -671,9 +691,7 @@ def register_hub_routes(
     @app.post("/api/chats/{chat_id}/agent-tools/project-binding")
     async def api_agent_tools_attach_project_binding(chat_id: str, request: Request) -> dict[str, Any]:
         token = state.credentials_service.resolve_token(request.headers)
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request)
         return state.credentials_service.attach_chat_project_credentials(
             chat_id=chat_id,
             token=token,
@@ -684,11 +702,8 @@ def register_hub_routes(
     @app.post("/api/chats/{chat_id}/agent-tools/ack")
     async def api_agent_tools_ack_chat_ready(chat_id: str, request: Request) -> dict[str, Any]:
         token = state.credentials_service.resolve_token(request.headers)
-        payload = await request.json()
-        if payload is None:
-            payload = {}
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request, none_as_empty_object=True)
+        validate_ready_ack_stage(payload, route_label="chat")
         acknowledgement = state.credentials_service.acknowledge_chat_ready(
             chat_id=chat_id,
             token=token,
@@ -702,28 +717,21 @@ def register_hub_routes(
     async def api_agent_tools_submit_chat_artifact(chat_id: str, request: Request) -> dict[str, Any]:
         token = state.artifacts_service.resolve_agent_tools_token(request.headers)
         workspace = state.artifacts_service.require_chat_submit_workspace(chat_id=chat_id, token=token)
-        payload, staged_paths = await parse_artifact_request_payload(
-            request,
+        return await _artifact_route_response(
+            request=request,
+            parse_artifact_request_payload=parse_artifact_request_payload,
+            cleanup_uploaded_artifact_paths=cleanup_uploaded_artifact_paths,
+            logger=logger,
             context=f"/api/chats/{chat_id}/agent-tools/artifacts/submit",
             workspace=workspace,
-        )
-        try:
-            artifact = state.artifacts_service.submit_chat_artifact(
+            failure_log_message=f"agent-tools artifact submit failed for chat_id={chat_id}: %s",
+            publish=lambda payload: state.artifacts_service.submit_chat_artifact(
                 chat_id=chat_id,
                 token=token,
                 submitted_path=payload.get("path"),
                 name=payload.get("name"),
-            )
-        except HTTPException as exc:
-            logger.warning(
-                "agent-tools artifact submit failed for chat_id=%s: %s",
-                chat_id,
-                exc.detail,
-            )
-            raise
-        finally:
-            cleanup_uploaded_artifact_paths(staged_paths)
-        return {"artifact": artifact}
+            ),
+        )
 
     @app.get("/api/agent-tools/sessions/{session_id}/credentials")
     def api_agent_tools_session_list_credentials(session_id: str, request: Request) -> dict[str, Any]:
@@ -733,11 +741,7 @@ def register_hub_routes(
     @app.post("/api/agent-tools/sessions/{session_id}/credentials/resolve")
     async def api_agent_tools_session_resolve_credentials(session_id: str, request: Request) -> dict[str, Any]:
         token = state.credentials_service.resolve_token(request.headers)
-        payload = await request.json()
-        if payload is None:
-            payload = {}
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request, none_as_empty_object=True)
         return state.credentials_service.resolve_session_credentials(
             session_id=session_id,
             token=token,
@@ -748,9 +752,7 @@ def register_hub_routes(
     @app.post("/api/agent-tools/sessions/{session_id}/project-binding")
     async def api_agent_tools_session_attach_project_binding(session_id: str, request: Request) -> dict[str, Any]:
         token = state.credentials_service.resolve_token(request.headers)
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request)
         return state.credentials_service.attach_session_project_credentials(
             session_id=session_id,
             token=token,
@@ -761,11 +763,8 @@ def register_hub_routes(
     @app.post("/api/agent-tools/sessions/{session_id}/ack")
     async def api_agent_tools_ack_session_ready(session_id: str, request: Request) -> dict[str, Any]:
         token = state.credentials_service.resolve_token(request.headers)
-        payload = await request.json()
-        if payload is None:
-            payload = {}
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        payload = await _request_json_object(request, none_as_empty_object=True)
+        validate_ready_ack_stage(payload, route_label="session")
         acknowledgement = state.credentials_service.acknowledge_session_ready(
             session_id=session_id,
             token=token,
@@ -779,55 +778,41 @@ def register_hub_routes(
     async def api_publish_session_artifact(session_id: str, request: Request) -> dict[str, Any]:
         token = state.artifacts_service.resolve_artifact_publish_token(request.headers)
         workspace = state.artifacts_service.require_session_publish_workspace(session_id=session_id, token=token)
-        payload, staged_paths = await parse_artifact_request_payload(
-            request,
+        return await _artifact_route_response(
+            request=request,
+            parse_artifact_request_payload=parse_artifact_request_payload,
+            cleanup_uploaded_artifact_paths=cleanup_uploaded_artifact_paths,
+            logger=logger,
             context=f"/api/agent-tools/sessions/{session_id}/artifacts/publish",
             workspace=workspace,
-        )
-        try:
-            artifact = state.artifacts_service.publish_session_artifact(
+            failure_log_message=f"session artifact publish failed for session_id={session_id}: %s",
+            publish=lambda payload: state.artifacts_service.publish_session_artifact(
                 session_id=session_id,
                 token=token,
                 submitted_path=payload.get("path"),
                 name=payload.get("name"),
-            )
-        except HTTPException as exc:
-            logger.warning(
-                "session artifact publish failed for session_id=%s: %s",
-                session_id,
-                exc.detail,
-            )
-            raise
-        finally:
-            cleanup_uploaded_artifact_paths(staged_paths)
-        return {"artifact": artifact}
+            ),
+        )
 
     @app.post("/api/agent-tools/sessions/{session_id}/artifacts/submit")
     async def api_agent_tools_submit_session_artifact(session_id: str, request: Request) -> dict[str, Any]:
         token = state.artifacts_service.resolve_agent_tools_token(request.headers)
         workspace = state.artifacts_service.require_session_submit_workspace(session_id=session_id, token=token)
-        payload, staged_paths = await parse_artifact_request_payload(
-            request,
+        return await _artifact_route_response(
+            request=request,
+            parse_artifact_request_payload=parse_artifact_request_payload,
+            cleanup_uploaded_artifact_paths=cleanup_uploaded_artifact_paths,
+            logger=logger,
             context=f"/api/agent-tools/sessions/{session_id}/artifacts/submit",
             workspace=workspace,
-        )
-        try:
-            artifact = state.artifacts_service.submit_session_artifact(
+            failure_log_message=f"session artifact submit failed for session_id={session_id}: %s",
+            publish=lambda payload: state.artifacts_service.submit_session_artifact(
                 session_id=session_id,
                 token=token,
                 submitted_path=payload.get("path"),
                 name=payload.get("name"),
-            )
-        except HTTPException as exc:
-            logger.warning(
-                "session artifact submit failed for session_id=%s: %s",
-                session_id,
-                exc.detail,
-            )
-            raise
-        finally:
-            cleanup_uploaded_artifact_paths(staged_paths)
-        return {"artifact": artifact}
+            ),
+        )
 
     @app.get("/api/agent-tools/sessions/{session_id}/artifacts/{artifact_id}/download")
     def api_download_session_artifact(session_id: str, artifact_id: str) -> FileResponse:

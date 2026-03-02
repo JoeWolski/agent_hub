@@ -7,7 +7,7 @@ import subprocess
 from threading import Lock, Thread
 from typing import Any, Callable
 
-from fastapi import HTTPException
+from agent_core.errors import ConfigError, RuntimeStateError
 from agent_hub.runtime import queue_put_drop_oldest, set_terminal_size
 
 
@@ -185,12 +185,12 @@ class RuntimeDomain:
     def attach_terminal(self, chat_id: str) -> tuple[queue.Queue[str | None], str]:
         runtime = self._runtime_for_chat(chat_id)
         if runtime is None:
-            raise HTTPException(status_code=409, detail="Chat is not running.")
+            raise RuntimeStateError("Chat is not running.")
         listener: queue.Queue[str | None] = queue.Queue(maxsize=self._terminal_queue_max)
         with self._runtime_lock:
             active_runtime = self._chat_runtimes.get(chat_id)
             if active_runtime is None:
-                raise HTTPException(status_code=409, detail="Chat is not running.")
+                raise RuntimeStateError("Chat is not running.")
             active_runtime.listeners.add(listener)
         return listener, self._chat_log_history(chat_id)
 
@@ -204,13 +204,13 @@ class RuntimeDomain:
     def write_terminal_input(self, chat_id: str, data: str) -> None:
         runtime = self._runtime_for_chat(chat_id)
         if runtime is None:
-            raise HTTPException(status_code=409, detail="Chat is not running.")
+            raise RuntimeStateError("Chat is not running.")
         if not data:
             return
         try:
             os.write(runtime.master_fd, data.encode("utf-8", errors="ignore"))
         except OSError as exc:
-            raise HTTPException(status_code=409, detail="Failed to write to chat terminal.") from exc
+            raise RuntimeStateError("Failed to write to chat terminal.") from exc
         submissions = self._collect_submitted_prompts(chat_id, data)
         for prompt in submissions:
             self._record_submitted_prompt(chat_id, prompt)
@@ -218,9 +218,9 @@ class RuntimeDomain:
     def resize_terminal(self, chat_id: str, cols: int, rows: int) -> None:
         runtime = self._runtime_for_chat(chat_id)
         if runtime is None:
-            raise HTTPException(status_code=409, detail="Chat is not running.")
+            raise RuntimeStateError("Chat is not running.")
         try:
             self._set_terminal_size(runtime.master_fd, cols, rows)
         except (OSError, TypeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="Invalid terminal resize request.") from exc
+            raise ConfigError("Invalid terminal resize request.") from exc
         self._signal_process_group_winch(int(runtime.process.pid))

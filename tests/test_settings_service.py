@@ -12,6 +12,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from agent_core.errors import ConfigError
 from agent_hub.services.settings_service import SettingsService
 
 
@@ -59,10 +60,9 @@ class SettingsServiceTests(unittest.TestCase):
         self.assertEqual(payload["git_user_name"], "Jane Doe")
         self.assertEqual(payload["git_user_email"], "jane@example.com")
 
-    def test_normalize_settings_payload_clears_partial_git_identity(self) -> None:
-        payload = self._service().normalize_settings_payload({"git_user_name": "Only Name"})
-        self.assertEqual(payload["git_user_name"], "")
-        self.assertEqual(payload["git_user_email"], "")
+    def test_normalize_settings_payload_rejects_partial_git_identity(self) -> None:
+        with self.assertRaises(ConfigError):
+            self._service().normalize_settings_payload({"git_user_name": "Only Name"})
 
     def test_update_settings_rejects_empty_update(self) -> None:
         with self.assertRaises(HTTPException) as raised:
