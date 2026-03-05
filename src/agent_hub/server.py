@@ -2529,10 +2529,25 @@ def _upsert_codex_trusted_project_config(base_config_text: str, container_projec
         return str(base_config_text or "")
     if not normalized_path.startswith("/"):
         normalized_path = "/" + normalized_path.lstrip("/")
-    assignment_key = f"projects.{json.dumps(normalized_path)}.trust_level"
-    pattern = re.compile(rf"(?m)^\s*{re.escape(assignment_key)}\s*=.*\n?")
-    cleaned = re.sub(pattern, "", str(base_config_text or ""))
-    return f"{cleaned.rstrip()}\n{assignment_key} = \"trusted\"\n"
+    project_key = f"projects.{json.dumps(normalized_path)}"
+    assignment_key = f"{project_key}.trust_level"
+    text = str(base_config_text or "")
+
+    # Remove legacy dotted assignment so it cannot remain scoped under an open table.
+    text = re.sub(rf"(?m)^\s*{re.escape(assignment_key)}\s*=.*\n?", "", text)
+
+    # Upsert trust_level inside an explicit [projects.\"<path>\"] table.
+    project_table_header = f"[{project_key}]"
+    table_pattern = re.compile(
+        rf"(?ms)^({re.escape(project_table_header)}\n)(.*?)(?=^\[|\Z)",
+    )
+    match = table_pattern.search(text)
+    if match:
+        table_body = re.sub(r"(?m)^\s*trust_level\s*=.*\n?", "", match.group(2))
+        replacement = f"{project_table_header}\n{table_body}trust_level = \"trusted\"\n"
+        return f"{text[:match.start()]}{replacement}{text[match.end():]}"
+
+    return f"{text.rstrip()}\n\n{project_table_header}\ntrust_level = \"trusted\"\n"
 
 
 def _short_summary(text: str, max_words: int = 10, max_chars: int = 80) -> str:
