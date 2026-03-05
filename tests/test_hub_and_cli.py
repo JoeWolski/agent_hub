@@ -10,6 +10,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import tomllib
 import urllib.error
 import urllib.request
 import unittest
@@ -2615,8 +2616,12 @@ Gemini CLI
         self.config_file.write_text(
             (
                 "model = 'test'\n"
-                'projects."/workspace/other".trust_level = "trusted"\n'
-                'projects."/workspace/agent_hub".trust_level = "untrusted"\n'
+                "[runtime]\n"
+                "approval_policy = 'never'\n"
+                '[projects."/workspace/other"]\n'
+                'trust_level = "trusted"\n'
+                '[projects."/workspace/agent_hub"]\n'
+                'trust_level = "untrusted"\n'
             ),
             encoding="utf-8",
         )
@@ -2631,10 +2636,14 @@ Gemini CLI
         )
 
         runtime_text = runtime_config_file.read_text(encoding="utf-8")
-        self.assertIn('projects."/workspace/other".trust_level = "trusted"', runtime_text)
-        expected_line = 'projects."/workspace/agent_hub".trust_level = "trusted"'
-        self.assertIn(expected_line, runtime_text)
-        self.assertEqual(runtime_text.count(expected_line), 1)
+        self.assertIn('[projects."/workspace/other"]', runtime_text)
+        self.assertIn('[projects."/workspace/agent_hub"]', runtime_text)
+        self.assertIn('trust_level = "trusted"', runtime_text)
+        self.assertNotIn('projects."/workspace/agent_hub".trust_level', runtime_text)
+        parsed = tomllib.loads(runtime_text)
+        self.assertEqual(parsed.get("runtime", {}).get("approval_policy"), "never")
+        self.assertEqual(parsed.get("projects", {}).get("/workspace/other", {}).get("trust_level"), "trusted")
+        self.assertEqual(parsed.get("projects", {}).get("/workspace/agent_hub", {}).get("trust_level"), "trusted")
 
     def test_start_chat_filters_reserved_openai_env_vars(self) -> None:
         project = self.state.add_project(
