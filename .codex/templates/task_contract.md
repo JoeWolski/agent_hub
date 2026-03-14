@@ -23,14 +23,14 @@ List explicit non-goals.
 
 ## Required Validation Commands
 ```bash
-# Run minimal targeted checks for changed scope.
-uv run pytest tests/<targeted_test>.py
-cd web && yarn build
+# Use repo-root wrappers where possible.
+./make.sh <target-or-scope>
+./make.sh --test-regex <pattern>
 ```
 
 ## PR Evidence Plan
 - Required artifacts:
-  - List exact visual artifacts to produce, with owner and path.
+  - List exact `.png` artifacts to produce, with owner and path.
 - Visualization design:
   - Define each planned visualization before implementation starts.
   - For each visualization, state:
@@ -38,20 +38,21 @@ cd web && yarn build
     - legend contents
     - why it gives an at-a-glance correctness argument
 - Self-review gate:
-  - Before PR-body inclusion, assert each visual artifact is:
+  - Before PR-body inclusion, assert each `.png` is:
     - clear/readable
     - legend-consistent
     - artifact/bug/glitch free
     - complete for required visualization intent
-  - Format preference:
-    - `.png` only
 
 ## Incremental Testing Breakdown
 - Baseline:
   - Capture baseline behavior (targeted test result and/or key logs) before code edits.
 - Compile/Smoke:
   - After first compileable change, run the smallest relevant smoke command.
-  - For long-running flows, run a short plumbing check first to verify wiring/output paths before full runs.
+  - For simulation/offline-log pipelines, run a short plumbing check first:
+    - sim/log time cap: 5 seconds
+    - wall-clock cap: 30 seconds
+    - verify schema/wiring/output channels/manifest correctness before full runs.
 - Chunk Validation:
   - After each logical change chunk, run nearest unit/subsystem tests.
 - Integration Validation:
@@ -64,11 +65,13 @@ cd web && yarn build
   - Keep PR body updated as validation/evidence status changes.
 
 ## Logging and Diagnostics Plan
+- C++ logging:
+  - Use `LERROR`, `LWARN`, `LINFO`, `LDEBUG`, and especially `LDEBUG_VERBOSE`.
+  - Use `LDEBUG_VERBOSE` liberally with meaningful verbosity levels while developing/debugging.
+  - During implementation testing, run with maximum practical log verbosity.
 - Python logging:
   - Use equivalent levels: `logging.error`, `logging.warning`, `logging.info`, `logging.debug`.
   - Add detailed debug traces around failure-prone paths during development/testing.
-- Frontend/Node logging:
-  - Use established project logging patterns and include sufficient debug context when diagnosing failures.
 - Cleanup:
   - Keep durable diagnostics; remove purely temporary noise before final handoff unless explicitly requested.
 

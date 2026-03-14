@@ -6,6 +6,7 @@ import { Layout, Model } from "flexlayout-react";
 import {
   findMatchingServerChatForPendingSession,
   isChatStarting,
+  reconcilePendingProjectChatCreates,
   reconcilePendingChatStarts,
   reconcilePendingSessions
 } from "./chatPendingState";
@@ -21,6 +22,7 @@ import {
   reconcileOuterFlexLayoutJson,
   reconcileProjectChatsFlexLayoutJson
 } from "./flexLayoutState";
+import { rekeyChatUiIdentityState } from "./chatIdentityState";
 import {
   isAutoCreateProjectConfigMode,
   normalizeCreateProjectConfigMode,
@@ -1874,6 +1876,20 @@ function HubApp() {
   const chatFirstSeenOrderRef = useRef(createFirstSeenOrderState());
   const chatOrderAliasByServerIdRef = useRef(new Map());
   const projectChatCreateLocksRef = useRef(new Set());
+  const pendingSessionsRef = useRef(pendingSessions);
+  const chatUiIdentityStateRef = useRef({
+    pendingSessions,
+    openChats,
+    openChatDetails,
+    openChatLogs,
+    pendingChatLogLoads,
+    chatStaticLogs,
+    showArtifactThumbnailsByChat,
+    collapsedTerminalsByChat,
+    fullscreenChatId,
+    artifactPreview,
+    chatFlexProjectLayoutsByProjectId
+  });
   const chatFlexOuterModelCacheRef = useRef({ layoutJson: null, model: null });
   const chatFlexProjectModelCacheRef = useRef({
     layoutsByProjectId: {},
@@ -1912,14 +1928,109 @@ function HubApp() {
     () => normalizeHubSettings(hubState.settings, agentCapabilities),
     [hubState.settings, agentCapabilities]
   );
+  const hubStateRef = useRef(hubState);
   const hubSettingsRef = useRef(hubSettings);
   const agentCapabilitiesRef = useRef(agentCapabilities);
   const chatStartSettingsByProjectRef = useRef(chatStartSettingsByProject);
   const autoConfigStartSettingsRef = useRef(autoConfigStartSettings);
+  hubStateRef.current = hubState;
   hubSettingsRef.current = hubSettings;
   agentCapabilitiesRef.current = agentCapabilities;
   chatStartSettingsByProjectRef.current = chatStartSettingsByProject;
   autoConfigStartSettingsRef.current = autoConfigStartSettings;
+  pendingSessionsRef.current = pendingSessions;
+  chatUiIdentityStateRef.current = {
+    pendingSessions,
+    openChats,
+    openChatDetails,
+    openChatLogs,
+    pendingChatLogLoads,
+    chatStaticLogs,
+    showArtifactThumbnailsByChat,
+    collapsedTerminalsByChat,
+    fullscreenChatId,
+    artifactPreview,
+    chatFlexProjectLayoutsByProjectId
+  };
+
+  function clearPendingProjectCreateState(projectId) {
+    const normalizedProjectId = String(projectId || "").trim();
+    if (!normalizedProjectId) {
+      return;
+    }
+    projectChatCreateLocksRef.current.delete(normalizedProjectId);
+    setPendingProjectChatCreates((prev) => {
+      if (!prev[normalizedProjectId]) {
+        return prev;
+      }
+      const next = { ...prev };
+      delete next[normalizedProjectId];
+      return next;
+    });
+  }
+
+  function promotePendingChatIdentity(uiId, serverChatId, projectId = "") {
+    const normalizedUiId = String(uiId || "").trim();
+    const normalizedServerChatId = String(serverChatId || "").trim();
+    if (!normalizedUiId || !normalizedServerChatId) {
+      return false;
+    }
+    const currentBundle = chatUiIdentityStateRef.current;
+    const stillPending = (currentBundle.pendingSessions || []).some(
+      (session) => String(session?.ui_id || "").trim() === normalizedUiId
+    );
+    if (!stillPending) {
+      return false;
+    }
+    const nextBundle = rekeyChatUiIdentityState(
+      currentBundle,
+      normalizedUiId,
+      normalizedServerChatId,
+      String(projectId || "").trim()
+    );
+    chatUiIdentityStateRef.current = nextBundle;
+    pendingSessionsRef.current = nextBundle.pendingSessions;
+    setPendingSessions(nextBundle.pendingSessions);
+    setOpenChats(nextBundle.openChats);
+    setOpenChatDetails(nextBundle.openChatDetails);
+    setOpenChatLogs(nextBundle.openChatLogs);
+    setPendingChatLogLoads(nextBundle.pendingChatLogLoads);
+    setChatStaticLogs(nextBundle.chatStaticLogs);
+    setShowArtifactThumbnailsByChat(nextBundle.showArtifactThumbnailsByChat);
+    setCollapsedTerminalsByChat(nextBundle.collapsedTerminalsByChat);
+    setFullscreenChatId(nextBundle.fullscreenChatId);
+    setArtifactPreview(nextBundle.artifactPreview);
+    setChatFlexProjectLayoutsByProjectId(nextBundle.chatFlexProjectLayoutsByProjectId);
+    chatOrderAliasByServerIdRef.current.set(normalizedServerChatId, normalizedUiId);
+    clearPendingProjectCreateState(projectId);
+    return true;
+  }
+
+  function collectPendingSessionPromotions(previousPendingSessions, serverChats) {
+    const sessions = Array.isArray(previousPendingSessions) ? previousPendingSessions : [];
+    const serverList = Array.isArray(serverChats) ? serverChats : [];
+    const mappedServerIds = new Set();
+    const promotions = [];
+
+    for (const session of sessions) {
+      const matchedChat = findMatchingServerChatForPendingSession(session, serverList, mappedServerIds);
+      if (!matchedChat) {
+        continue;
+      }
+      const matchedChatId = String(matchedChat.id || "").trim();
+      const uiId = String(session?.ui_id || "").trim();
+      if (!matchedChatId || !uiId) {
+        continue;
+      }
+      mappedServerIds.add(matchedChatId);
+      promotions.push({
+        uiId,
+        serverChatId: matchedChatId,
+        projectId: String(session?.project_id || "").trim()
+      });
+    }
+    return promotions;
+  }
 
   useEffect(() => {
     uiLifecycleTrace.setEnabled(lifecycleDebugEnabled);
@@ -1969,6 +2080,10 @@ function HubApp() {
       chats: normalizedPayload.chats.length,
       chat_statuses: summarizeChatsByStatus(normalizedPayload.chats)
     });
+    const promotions = collectPendingSessionPromotions(pendingSessionsRef.current, normalizedPayload.chats || []);
+    for (const promotion of promotions) {
+      promotePendingChatIdentity(promotion.uiId, promotion.serverChatId, promotion.projectId);
+    }
     setHubState(normalizedPayload);
     setHubStateHydrated(true);
     const serverChatMap = new Map((normalizedPayload.chats || []).map((chat) => [chat.id, chat]));
@@ -1992,7 +2107,7 @@ function HubApp() {
       }
       return next;
     });
-  }, []);
+  }, [trace]);
 
   const refreshState = useCallback(async () => {
     const startedAt = typeof performance !== "undefined" && typeof performance.now === "function"
@@ -2221,20 +2336,13 @@ function HubApp() {
       const serverId = String(session.server_chat_id || "");
       if (serverId && serverChatById.has(serverId)) {
         mappedServerIds.add(serverId);
-        const serverChat = serverChatById.get(serverId);
-        merged.push({ ...serverChat, id: session.ui_id, server_chat_id: serverId });
+        merged.push(serverChatById.get(serverId));
         continue;
       }
       const matchedServerChat = findMatchingServerChatForPendingSession(session, serverChats, mappedServerIds);
       if (matchedServerChat) {
         mappedServerIds.add(matchedServerChat.id);
-        const matchedStatus = String(matchedServerChat.status || "").toLowerCase();
-        merged.push({
-          ...matchedServerChat,
-          id: session.ui_id,
-          server_chat_id: matchedServerChat.id,
-          is_pending_start: matchedStatus === "starting"
-        });
+        merged.push(matchedServerChat);
         continue;
       }
       merged.push({
@@ -2275,6 +2383,19 @@ function HubApp() {
       }
     }
   }, [pendingSessions]);
+
+  useEffect(() => {
+    setPendingProjectChatCreates((prev) => {
+      const next = reconcilePendingProjectChatCreates(prev, pendingSessions, hubState.chats);
+      const nextProjectIds = new Set(Object.keys(next));
+      for (const projectId of Array.from(projectChatCreateLocksRef.current)) {
+        if (!nextProjectIds.has(projectId)) {
+          projectChatCreateLocksRef.current.delete(projectId);
+        }
+      }
+      return next;
+    });
+  }, [hubState.chats, pendingSessions]);
 
   const orderedVisibleChats = useMemo(
     () =>
@@ -2924,15 +3045,31 @@ function HubApp() {
   }
 
   const removeOptimisticChatRow = useCallback((uiId) => {
-    setPendingSessions((prev) => prev.filter((session) => session.ui_id !== uiId));
+    setPendingSessions((prev) => {
+      const next = prev.filter((session) => session.ui_id !== uiId);
+      pendingSessionsRef.current = next;
+      chatUiIdentityStateRef.current = {
+        ...chatUiIdentityStateRef.current,
+        pendingSessions: next
+      };
+      return next;
+    });
     setOpenChats((prev) => {
       const next = { ...prev };
       delete next[uiId];
+      chatUiIdentityStateRef.current = {
+        ...chatUiIdentityStateRef.current,
+        openChats: next
+      };
       return next;
     });
     setOpenChatDetails((prev) => {
       const next = { ...prev };
       delete next[uiId];
+      chatUiIdentityStateRef.current = {
+        ...chatUiIdentityStateRef.current,
+        openChatDetails: next
+      };
       return next;
     });
   }, []);
@@ -3202,21 +3339,43 @@ function HubApp() {
       const knownServerChatIds = (hubState.chats || [])
         .filter((chat) => String(chat.project_id || "") === normalizedProjectId)
         .map((chat) => chat.id);
-      setPendingSessions((prev) => [...prev, {
-        ui_id: uiId,
-        project_id: normalizedProjectId,
-        project_name: project?.name || "Unknown",
-        agent_type: agentType,
-        create_request_id: requestId,
-        server_chat_id: "",
-        created_at_ms: pendingCreatedAtMs,
-        server_chat_id_set_at_ms: 0,
-        known_server_chat_ids: knownServerChatIds,
-        seen_on_server: false
-      }]);
+      setPendingSessions((prev) => {
+        const next = [...prev, {
+          ui_id: uiId,
+          project_id: normalizedProjectId,
+          project_name: project?.name || "Unknown",
+          agent_type: agentType,
+          create_request_id: requestId,
+          server_chat_id: "",
+          created_at_ms: pendingCreatedAtMs,
+          server_chat_id_set_at_ms: 0,
+          known_server_chat_ids: knownServerChatIds,
+          seen_on_server: false
+        }];
+        pendingSessionsRef.current = next;
+        chatUiIdentityStateRef.current = {
+          ...chatUiIdentityStateRef.current,
+          pendingSessions: next
+        };
+        return next;
+      });
       setActiveTab("chats");
-      setOpenChats((prev) => ({ ...prev, [uiId]: true }));
-      setOpenChatDetails((prev) => ({ ...prev, [uiId]: false }));
+      setOpenChats((prev) => {
+        const next = { ...prev, [uiId]: true };
+        chatUiIdentityStateRef.current = {
+          ...chatUiIdentityStateRef.current,
+          openChats: next
+        };
+        return next;
+      });
+      setOpenChatDetails((prev) => {
+        const next = { ...prev, [uiId]: false };
+        chatUiIdentityStateRef.current = {
+          ...chatUiIdentityStateRef.current,
+          openChatDetails: next
+        };
+        return next;
+      });
       setCollapsedProjectChats((prev) => ({ ...prev, [normalizedProjectId]: false }));
       trace("create_chat_optimistic_row_added", {
         project_id: normalizedProjectId,
@@ -3238,24 +3397,25 @@ function HubApp() {
         has_chat: Boolean(response?.chat)
       });
       if (!chatId) {
-        removeOptimisticChatRow(uiId);
+        if (pendingSessionsRef.current.some((session) => String(session?.ui_id || "").trim() === uiId)) {
+          removeOptimisticChatRow(uiId);
+        }
         setError("Chat start request succeeded but did not include a chat id.");
-        refreshState().catch(() => {});
+        queueStateRefresh();
         return;
       }
-      chatOrderAliasByServerIdRef.current.set(chatId, uiId);
-      setPendingSessions((prev) =>
-        prev.map((session) =>
-          session.ui_id === uiId
-            ? {
-              ...session,
-              server_chat_id: chatId,
-              server_chat_id_set_at_ms: Date.now()
-            }
-            : session
-        )
-      );
-      setPendingChatStarts((prev) => ({ ...prev, [chatId]: Date.now() }));
+      const promoted = promotePendingChatIdentity(uiId, chatId, normalizedProjectId);
+      const existingServerChat = (hubStateRef.current.chats || []).find((chat) => String(chat?.id || "") === String(chatId || ""));
+      const existingServerStatus = String(existingServerChat?.status || "").toLowerCase();
+      if (promoted && (!existingServerChat || existingServerStatus === "starting")) {
+        setPendingChatStarts((prev) => ({ ...prev, [chatId]: Date.now() }));
+      } else {
+        setPendingChatStarts((prev) => {
+          const next = { ...prev };
+          delete next[chatId];
+          return next;
+        });
+      }
       setError("");
       trace("create_chat_state_enqueued", {
         project_id: normalizedProjectId,
@@ -3263,9 +3423,9 @@ function HubApp() {
         request_id: requestId,
         chat_id: String(chatId || "")
       });
-      refreshState().catch(() => {});
+      queueStateRefresh();
     } catch (err) {
-      if (uiId) {
+      if (uiId && pendingSessionsRef.current.some((session) => String(session?.ui_id || "").trim() === uiId)) {
         removeOptimisticChatRow(uiId);
       }
       trace("create_chat_error", {
@@ -3274,21 +3434,13 @@ function HubApp() {
         error: err?.message || String(err)
       });
       setError(err.message || String(err));
-      refreshState().catch(() => {});
+      queueStateRefresh();
     } finally {
       trace("create_chat_finalize", {
         project_id: normalizedProjectId,
         pending_ui_id: uiId
       });
-      projectChatCreateLocksRef.current.delete(normalizedProjectId);
-      setPendingProjectChatCreates((prev) => {
-        if (!prev[normalizedProjectId]) {
-          return prev;
-        }
-        const next = { ...prev };
-        delete next[normalizedProjectId];
-        return next;
-      });
+      clearPendingProjectCreateState(normalizedProjectId);
     }
   }
 
@@ -3331,7 +3483,7 @@ function HubApp() {
     try {
       await fetchJson(`/api/chats/${chatId}/start`, { method: "POST" });
       setError("");
-      refreshState().catch(() => {});
+      queueStateRefresh();
     } catch (err) {
       setPendingChatStarts((prev) => {
         const next = { ...prev };
@@ -3339,7 +3491,7 @@ function HubApp() {
         return next;
       });
       setError(err.message || String(err));
-      refreshState().catch(() => {});
+      queueStateRefresh();
     }
   }
 

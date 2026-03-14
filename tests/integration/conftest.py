@@ -19,6 +19,21 @@ if str(SRC) not in sys.path:
 import agent_hub.server as hub_server
 
 
+def canonical_runtime_config_text(*, model: str = "test", model_provider: str = "openai") -> str:
+    return (
+        "[identity]\n\n"
+        "[paths]\n\n"
+        "[providers]\n\n"
+        "[providers.defaults]\n"
+        f"model = '{model}'\n"
+        f"model_provider = '{model_provider}'\n\n"
+        "[mcp]\n\n"
+        "[auth]\n\n"
+        "[logging]\n\n"
+        "[runtime]\n"
+    )
+
+
 def _docker_daemon_available() -> bool:
     if shutil.which("docker") is None:
         return False
@@ -83,7 +98,7 @@ def hub_state() -> hub_server.HubState:
     tmp = tempfile.TemporaryDirectory()
     tmp_path = Path(tmp.name)
     config = tmp_path / "agent.config.toml"
-    config.write_text("model = 'test'\n", encoding="utf-8")
+    config.write_text(canonical_runtime_config_text(), encoding="utf-8")
     state = hub_server.HubState(tmp_path / "hub", config)
     try:
         yield state

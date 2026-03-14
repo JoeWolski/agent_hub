@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import agent_cli.cli as image_cli
+from conftest import canonical_runtime_config_text
 
 def _run(cmd: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -41,7 +42,7 @@ def test_prepare_snapshot_reproduces_missing_agent_group_failure(integration_tmp
     (project_dir / "README.md").write_text("snapshot repro\n", encoding="utf-8")
 
     config_file = integration_tmp_dir / "agent.config.toml"
-    config_file.write_text("model = 'test'\n", encoding="utf-8")
+    config_file.write_text(canonical_runtime_config_text(), encoding="utf-8")
 
     snapshot_tag = f"agent-hub-test:snapshot-{uuid.uuid4().hex[:12]}"
     setup_runtime_tag = image_cli._snapshot_setup_runtime_image_for_snapshot(snapshot_tag)

@@ -24,6 +24,7 @@ if str(HELPERS_DIR) not in sys.path:
     sys.path.insert(0, str(HELPERS_DIR))
 
 from helpers import insert_ready_project
+from conftest import canonical_runtime_config_text
 from test_provider_local_e2e import LocalForgeServer, _seed_bare_repo
 
 
@@ -113,7 +114,7 @@ def test_local_forge_provider_flow_over_real_hub_api(integration_tmp_dir: Path) 
 
     data_dir = integration_tmp_dir / "hub-data"
     config_file = integration_tmp_dir / "agent.config.toml"
-    config_file.write_text("model = 'test'\n", encoding="utf-8")
+    config_file.write_text(canonical_runtime_config_text(), encoding="utf-8")
 
     seed_state = hub_server.HubState(data_dir, config_file)
     seeded_project = insert_ready_project(

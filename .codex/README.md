@@ -5,7 +5,7 @@ This repo supports two multi-agent workflows:
 1. Project design documentation
 2. Project implementation
 
-All feature artifacts live under `docs/analysis/<feature-name>/`.
+All feature artifacts live under `docs/<appropriate-subsystem>/<feature-name>/`.
 
 ## Workflow 1: Project Design Documentation
 
@@ -21,12 +21,12 @@ User flow:
 
 Agent behavior requirements:
 
-- Create/use `docs/analysis/<feature-name>/`.
+- Create/use `docs/<appropriate-subsystem>/<feature-name>/`.
 - Save docs in that run directory:
   - `feature_plan.md`
   - `verification.md`
   - `design_spec.md`
-  - `.codex/tasks/analysis/<feature-name>/task-*.md`
+  - `.codex/tasks/<appropriate-subsystem>/<feature-name>/task-*.md`
   - `feedback_log.md`
 - Use multi-agent delegation when it improves speed/quality.
 - Do not modify product source code during documentation workflow.
@@ -52,13 +52,17 @@ User flow:
 Agent behavior requirements:
 
 - Resolve run directory from feature name:
-  - `docs/analysis/<feature-name>/`
+  - `docs/<appropriate-subsystem>/<feature-name>/`
 - Load design docs from workflow 1.
 - Implement code/tests and validation.
-- Run evidence and gates autonomously by maintaining run artifacts:
-  - `<run-dir>/validation/manifest.txt`
-  - `<run-dir>/validation/validation_report.md`
-  - `<run-dir>/gates.md` with statuses for `intake`, `design_review`, `implementation`, `verification`, `fresh_audit`, `pr_ready`
+- Run evidence and gates autonomously:
+  - `tools/codex/collect_evidence.sh --manifest <run-dir>/validation/manifest.txt --output <run-dir>/validation/validation_report.md`
+  - `tools/codex/run_gate.sh --gate intake --run-dir <run-dir>`
+  - `tools/codex/run_gate.sh --gate design_review --run-dir <run-dir>`
+  - `tools/codex/run_gate.sh --gate implementation --run-dir <run-dir>`
+  - `tools/codex/run_gate.sh --gate verification --run-dir <run-dir>`
+  - `tools/codex/run_gate.sh --gate fresh_audit --run-dir <run-dir>`
+  - `tools/codex/run_gate.sh --gate pr_ready --run-dir <run-dir>`
 - Require fresh-context audit before PR-ready:
   - spawn a brand-new fresh auditor agent
   - provide only design docs, task contracts, changed-file diffs, and validation evidence
@@ -67,9 +71,13 @@ Agent behavior requirements:
   - run baseline + chunk-level + integration checks throughout development
   - do not wait until end-of-feature to run first meaningful tests
   - keep execution logs updated as failures are discovered/fixed
-  - for longer-running flows, run a short smoke check before full runs to verify wiring/output paths first
+  - for simulation/offline-log pipelines, run a short plumbing check before full runs:
+    - sim/log time cap: 5 seconds
+    - wall-clock cap: 30 seconds
+    - verify wiring/schema/output channel/manifest correctness first
 - Require rich diagnostics during implementation testing:
-  - Python/JS: use appropriate verbose logging with useful context while diagnosing failures
+  - C++: use `LERROR`, `LWARN`, `LINFO`, `LDEBUG`, and liberal `LDEBUG_VERBOSE` with useful verbosity levels
+  - Python: use equivalent `logging` levels with detailed debug traces
   - run tests with maximum practical log verbosity while diagnosing failures
 - Update PR stack without requiring user-run commands.
 - Keep PR body continuously up to date as implementation/evidence evolves.
@@ -89,12 +97,20 @@ No user-run setup script is required.
 ## Model Profiles
 
 Default model/reasoning policy is defined in `.codex/config.toml`:
-- default coding and orchestration: `gpt-5.3-codex` with `medium` reasoning effort
-- deep review: `gpt-5.3-codex` with `high` reasoning effort
-- fast read-heavy triage: `gpt-5.3-codex-spark` with `low` reasoning effort
+- main-thread orchestration/spec ownership: `gpt-5.4` with `high` reasoning effort
+- implementation workers: `gpt-5.3-codex-spark` with `medium` reasoning effort
+- adversarial spec/implementation review: `gpt-5.3-codex-spark` with `medium` reasoning effort
+- read-heavy exploration/naive implementation checks: `gpt-5.3-codex-spark` with `medium` reasoning effort
 
-Use Spark profiles only for non-critical read-heavy subtasks, not primary code editing.
+Implementation and review both use divide-and-conquer fan-out:
+- split implementation into multiple owned slices and start with the largest/highest-risk changes first
+- split review across implementability, bug/risk, and architecture/test-quality lenses
+- do not stop an implementation turn until reviewer agents explicitly report the ExecPlan fully implemented, implemented well, and bug free
 
-## Gate/Evidence Notes
+## Gate/Evidence Scripts
 
-This repository does not require `tools/codex/*` gate scripts. Agents should keep gate/evidence state in the run directory artifacts listed above.
+These are internal workflow tools for agents (not user-run requirements):
+
+- `tools/codex/run_gate.sh`
+- `tools/codex/collect_evidence.sh`
+- `tools/codex/upload_artifacts.sh`

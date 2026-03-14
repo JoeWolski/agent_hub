@@ -455,3 +455,70 @@ export function reconcileProjectChatsFlexLayoutJson(existingLayoutJson, chats, p
   }
   return layoutJson;
 }
+
+export function rekeyProjectChatPaneTabIds(existingLayoutJson, oldChatId, newChatId) {
+  const normalizedOldChatId = String(oldChatId || "").trim();
+  const normalizedNewChatId = String(newChatId || "").trim();
+  if (!normalizedOldChatId || !normalizedNewChatId || normalizedOldChatId === normalizedNewChatId) {
+    return cloneJson(existingLayoutJson, null);
+  }
+  const layoutJson = cloneJson(existingLayoutJson, null);
+  if (!layoutJson || typeof layoutJson !== "object") {
+    return layoutJson;
+  }
+  const oldTabId = chatPaneTabId(normalizedOldChatId);
+  const newTabId = chatPaneTabId(normalizedNewChatId);
+  visitLayoutNodes(layoutJson.layout, (node) => {
+    if (!isLayoutTabsetNode(node)) {
+      return;
+    }
+    const nextChildren = [];
+    let selectedChatId = "";
+    const selectedIndex = Number(node.selected);
+    for (let index = 0; index < (node.children || []).length; index += 1) {
+      if (index === selectedIndex) {
+        selectedChatId = chatIdFromProjectPaneTab(node.children[index]);
+      }
+    }
+    for (const child of node.children || []) {
+      if (!isLayoutTabNode(child) || String(child.component || "") !== "project-chat-pane") {
+        nextChildren.push(child);
+        continue;
+      }
+      const childChatId = chatIdFromProjectPaneTab(child);
+      if (!childChatId) {
+        nextChildren.push(child);
+        continue;
+      }
+      if (childChatId === normalizedNewChatId) {
+        nextChildren.push({
+          ...child,
+          id: newTabId,
+          config: { ...(child.config || {}), chat_id: normalizedNewChatId }
+        });
+        continue;
+      }
+      if (childChatId !== normalizedOldChatId) {
+        nextChildren.push(child);
+        continue;
+      }
+      if (nextChildren.some((existingChild) => chatIdFromProjectPaneTab(existingChild) === normalizedNewChatId)) {
+        continue;
+      }
+      nextChildren.push({
+        ...child,
+        id: newTabId,
+        config: { ...(child.config || {}), chat_id: normalizedNewChatId }
+      });
+    }
+    node.children = nextChildren;
+    if (selectedChatId) {
+      const nextSelectedIndex = node.children.findIndex(
+        (child) => chatIdFromProjectPaneTab(child) === (selectedChatId === normalizedOldChatId ? normalizedNewChatId : selectedChatId)
+      );
+      node.selected = nextSelectedIndex >= 0 ? nextSelectedIndex : 0;
+    }
+    normalizeTabsetSelectedIndex(node);
+  });
+  return layoutJson;
+}

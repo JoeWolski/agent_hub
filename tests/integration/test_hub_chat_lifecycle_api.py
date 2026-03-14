@@ -25,7 +25,10 @@ class TestHubLifecycleApiIntegration:
         self.tmp_path = Path(self.tmp.name)
         self.data_dir = self.tmp_path / "hub"
         self.config = self.tmp_path / "agent.config.toml"
-        self.config.write_text("model = 'test'\n", encoding="utf-8")
+        self.config.write_text(
+            "[identity]\n\n[paths]\n\n[providers]\n\n[providers.defaults]\nmodel = 'test'\nmodel_provider = 'openai'\n\n[mcp]\n\n[auth]\n\n[logging]\n\n[runtime]\n",
+            encoding="utf-8",
+        )
         self.runner = CliRunner()
 
     def teardown_method(self) -> None:
@@ -97,7 +100,9 @@ class TestHubLifecycleApiIntegration:
             hub_server.HubState, "_ensure_chat_clone", return_value=Path.cwd()
         ), patch.object(hub_server.HubState, "_sync_checkout_to_remote", return_value=None), patch.object(
             hub_server.HubState, "_prepare_chat_runtime_config", return_value=Path.cwd() / "runtime.toml"
-        ), patch.object(hub_server.HubState, "_spawn_chat_process", return_value=SimpleNamespace(pid=1234)):
+        ), patch.object(
+            hub_server.HubState, "_spawn_chat_process", return_value=SimpleNamespace(pid=1234)
+        ) as spawn_chat_process:
             with TestClient(app) as client:
                 first = client.post(
                     f"/api/projects/{ids['project_id']}/chats/start",
@@ -113,6 +118,113 @@ class TestHubLifecycleApiIntegration:
         first_chat = first.json()["chat"]
         second_chat = second.json()["chat"]
         assert first_chat["id"] == second_chat["id"]
+        assert spawn_chat_process.call_count == 1
+
+    def test_project_chat_start_rejects_legacy_codex_args(self) -> None:
+        app = self._build_app()
+        state = app.state.hub_state
+        ids = self._seed_ready_project(state)
+
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/projects/{ids['project_id']}/chats/start",
+                json={"request_id": "req-legacy", "agent_type": "codex", "codex_args": []},
+            )
+
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"] == "codex_args is no longer supported; use agent_args."
+
+    def test_direct_chat_start_returns_conflict_when_chat_is_already_starting(self) -> None:
+        app = self._build_app()
+        state = app.state.hub_state
+        ids = self._seed_ready_project(state, project_id="project-starting-chat")
+        chat = state.create_chat(
+            project_id=ids["project_id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+            agent_type=hub_server.AGENT_TYPE_CODEX,
+        )
+        state_data = state.load()
+        state_data["chats"][chat["id"]]["status"] = hub_server.CHAT_STATUS_STARTING
+        state_data["chats"][chat["id"]]["status_reason"] = "chat_start_requested"
+        state.save(state_data, reason="test_mark_chat_starting")
+
+        with TestClient(app) as client:
+            response = client.post(f"/api/chats/{chat['id']}/start")
+
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == "Chat is already starting."
+
+    def test_project_chat_start_failure_then_retry_reuses_same_chat_id(self) -> None:
+        app = self._build_app()
+        state = app.state.hub_state
+        ids = self._seed_ready_project(state, project_id="project-retry")
+        spawn_calls = {"count": 0}
+
+        def fake_spawn(_chat_id: str, _cmd: list[str]):
+            spawn_calls["count"] += 1
+            if spawn_calls["count"] == 1:
+                raise RuntimeError("synthetic spawn failure")
+            return SimpleNamespace(pid=1234)
+
+        with patch("agent_hub.server._docker_image_exists", return_value=True), patch.object(
+            hub_server.HubState, "_ensure_chat_clone", return_value=Path.cwd()
+        ), patch.object(hub_server.HubState, "_sync_checkout_to_remote", return_value=None), patch.object(
+            hub_server.HubState, "_prepare_chat_runtime_config", return_value=Path.cwd() / "runtime.toml"
+        ), patch.object(hub_server.HubState, "_spawn_chat_process", side_effect=fake_spawn), patch(
+            "agent_hub.server._is_process_running",
+            side_effect=lambda pid: isinstance(pid, int),
+        ):
+            with TestClient(app) as client:
+                failed = client.post(
+                    f"/api/projects/{ids['project_id']}/chats/start",
+                    json={"request_id": "req-retry", "agent_type": "codex", "agent_args": []},
+                )
+                assert failed.status_code >= 400, failed.text
+                state_payload = client.get("/api/state")
+                assert state_payload.status_code == 200, state_payload.text
+                chats = [chat for chat in state_payload.json()["chats"] if chat["create_request_id"] == "req-retry"]
+                assert len(chats) == 1
+                failed_chat = chats[0]
+                assert failed_chat["status"] == hub_server.CHAT_STATUS_FAILED
+
+                retried = client.post(
+                    f"/api/projects/{ids['project_id']}/chats/start",
+                    json={"request_id": "req-retry", "agent_type": "codex", "agent_args": []},
+                )
+
+        assert retried.status_code == 200, retried.text
+        assert retried.json()["chat"]["id"] == failed_chat["id"]
+
+    def test_same_request_id_in_different_projects_creates_distinct_chats(self) -> None:
+        app = self._build_app()
+        state = app.state.hub_state
+        first_ids = self._seed_ready_project(state, project_id="project-alpha")
+        second_ids = self._seed_ready_project(state, project_id="project-beta")
+
+        with patch("agent_hub.server._docker_image_exists", return_value=True), patch(
+            "agent_hub.server._is_process_running", return_value=True
+        ), patch.object(
+            hub_server.HubState, "_ensure_chat_clone", return_value=Path.cwd()
+        ), patch.object(hub_server.HubState, "_sync_checkout_to_remote", return_value=None), patch.object(
+            hub_server.HubState, "_prepare_chat_runtime_config", return_value=Path.cwd() / "runtime.toml"
+        ), patch.object(hub_server.HubState, "_spawn_chat_process", side_effect=[SimpleNamespace(pid=1001), SimpleNamespace(pid=1002)]):
+            with TestClient(app) as client:
+                first = client.post(
+                    f"/api/projects/{first_ids['project_id']}/chats/start",
+                    json={"request_id": "req-shared", "agent_type": "codex", "agent_args": []},
+                )
+                second = client.post(
+                    f"/api/projects/{second_ids['project_id']}/chats/start",
+                    json={"request_id": "req-shared", "agent_type": "codex", "agent_args": []},
+                )
+
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["chat"]["id"] != second.json()["chat"]["id"]
 
     def test_chat_lifecycle_routes_and_events_snapshot(self) -> None:
         app = self._build_app()
@@ -199,7 +311,9 @@ class TestHubLifecycleApiIntegration:
             agent_type=hub_server.AGENT_TYPE_CODEX,
         )
 
-        with patch.object(hub_server.HubState, "_ensure_project_clone", return_value=Path.cwd()), patch.object(
+        with patch("agent_hub.server._docker_image_exists", return_value=True), patch.object(
+            hub_server.HubState, "_ensure_project_clone", return_value=Path.cwd()
+        ), patch.object(
             hub_server.HubState, "_ensure_chat_clone", return_value=Path.cwd()
         ), patch.object(hub_server.HubState, "_sync_checkout_to_remote", return_value=None), patch(
             "agent_hub.server._run_for_repo", return_value=SimpleNamespace(stdout="deadbeef\n")
