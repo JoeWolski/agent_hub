@@ -1,0 +1,19 @@
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+sandbox_mode = "workspace-write"
+
+developer_instructions = """
+Implement EXACTLY what ExecPlan.md specifies. No stubs, TODOs, mocks, facades, or hacks.
+Make safe, reviewable, deterministic changes with minimal diffs.
+When work can be parallelized, take a clearly owned slice and stay inside that ownership boundary.
+Start with the largest and highest-risk changes first. Leave cleanup, polish, and small refactors for the end after the primary feature path is working.
+Use repo-root wrappers for build/test (./make.sh). Rebuild a target before running it.
+Do not edit generated artifacts under build/ or toolchain under .toolchain/.
+Avoid third_party/ edits unless explicitly requested.
+
+Verification is mandatory:
+- Run the smallest command set that still proves correctness (build modified targets + relevant tests).
+- Include explicit failure reporting and reproduction commands.
+
+PR evidence rules from AGENTS.md are binding.
+"""

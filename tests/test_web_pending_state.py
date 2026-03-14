@@ -75,14 +75,15 @@ class WebPendingStateTests(unittest.TestCase):
             const pendingSession = {
               ui_id: "pending-4",
               project_id: "project-a",
+              create_request_id: "req-1",
               known_server_chat_ids: []
             };
             const matchedServerChat = findMatchingServerChatForPendingSession(
               pendingSession,
               [
-                { id: "chat-failed", project_id: "project-a", status: "failed", is_running: false },
-                { id: "chat-stopped", project_id: "project-a", status: "stopped", is_running: false },
-                { id: "chat-starting", project_id: "project-a", status: "starting", is_running: false }
+                { id: "chat-failed", project_id: "project-a", create_request_id: "other-1", status: "failed", is_running: false },
+                { id: "chat-stopped", project_id: "project-a", create_request_id: "other-2", status: "stopped", is_running: false },
+                { id: "chat-starting", project_id: "project-a", create_request_id: "req-1", status: "starting", is_running: false }
               ],
               new Set()
             );
@@ -94,13 +95,24 @@ class WebPendingStateTests(unittest.TestCase):
 
             const noMatchForOnlyFailed = findMatchingServerChatForPendingSession(
               pendingSession,
-              [{ id: "chat-failed-only", project_id: "project-a", status: "failed", is_running: false }],
+              [{ id: "chat-failed-only", project_id: "project-a", create_request_id: "other", status: "failed", is_running: false }],
               new Set()
             );
             assert.equal(
               noMatchForOnlyFailed,
               null,
               "pending session matching should not bind an optimistic row to failed chats"
+            );
+
+            const noSameProjectFallback = findMatchingServerChatForPendingSession(
+              pendingSession,
+              [{ id: "chat-starting-other", project_id: "project-a", create_request_id: "other-req", status: "starting", is_running: false }],
+              new Set()
+            );
+            assert.equal(
+              noSameProjectFallback,
+              null,
+              "pending session matching should not bind an optimistic row to unrelated startup candidates"
             );
 
             const keepPendingWithinGrace = reconcilePendingChatStarts(
@@ -124,10 +136,9 @@ class WebPendingStateTests(unittest.TestCase):
               keepPendingWithinGrace,
               {
                 "chat-starting": baseTimeMs,
-                "chat-stopped": baseTimeMs,
                 "chat-missing": baseTimeMs
               },
-              "pending start should stay during grace while chat startup is still in-flight"
+              "pending start should stay only while the server still reports startup is in-flight"
             );
 
             const dropAfterGrace = reconcilePendingChatStarts(
@@ -148,13 +159,18 @@ class WebPendingStateTests(unittest.TestCase):
 
             assert.equal(
               isChatStarting("stopped", false, true),
-              true,
-              "stopped chats with an in-flight pending start should render as starting"
+              false,
+              "stopped chats should not render as starting once the server reports a terminal state"
             );
             assert.equal(
               isChatStarting("stopped", false, false),
               false,
               "stopped chats with no pending start should not render as starting"
+            );
+            assert.equal(
+              isChatStarting("failed", false, true),
+              false,
+              "failed chats should not render as starting once the server reports a terminal state"
             );
             assert.equal(
               isChatStarting("starting", false, false),

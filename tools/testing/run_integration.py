@@ -100,7 +100,13 @@ def _select_payload(changed_files: list[str]) -> dict[str, list[str]]:
 
 
 def _write_selection_artifact(path: Path, payload: dict[str, list[str]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "Selection artifact directory is not writable: "
+            f"{path.parent}. Ensure /workspace/tmp exists and is writable in this runtime."
+        ) from exc
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 

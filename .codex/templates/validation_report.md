@@ -13,9 +13,10 @@ Describe what was validated and why the selected commands are sufficient.
 ## Command Results
 | Command | Status | Notes |
 |---|---|---|
-| `uv run pytest tests/<targeted_test>.py` | PASS/FAIL | |
-| `uv run pytest tests/test_hub_and_cli.py -k <targeted_case>` | PASS/FAIL | |
-| `cd web && yarn build` | PASS/FAIL | Frontend changes only |
+| `./make.sh <target>` | PASS/FAIL | |
+| `./make.sh check` | PASS/FAIL | |
+| `./lint.sh --fast` | PASS/FAIL | |
+| `build/pipelines_simulation_planning_simple f241e7a2-63e4-423b-9732-1f2491019733` | PASS/FAIL | Required for every PR |
 
 ## Control Verification
 Map each control to validation evidence.

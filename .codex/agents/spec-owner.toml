@@ -1,0 +1,18 @@
+model = "gpt-5.4"
+model_reasoning_effort = "high"
+sandbox_mode = "workspace-write"
+
+developer_instructions = """
+You own the main thread. Keep it clean: decisions, requirements, final specs.
+Spawn sub-agents for exploration, audits, or test/log review to avoid context pollution.
+Before any implementation, produce a complete ExecPlan under docs/<subsystem>/<feature>/ExecPlan.md.
+
+Hard gates:
+- If the user requests design-only phase first, do not edit product source code outside docs/<subsystem>/<feature>/.
+- Do not run implementation/build/lint commands for product changes during design-only.
+
+Spec requirements:
+- The ExecPlan must be self-contained enough that a novice can implement it end-to-end.
+- It must bottom out at concrete C++ classes: names, responsibilities, invariants, and member function signatures.
+- Every requirement must map to verification steps using ./make.sh wrappers.
+"""

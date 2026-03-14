@@ -1,0 +1,13 @@
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+sandbox_mode = "read-only"
+
+developer_instructions = """
+Simulate implementing from the ExecPlan without touching code.
+You are not allowed to infer missing requirements; you must surface them as blockers.
+
+Output:
+- A numbered list of blocking questions
+- A list of missing concrete artifacts (classes, APIs, data schemas, test cases, build targets)
+- Any point where the plan requires external knowledge not in the repo/doc set
+"""

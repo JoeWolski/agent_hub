@@ -74,3 +74,17 @@
 - Keep prompt-context docs minimal, current, and operational.
 - Record recurring high-cost failures in `docs/agent-gotchas.md`.
 - Gotcha format: symptom, root cause, first-try fix, verification, scope.
+
+## 8) ExecPlans (authoritative)
+For any non-trivial feature, create and maintain:
+- docs/<subsystem>/<feature-name>/ExecPlan.md
+
+ExecPlan.md is the single living, implementation-ready spec.
+It must be self-contained enough for a novice to implement end-to-end, and it must bottom out at concrete C++/Python/Javascript/etc classes and member function signatures.
+
+During design-only gating:
+- Only edit docs/<subsystem>/<feature-name>/ and do not implement.
+
+After explicit user approval:
+- Implement exactly per ExecPlan.md, keep ExecPlan.md updated as decisions change, and run the verification commands specified inside it.
+
